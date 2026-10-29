@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "tag": "models-v1",
+  "base": "https://github.com/FXYXL/cortico-world-fish-sing/releases/download/models-v1/",
+  "totalBytes": 953247170,
+  "note": "首次使用前把这些文件下载到 <运行时根>/ 下对应 target 路径；sha256 必须一致。",
+  "files": [
+    {
+      "name": "dfy2.pth",
+      "size": 55193472,
+      "sha256": "11a79a086aeca9a28493adb3288c3a61ef488ed16b8d916b5a2aa26e47fd8d1d",
+      "target": "assets/weights/dfy2.pth"
+    },
+    {
+      "name": "added_IVF2529_Flat_nprobe_1_dfy2_v2.index",
+      "size": 311680739,
+      "sha256": "25f7003a2b9eadcc3d3f1c49d3e265524add799d063665d3c7bea31df07879ea",
+      "target": "logs/dfy2/added_IVF2529_Flat_nprobe_1_dfy2_v2.index"
+    },
+    {
+      "name": "pytorch_model.bin",
+      "size": 189206711,
+      "sha256": "cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5",
+      "target": "assets/hubert_base/pytorch_model.bin"
+    },
+    {
+      "name": "rmvpe.pt",
+      "size": 181184272,
+      "sha256": "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193",
+      "target": "assets/rmvpe/rmvpe.pt"
+    },
+    {
+      "name": "f0G40k.pth",
+      "size": 73106273,
+      "sha256": "3b2c44035e782c4b14ddc0bede9e2f4a724d025cd073f736d4f43708453adfcb",
+      "target": "assets/pretrained_v2/f0G40k.pth"
+    },
+    {
+      "name": "f0D40k.pth",
+      "size": 142875703,
+      "sha256": "6b6ab091e70801b28e3f41f335f2fc5f3f35c75b39ae2628d419644ec2b0fa09",
+      "target": "assets/pretrained_v2/f0D40k.pth"
+    }
+  ]
+}
