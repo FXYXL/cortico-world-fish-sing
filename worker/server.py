@@ -183,7 +183,13 @@ def status() -> dict:
             "ok": True,
             "engine": ENGINE.info(),
             "queue": QUEUE.qsize(),
-            "current": {"id": cur, "message": job["message"], "progress": job["progress"]} if job else None,
+            "current": {
+                "id": cur,
+                "kind": job["kind"],
+                "state": job["state"],
+                "message": job["message"],
+                "progress": job["progress"],
+            } if job else None,
             "chunkSec": CHUNK_SEC,
         }
 
@@ -247,6 +253,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._auth_ok():
                 self._json(401, {"ok": False, "message": "令牌不对"})
+                return
+            if self.path.startswith("/current"):
+                # 重启 Coo 后靠它找回「上一个 worker 还在跑的那个任务」。
+                # 没有这个接口，新面板就不知道有个训练在进行，只能去猜日志。
+                with LOCK:
+                    cur = CURRENT["id"]
+                    job = JOBS.get(cur) if cur else None
+                    snapshot = dict(job) if job else None
+                if snapshot:
+                    # 不带 params（里面有权重表之类的东西），但训练要的 exp/epochs 得留下
+                    snapshot = {k: v for k, v in snapshot.items() if k != "params"}
+                    snapshot["exp"] = str(job.get("params", {}).get("exp", ""))
+                    snapshot["epochs"] = int(job.get("params", {}).get("epochs", 0) or 0)
+                self._json(200, {"ok": True, "job": snapshot})
                 return
             if self.path.startswith("/scan"):
                 import dataset as ds

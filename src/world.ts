@@ -199,6 +199,26 @@ export class FishSingWorld implements World {
     this.host = host;
     host.log.info(`fish-sing 就绪：模型 ${this.opts.cfg.voice?.model ?? '?'}，本机播放${this.opts.cfg.play?.enabled === false ? '关' : '开'}`);
     if (this.opts.cfg.enabled === false) return;
+    // 如果上一个 worker 还活着并且正在训练，直接把那个任务认回来——
+    // 这样停止按钮能用、进度来自任务本身，比只读日志可靠。
+    if (this.ownedJob !== 'train') {
+      const cur = await this.worker.currentJob().catch(() => null);
+      if (cur && cur.kind === 'train' && cur.state !== 'done' && cur.state !== 'error'
+          && cur.state !== 'canceled') {
+        this.trainJob = {
+          id: cur.id,
+          state: 'running',
+          pct: Math.round((cur.progress ?? 0) * 100),
+          msg: cur.message || '训练中',
+          exp: cur.exp || this.lastExp,
+          epochs: cur.epochs || 0,
+          startedAt: Date.now(),
+        };
+        this.ownedJob = 'train';
+        host.log.info(`[fish-sing] 接管正在进行的训练：${this.trainJob.exp}（${this.trainJob.pct}%）`);
+      }
+    }
+
     // 自托管时每次启动刷新一遍 RVC 代码（约 3 MB）。
     // 不这么做的话，插件升级后 runtime/ 里还是旧代码——改了训练逻辑也传不下去。
     // 权重和 logs 不受影响（copyRvcCode 只覆盖代码文件）。
@@ -239,7 +259,14 @@ export class FishSingWorld implements World {
     if (this.ownedJob === 'song') {
       await this.worker.cancel().catch(() => undefined);
     }
-    this.worker.shutdown();
+    // 训练还在跑就**连 worker 一起留着**。
+    // 关掉 worker 的话训练就成了孤儿：面板再打开时只能靠猜日志判断它死没死，
+    // 停止按钮也按不动。留着它，下次启动 /current 就能把任务认回来。
+    if (this.trainJob?.state === 'running') {
+      this.host?.log.info(`[fish-sing] 训练进行中，worker 保持运行：${this.trainJob.exp}`);
+    } else {
+      this.worker.shutdown();
+    }
     this.host = null;
   }
 
@@ -968,8 +995,12 @@ export class FishSingWorld implements World {
         etaSec,
         models: models.map((x) => ({ name: x.name, epoch: x.epoch, sizeMb: x.sizeMb, current: x.current })),
         datasetBusy: this.datasetJob?.state === 'running',
-        /** 这个训练是不是本次启动的（不是的话「停止训练」按不动，得去杀进程） */
-        owned: Boolean(this.trainJob?.id),
+        /**
+         * 面板能不能管这个训练。
+         * 认回任务（有 id）当然能；认不回但日志还在写，也能——`/stop` 取消的是 worker 当前的
+         * 那一个任务，跟谁提交的无关，旧版 worker 同样支持。
+         */
+        owned: Boolean(this.trainJob?.id) || (logAgeSec(expDir) ?? 9999) < 180,
         /** 日志多久没更新了，秒。用来判断「日志还在写 = 还在跑」 */
         logAgeSec: logAgeSec(expDir),
         ckpt: exp ? checkpointStats(join(this.routes.rvcRoot, 'assets', 'weights'), exp) : { n: 0, totalMb: 0 },

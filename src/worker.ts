@@ -43,6 +43,11 @@ export interface JobState {
   message: string;
   result?: Record<string, unknown> | null;
   error?: string;
+  /** 任务类型（/current 返回，重启后靠它判断是否要重新接管训练） */
+  kind?: string;
+  /** 训练任务额外带的信息（/current 返回） */
+  exp?: string;
+  epochs?: number;
 }
 
 export interface LoggerLike {
@@ -185,6 +190,17 @@ export class WorkerClient {
       };
       setTimeout(() => void tick(), 1200);
     });
+  }
+
+  /** worker 里正在跑的任务（重启后靠它重新接管训练）。没有返回 null。 */
+  async currentJob(): Promise<JobState | null> {
+    try {
+      const res = await fetch(`${this.baseUrl}/current`, { signal: AbortSignal.timeout(3000) });
+      const b = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
+      return b.job ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async submit(kind: string, params: Record<string, unknown>): Promise<string> {

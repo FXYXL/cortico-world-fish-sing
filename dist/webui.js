@@ -1310,8 +1310,9 @@ function mountTrain(ctx) {
     const total = st.total || 0;
 
     startT.disabled = running || st.datasetBusy;
-    stopT.disabled = !running || !owned;
-    stopT.title = owned ? '' : '这个训练不是本次启动的（可能是重启前留下的），面板管不了它，要停只能结束 python 进程';
+    // 即使不是本次启动的也能停：/stop 取消的是 worker 当前任务，跟谁提交的无关
+    stopT.disabled = !running;
+    stopT.title = owned ? '' : '这个训练不是本次启动的（可能是重启前留下的），按下会让 worker 取消它当前的任务';
     tFill.style.width = `${running ? (job ? job.pct : Math.min(99, Math.round((log.done / Math.max(1, total)) * 100))) : job && job.state === 'done' ? 100 : 0}%`;
 
     if (job) {
