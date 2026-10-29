@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-fish-sing",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "让她真的开口唱：B 站点歌或本地文件 → 分离 → 换声 → 混音，本机出声或发 QQ 语音条",
   "type": "module",
   "main": "./src/index.ts",
@@ -36,7 +36,7 @@
       "local"
     ],
     "describe": "describe.json",
-    "webUiClient": "dist/webui.js"
+    "webUiClient": "dist/webui-b6bd11d1.js"
   },
   "scripts": {
     "doctor": "node tools/doctor.mjs"
