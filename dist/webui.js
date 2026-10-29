@@ -119,12 +119,16 @@ function mount(ctx) {
         ? `共 ${n} 首 · ${data.totalMb || 0} MB · ${data.playingEnabled === false ? '本机播放已关' : ''}`
         : '还一首都没唱过';
       render();
-      // 有在播的就每 2 秒对一次状态，播完自动取消高亮
-      if (timer) clearTimeout(timer);
-      if (playingId) timer = setTimeout(() => void load(), 2000);
+      schedulePoll();
     } catch {
       /* say() 已经提示过了 */
     }
+  };
+
+  /** 有在播的就每 2 秒对一次状态，播完自动取消高亮；没在播就不轮询。 */
+  const schedulePoll = () => {
+    if (timer) clearTimeout(timer);
+    timer = playingId ? setTimeout(() => void load(), 2000) : null;
   };
 
   const sorted = () => {
@@ -195,7 +199,19 @@ function mount(ctx) {
 
     const acts = el('div', 'fs-acts');
     const play = el('button', 'fs-btn', '播放');
-    play.addEventListener('click', () => void call('play', [r.id]));
+    play.addEventListener('click', async () => {
+      play.disabled = true;
+      try {
+        await call('play', [r.id]);
+        // 立刻把「正在播」落到本地状态：不然「停止播放」要等下一次轮询才可用
+        playingId = `${r.id}.mp3`;
+        stop.disabled = false;
+        render();
+        schedulePoll();
+      } finally {
+        play.disabled = false;
+      }
+    });
     const rename = el('button', 'fs-btn', '改名');
     rename.addEventListener('click', () => {
       // 就地编辑，不用 prompt（Electron 里 prompt 某些版本被禁用）
@@ -261,7 +277,15 @@ function mount(ctx) {
     say('');
     void load();
   });
-  stop.addEventListener('click', () => void call('stop', []).then(load).catch(() => {}));
+  stop.addEventListener('click', async () => {
+    stop.disabled = true;
+    try {
+      await call('stop', []);
+    } finally {
+      playingId = '';
+      await load();
+    }
+  });
   reveal.addEventListener('click', () => void call('reveal', []));
   search.addEventListener('input', () => {
     filter = search.value.trim().toLowerCase();
