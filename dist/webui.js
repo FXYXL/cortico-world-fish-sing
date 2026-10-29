@@ -716,6 +716,13 @@ function mountTrain(ctx) {
   const scanBtn = el('button', 'fs-btn', '扫描');
   bar.append(pathIn, scanBtn);
 
+  const importBar = el('div', 'fs-bar');
+  const expSel = el('select', 'fs-btn');
+  expSel.title = '本机已有的训练实验（logs/<实验>/0_gt_wavs 里还留着切片的）';
+  const importBtn = el('button', 'fs-btn', '导入已训练模型的数据');
+  const expMeta = el('span', 'fs-meta', '');
+  importBar.append(el('span', 'fs-meta', '已有模型：'), expSel, importBtn, expMeta);
+
   const bar2 = el('div', 'fs-bar');
   const modeSel = el('select', 'fs-btn');
   for (const [v, t] of [['auto', '自动切片（按乐句，2–4.5 秒）'], ['fixed', '固定长度']]) {
@@ -731,7 +738,14 @@ function mountTrain(ctx) {
   const stopBtn = el('button', 'fs-btn danger', '停止');
   stopBtn.disabled = true;
   const revealBtn = el('button', 'fs-btn', '打开目录');
-  bar2.append(modeSel, lenIn, startBtn, stopBtn, el('span', 'fs-grow'), revealBtn);
+  const appendChk = el('input', 'fs-ck');
+  appendChk.type = 'checkbox';
+  appendChk.checked = true;
+  appendChk.disabled = true;
+  const appendLabel = el('label', 'fs-meta', '追加到当前数据集');
+  appendLabel.style.display = 'none';
+
+  bar2.append(modeSel, lenIn, startBtn, stopBtn, appendChk, appendLabel, el('span', 'fs-grow'), revealBtn);
 
   const msg = el('div', 'fs-msg');
   const prog = el('div', 'fs-prog');
@@ -741,11 +755,12 @@ function mountTrain(ctx) {
   const resultBox = el('div', '');
   const weightBox = el('div', '');
 
-  root.append(bar, bar2, prog, msg, listBox, resultBox, weightBox);
+  root.append(bar, importBar, bar2, prog, msg, listBox, resultBox, weightBox);
 
   let items = [];
   let checked = new Set();
   let timer = null;
+  let lastDir = '';
 
   const say = (t, bad) => {
     msg.textContent = t || '';
@@ -1005,6 +1020,9 @@ function mountTrain(ctx) {
       }
     }
     if (st.dataset) {
+      lastDir = st.dataset.dir || '';
+      appendChk.disabled = !lastDir;
+      appendLabel.style.display = lastDir ? '' : 'none';
       renderResult(st.dataset);
       if (st.dataset.rows && st.dataset.rows.length) {
         if (st.dataset.presets) wPresets = st.dataset.presets;
@@ -1015,6 +1033,52 @@ function mountTrain(ctx) {
     }
     return Boolean(job && job.state === 'running');
   };
+
+  let exps = [];
+
+  const loadExperiments = async () => {
+    try {
+      const r = await ctx.invoke('experiments', []);
+      exps = (r && r.items) || [];
+      expSel.replaceChildren();
+      if (!exps.length) {
+        const o = el('option', '', '（没有可导入的实验）');
+        o.value = '';
+        expSel.append(o);
+        importBtn.disabled = true;
+        expMeta.textContent = '训练切片（logs/<实验>/0_gt_wavs）已经不在了，只能从原始音频重建';
+        return;
+      }
+      for (const it of exps) {
+        const o = el('option', '', `${it.exp}（${it.slices} 片${it.models.length ? ' · ' + it.models.join(',') : ''}）`);
+        o.value = it.exp;
+        expSel.append(o);
+      }
+      importBtn.disabled = false;
+      expMeta.textContent = '';
+    } catch (e) {
+      expMeta.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  importBtn.addEventListener('click', async () => {
+    const exp = String(expSel.value || '');
+    if (!exp) return;
+    const cur = lastDir;
+    const appendTo = cur && appendChk.checked ? cur : '';
+    importBtn.disabled = true;
+    try {
+      await call('import', [exp, appendTo]);
+      timer = setInterval(() => void poll(), 900);
+      await poll();
+    } finally {
+      importBtn.disabled = false;
+    }
+  });
+
+  appendChk.addEventListener('change', () => {
+    appendLabel.textContent = appendChk.checked ? '追加到当前数据集' : '新建数据集';
+  });
 
   scanBtn.addEventListener('click', async () => {
     const raw = String(pathIn.value || '').trim();
@@ -1049,9 +1113,10 @@ function mountTrain(ctx) {
     }
     const params = { sliceMode: modeSel.value };
     if (modeSel.value === 'fixed') params.targetLen = Number(lenIn.value) || 3.7;
+    const opts = lastDir && appendChk.checked ? { dir: lastDir, append: true } : {};
     startBtn.disabled = true;
     try {
-      await call('start', [picked, params]);
+      await call('start', [picked, params, opts]);
       timer = setInterval(() => void poll(), 900);
       await poll();
     } catch {
@@ -1063,6 +1128,7 @@ function mountTrain(ctx) {
   revealBtn.addEventListener('click', () => void call('reveal', []).catch(() => {}));
 
   void poll();
+  void loadExperiments();
 
   return {
     dispose() {

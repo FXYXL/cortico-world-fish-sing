@@ -45,6 +45,14 @@ export interface WorkerPaths {
 
 const clean = (v: unknown): string => String(v ?? '').trim();
 
+/**
+ * 老机器上 RVC 项目常见的位置。
+ *
+ * 自托管之后 rvcRoot 指向 runtime/rvc，里面只有权重和索引，**没有 logs/<实验>/0_gt_wavs**
+ * （那是训练时的中间产物）。想「在已有模型上补音域」就得回头找这些老目录。
+ */
+export const LEGACY_RVC_ROOTS = ['D:/AI/rvc', 'C:/rvc'];
+
 export function resolvePaths(cfg: FishSingConfigSection, dataDir: string): WorkerPaths {
   const w = cfg.worker ?? ({} as FishSingConfigSection['worker']);
   const runtimeRoot = clean(w.runtimeRoot) || join(dataDir, 'runtime');

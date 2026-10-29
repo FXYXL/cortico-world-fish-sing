@@ -4,7 +4,7 @@
  * 所有音频处理都在 Python worker 里做（dataset.py），这里只负责把结果整理成
  * 面板能直接画的结构——统计、分档、直方图分桶。
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import type { WorkerClient } from './worker.ts';
@@ -345,4 +345,52 @@ export function sliceWeights(m: Manifest, cfg: WeightConfig): Array<{ file: stri
       const id = bandOfSlice(s, cfg.mode);
       return { file: s.file, weight: id === 'unknown' ? 1 : (cfg.bands[id] ?? 1) };
     });
+}
+
+// ---------------------------------------------------------------- 已有实验
+
+export interface ExperimentInfo {
+  exp: string;
+  /** logs/<exp>/0_gt_wavs 里的切片数 */
+  slices: number;
+  gtDir: string;
+  /** 这个实验有没有检索索引 */
+  index: string | null;
+  /** assets/weights 里属于这个实验的模型 */
+  models: string[];
+}
+
+/**
+ * 列出本机已有的训练实验（有切片的那种）。
+ *
+ * 为什么需要：想"在现有模型上补音域"，得先能看见它当初用了哪些切片。
+ * RVC 把切片留在 logs/<exp>/0_gt_wavs，但训练完很多人会清掉——清掉了这里就看不到。
+ */
+export function listExperiments(rvcRoot: string, weights: string[] = []): ExperimentInfo[] {
+  const logs = join(rvcRoot, 'logs');
+  if (!existsSync(logs)) return [];
+  const out: ExperimentInfo[] = [];
+  for (const name of readdirSync(logs, { withFileTypes: true })) {
+    if (!name.isDirectory()) continue;
+    const exp = name.name;
+    const gtDir = join(logs, exp, '0_gt_wavs');
+    if (!existsSync(gtDir)) continue;
+    const slices = readdirSync(gtDir).filter((f) => f.endsWith('.wav') && !f.includes('.spec.')).length;
+    if (!slices) continue;
+    out.push({
+      exp,
+      slices,
+      gtDir,
+      index: findIndexIn(logs, exp),
+      models: weights.filter((m) => m.replace(/\.pth$/i, '').replace(/_e\d+(_s\d+)?$/, '') === exp),
+    });
+  }
+  return out.sort((a, b) => b.slices - a.slices);
+}
+
+function findIndexIn(logs: string, exp: string): string | null {
+  const dir = join(logs, exp);
+  if (!existsSync(dir)) return null;
+  const idx = readdirSync(dir).filter((f) => f.endsWith('.index'));
+  return idx.length ? join('logs', exp, idx[0]) : null;
 }

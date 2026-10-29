@@ -20,6 +20,7 @@ import {
   BAND_LABEL,
   datasetDirName,
   f0Histogram,
+  listExperiments,
   readManifest,
   readWeights,
   saveWeights,
@@ -38,7 +39,7 @@ import {
   useModel,
   type CurrentModel,
 } from './models.ts';
-import { BUNDLED_SEPARATE, MODELS_MANIFEST, PKG_ROOT, resolvePaths, VENDORED_RVC, type WorkerPaths } from './paths.ts';
+import { BUNDLED_SEPARATE, LEGACY_RVC_ROOTS, MODELS_MANIFEST, PKG_ROOT, resolvePaths, VENDORED_RVC, type WorkerPaths } from './paths.ts';
 import {
   copyRvcCode,
   downloadModels,
@@ -510,6 +511,29 @@ export class FishSingWorld implements World {
     this.routes = resolvePaths(this.effCfg(), this.opts.dataDir);
   }
 
+  /**
+   * 本机能看到的训练实验（含历史目录）。
+   *
+   * 自托管后 rvcRoot 指向 runtime/rvc，里面只有权重和索引；训练切片（0_gt_wavs）
+   * 是中间产物，只在老项目里。所以两边都扫，用实验名去重。
+   */
+  private allExperiments(): Array<{
+    exp: string; slices: number; gtDir: string; index: string | null; models: string[]; root: string;
+  }> {
+    const weights = listModels(this.routes, this.current.model).map((m) => m.name);
+    const roots = [this.routes.rvcRoot, ...LEGACY_RVC_ROOTS.filter((p) => existsSync(p))];
+    const seen = new Set<string>();
+    const items = [];
+    for (const root of roots) {
+      for (const it of listExperiments(root, weights)) {
+        if (seen.has(it.exp)) continue;
+        seen.add(it.exp);
+        items.push({ ...it, root });
+      }
+    }
+    return items.sort((a, b) => b.slices - a.slices);
+  }
+
   /** 训练面板（数据准备阶段）：扫描、开始、进度、结果。 */
   private async trainInvoke(method: string, args: unknown[]): Promise<unknown> {
     if (method === 'scan') {
@@ -523,9 +547,12 @@ export class FishSingWorld implements World {
       if (this.datasetJob?.state === 'running') throw new Error('已经有一个数据准备任务在跑，等它结束');
       const sources = (args[0] as TrainSource[]) ?? [];
       const params = (args[1] as Record<string, unknown>) ?? {};
+      const opts = (args[2] as { dir?: string; append?: boolean } | undefined) ?? {};
       if (!sources.length) throw new Error('先勾选至少一首素材');
 
-      const dir = datasetDirName(this.opts.dataDir);
+      // 追加到当前数据集（在同一模型的基础上补音域），否则新建
+      const dir = opts.dir || datasetDirName(this.opts.dataDir);
+      if (opts.append) params.append = true;
       const job = { id: '', state: 'running' as const, pct: 0, msg: '排队中', dir };
       this.datasetJob = job;
       try {
@@ -584,6 +611,55 @@ export class FishSingWorld implements World {
           }
           : null,
       };
+    }
+
+    if (method === 'experiments') {
+      return {
+        items: this.allExperiments(),
+        current: this.current.model,
+        rvcRoot: this.routes.rvcRoot,
+      };
+    }
+
+    if (method === 'import') {
+      if (this.datasetJob?.state === 'running') throw new Error('已经有一个任务在跑');
+      const exp = String(args[0] ?? '').trim();
+      const appendTo = String(args[1] ?? '').trim();
+      const info = this.allExperiments().find((e) => e.exp === exp);
+      if (!info) {
+        throw new Error(`找不到实验「${exp}」的切片。训练完清理过 logs 的话就只能从原始音频重建。`);
+      }
+      const dir = appendTo || datasetDirName(this.opts.dataDir);
+      const job = { id: '', state: 'running' as const, pct: 0, msg: '排队中', dir };
+      this.datasetJob = job;
+      try {
+        const id = await this.worker.submit('dataset', {
+          mode: 'import',
+          gtDir: info.gtDir,
+          out: dir,
+          label: `导入：${exp}`,
+          append: Boolean(appendTo),
+        });
+        job.id = id;
+      } catch (e) {
+        job.state = 'error';
+        throw e;
+      }
+      void this.worker
+        .wait(job.id, (p, m) => {
+          job.pct = Math.round(p * 100);
+          job.msg = m;
+        })
+        .then(() => {
+          job.state = 'done';
+          job.pct = 100;
+          job.msg = '完成';
+        })
+        .catch((e: unknown) => {
+          job.state = 'error';
+          job.msg = e instanceof Error ? e.message : String(e);
+        });
+      return { text: `开始导入 ${exp} 的 ${info.slices} 片切片，产物在 ${dir}` };
     }
 
     if (method === 'weights') {

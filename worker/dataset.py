@@ -256,6 +256,19 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
     (out / "slices").mkdir(parents=True, exist_ok=True)
     (out / "sep").mkdir(parents=True, exist_ok=True)
 
+    # 追加模式：已有数据集就接着往里加，不覆盖历史（"在这个模型的基础上补音域"就是靠它）
+    append = bool(params.get("append", False))
+    old = None
+    if append and (out / "manifest.json").is_file():
+        try:
+            old = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            log(f"追加模式：已有 {len(old.get('slices', []))} 片")
+        except Exception:  # noqa: BLE001
+            old = None
+    base_index = len(old.get("sources", [])) if old else 0
+    old_records = list(old.get("slices", [])) if old else []
+    old_sources = list(old.get("sources", [])) if old else []
+
     mode = str(params.get("sliceMode") or "auto")
     target_len = float(params.get("targetLen") or 3.7)
     min_len = float(params.get("minLen") or MIN_LEN)
@@ -276,12 +289,13 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
     records, src_meta = [], []
     n = len(usable)
 
-    for i, s in enumerate(usable):
+    for i0, s in enumerate(usable):
+        i = i0 + base_index
         if cancel.is_set():
             raise RuntimeError("已取消")
         src_path = Path(s["path"])
         label = s["name"]
-        progress(0.02 + 0.5 * (i / n), f"分离 {i + 1}/{n}：{label[:28]}")
+        progress(0.02 + 0.5 * (i0 / n), f"分离 {i0 + 1}/{n}：{label[:28]}")
 
         need_sep = not skip_sep and not s.get("dry", False)
         vocal_wav = src_path
@@ -372,9 +386,10 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
                 "drop": drop,
             })
 
-        progress(0.02 + 0.5 * ((i + 1) / n), f"已处理 {i + 1}/{n}：{label[:28]}")
+        progress(0.02 + 0.5 * ((i0 + 1) / n), f"已处理 {i0 + 1}/{n}：{label[:28]}")
 
     progress(0.55, "统计音域分布")
+    records = old_records + records
     kept = [r for r in records if r["kept"]]
     bands = {}
     for r in kept:
@@ -394,7 +409,7 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             "minVoiced": min_voiced, "skipSeparate": skip_sep,
         },
         "bands": [{"id": b[2], "min": b[0], "max": b[1]} for b in BANDS],
-        "sources": src_meta,
+        "sources": old_sources + src_meta,
         "slices": records,
         "stats": {
             "sources": len(src_meta),
@@ -436,3 +451,130 @@ def fixed_segments(y: np.ndarray, sr: int, target_len: float):
             out.append((t, end))
         t = end
     return out
+
+
+def _link_or_copy(src, dst):
+    """同盘硬链接（不占空间），跨盘就复制。切片是只读的，链接没有副作用。"""
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def import_experiment(gt_dir, out_dir, label, progress, cancel, append=False) -> dict:
+    """
+    把一个已有 RVC 实验的训练切片（logs/<exp>/0_gt_wavs）导入成数据集。
+
+    用途：在「已经训好的模型」基础上继续补音域。切片直接硬链接过来，不占额外空间；
+    重新算一遍 F0，这样旧数据也能参与音域分档和加权。
+    """
+    src_dir = Path(gt_dir)
+    if not src_dir.is_dir():
+        raise RuntimeError(f"找不到切片目录：{src_dir}")
+
+    files = sorted(p for p in src_dir.glob("*.wav") if ".spec." not in p.name)
+    if not files:
+        raise RuntimeError(f"{src_dir} 里没有 .wav 切片（训练完清理过就只剩索引了）")
+
+    out = Path(out_dir)
+    (out / "slices").mkdir(parents=True, exist_ok=True)
+
+    old = None
+    if append and (out / "manifest.json").is_file():
+        try:
+            old = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            old = None
+    old_records = list(old.get("slices", [])) if old else []
+    old_sources = list(old.get("sources", [])) if old else []
+    base_index = len(old_sources)
+
+    log(f"导入 {len(files)} 片：{src_dir}")
+    records = []
+    total = len(files)
+    t0 = time.time()
+
+    for i, f in enumerate(files):
+        if cancel.is_set():
+            raise RuntimeError("已取消")
+        y16 = load_mono(f, 16000)
+        dur = y16.size / 16000 if y16.size else 0.0
+        f0, p90, vratio = f0_stats(y16, 16000)
+        peak = float(np.abs(y16).max()) if y16.size else 0.0
+
+        drop = None
+        if dur < MIN_LEN:
+            drop = "too_short"
+        elif vratio and vratio < 0.25:
+            drop = "too_quiet"
+        elif peak >= 0.999:
+            drop = "clipped"
+        elif f0 and (f0 < 70 or f0 > 1200):
+            drop = "f0_outlier"
+
+        if drop is None:
+            _link_or_copy(f, out / "slices" / f.name)
+
+        records.append({
+            "file": f"slices/{f.name}",
+            "source": label,
+            "sourceIndex": base_index,
+            "start": 0.0,
+            "dur": round(dur, 3),
+            "f0_median": round(f0, 1),
+            "f0_p90": round(p90, 1),
+            "voiced": round(vratio, 3),
+            "peak": round(peak, 4),
+            "band": band_of(f0),
+            "kept": drop is None,
+            "drop": drop,
+            "imported": True,
+        })
+
+        if i % 20 == 0 or i == total - 1:
+            progress(0.05 + 0.9 * ((i + 1) / total), f"分析 {i + 1}/{total}：{f.name}")
+
+    all_records = old_records + records
+    kept = [r for r in all_records if r["kept"]]
+    bands, drops = {}, {}
+    for r in kept:
+        bands[r["band"]] = bands.get(r["band"], 0) + 1
+    for r in all_records:
+        if not r["kept"]:
+            drops[r["drop"]] = drops.get(r["drop"], 0) + 1
+
+    source_meta = {
+        "index": base_index,
+        "path": str(src_dir),
+        "name": label,
+        "duration": round(sum(r["dur"] for r in records), 1),
+        "separated": False,
+        "vocalFile": "",
+        "imported": True,
+    }
+
+    manifest = {
+        "version": 1,
+        "createdAt": int(time.time() * 1000),
+        "sr": OUT_SR,
+        "params": {"importFrom": str(src_dir), "append": bool(append)},
+        "bands": [{"id": b[2], "min": b[0], "max": b[1]} for b in BANDS],
+        "sources": old_sources + [source_meta],
+        "slices": all_records,
+        "stats": {
+            "sources": len(old_sources) + 1,
+            "slices": len(all_records),
+            "kept": len(kept),
+            "dropped": len(all_records) - len(kept),
+            "seconds": round(sum(r["dur"] for r in kept), 1),
+            "droppedByReason": drops,
+            "byBand": bands,
+            "elapsedSec": round(time.time() - t0, 1),
+        },
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    progress(1.0, f"导入完成：{len(kept)} 片 / {manifest['stats']['seconds'] / 60:.1f} 分钟")
+    log(f"导入完成 {out}：{len(kept)} 片，用时 {manifest['stats']['elapsedSec']}s")
+    return {"dir": str(out), "manifest": str(out / "manifest.json"), "stats": manifest["stats"]}

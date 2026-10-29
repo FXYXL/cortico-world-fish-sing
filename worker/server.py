@@ -144,6 +144,15 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
     if kind == "dataset":
         import dataset as ds
         out = Path(params.get("out") or (WORK_ROOT / "datasets" / jid))
+        if str(params.get("mode")) == "import":
+            return ds.import_experiment(
+                gt_dir=str(params.get("gtDir") or ""),
+                out_dir=out,
+                label=str(params.get("label") or Path(str(params.get("gtDir") or "")).parent.name),
+                progress=progress,
+                cancel=cancel,
+                append=bool(params.get("append", False)),
+            )
         return ds.build(
             sources=params.get("sources") or [],
             out_dir=out,
