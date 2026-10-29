@@ -118,8 +118,8 @@ export class WorkerClient {
         ? join(this.opts.rvcRoot, this.opts.index)
         : this.opts.index,
       FISHSING_FFMPEG: join(this.opts.ffmpegDir, 'ffmpeg.exe'),
-      FISHSING_SEEDVC_PY: this.opts.separatePython,
-      FISHSING_SEEDVC_SEP: this.opts.separateScript,
+      FISHSING_SEP_PY: this.opts.separatePython,
+      FISHSING_SEP_SCRIPT: this.opts.separateScript,
       FISHSING_WORK: this.opts.workDir,
       PYTHONIOENCODING: 'utf-8',
       PYTHONUNBUFFERED: '1',

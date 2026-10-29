@@ -111,10 +111,14 @@ D:\AI\rvc\venv\Scripts\python.exe cli.py in.mp3 --start 95 --duration 30 --out �
 ## 目录
 
 ```
+vendor/rvc/     RVC 代码副本（MIT，随包分发）
+assets/models.manifest.json   权重清单（名称/大小/sha256/落盘路径）
+dist/webui.js   控制台面板（手写 ESM，无构建链）
 src/
   index.ts      入口（default 导出 definition）
   definition.ts WorldDefinition（id/默认值/preflight/create/describe）
   config.ts     配置段与默认值
+  paths.ts      路径解析（自托管 / 外部 RVC 两种模式）
   world.ts      World 类：工具、环境提示词、控制台声明
   sing.ts       编排：找源 → 换声 → 投递
   bili.ts       B 站搜索 / 打�� / 取音频流 / 下载
@@ -126,6 +130,7 @@ worker/
   engine.py     RVC 常驻 + 55 秒切片 + 分离 + 混音
   server.py     HTTP：/health /job /job/<id> /stop /doctor
   cli.py        一条命令跑完整条链
+  separate.py   demucs 分离（自带，不依赖外部项目）
 tools/
   doctor.mjs    自检
   install.mjs   安装到 Coopanion（会改 extensions/package.json 与 config.json）

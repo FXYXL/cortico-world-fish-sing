@@ -51,13 +51,15 @@ export interface FishSingConfigSection {
     gapMs: number;
   };
   worker: {
-    /** RVC 项目根（含 assets/weights、logs、venv） */
+    /** 自托管根目录；留空 = <数据目录>/runtime（推荐） */
+    runtimeRoot: string;
+    /** 外部 RVC 项目根；留空 = 用自托管（<runtimeRoot>/rvc） */
     rvcRoot: string;
-    /** 跑 worker 的 python（要装 torch/soundfile 的那个 venv） */
+    /** 外部 python；留空 = <runtimeRoot>/venv/Scripts/python.exe */
     pythonPath: string;
-    /** demucs 所在的 python（Seed-VC 环境） */
+    /** 跑 demucs 的 python；留空 = 与 pythonPath 相同 */
     separatePython: string;
-    /** demucs 分离脚本 */
+    /** 分离脚本；留空 = 插件自带的 worker/separate.py */
     separateScript: string;
     /** ffmpeg 目录（ffmpeg.exe / ffprobe.exe / ffplay.exe） */
     ffmpegDir: string;
@@ -102,10 +104,11 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     gapMs: 1500,
   },
   worker: {
-    rvcRoot: 'D:\\AI\\rvc',
-    pythonPath: 'D:\\AI\\rvc\\venv\\Scripts\\python.exe',
-    separatePython: 'D:\\AI\\seed-vc\\venv\\Scripts\\python.exe',
-    separateScript: 'D:\\AI\\seed-vc-src\\separate.py',
+    runtimeRoot: '',
+    rvcRoot: '',
+    pythonPath: '',
+    separatePython: '',
+    separateScript: '',
     ffmpegDir: 'D:\\ffmpeg\\bin',
     port: 9890,
     token: '',
@@ -301,28 +304,34 @@ export function fishsingConfigGroups(): ConfigGroup[] {
         type: 'object',
         title: '运行时（改这些要重启）',
         properties: {
+          [at('worker.runtimeRoot')]: {
+            type: 'string',
+            title: '自托管根目录',
+            description: '留空 = <数据目录>/runtime。代码、venv、权重都装在这里。',
+            'x-hot': false,
+          },
           [at('worker.rvcRoot')]: {
             type: 'string',
-            title: 'RVC 根目录',
-            description: '含 assets/weights、logs、venv 的那个目录。',
+            title: '外部 RVC 目录（高级）',
+            description: '已经有一份 RVC 项目时才填，填了就不用自托管。留空 = 用插件自带的代码。',
             'x-hot': false,
           },
           [at('worker.pythonPath')]: {
             type: 'string',
-            title: 'worker 用的 python',
-            description: '要装了 torch/soundfile 的那个 venv。',
+            title: '外部 python（高级）',
+            description: '留空 = 自托管 venv。填了就用你的。',
             'x-hot': false,
           },
           [at('worker.separatePython')]: {
             type: 'string',
-            title: '分离用的 python',
-            description: '装了 demucs 的环境（Seed-VC 那个 venv）。',
+            title: '分离用的 python（高级）',
+            description: '留空 = 与上面同一个 venv（demucs 装在同一个里）。',
             'x-hot': false,
           },
           [at('worker.separateScript')]: {
             type: 'string',
-            title: '分离脚本',
-            description: '吃 <输入 wav> <输出目录>，产出 vocals.wav / inst.wav。',
+            title: '分离脚本（高级）',
+            description: '留空 = 插件自带的 worker/separate.py。',
             'x-hot': false,
           },
           [at('worker.ffmpegDir')]: {

@@ -10,7 +10,7 @@ fish-sing worker 的核心：常驻 RVC + 切片换声 + 分离/混音。
 
 外部依赖：
   · RVC 环境（D:\\AI\\rvc\\venv）：torch 2.7.1+cu118，提供 VC / ContentVec / rmvpe
-  · Seed-VC 环境（D:\\AI\\seed-vc\\venv）：demucs 4.1.0，权重已缓存在
+  · 运行时 venv（torch + demucs）：分离也用同一个，脚本是插件自带的 worker/separate.py
     %USERPROFILE%\\.cache\\torch\\hub\\checkpoints\\955717e8-8726e21a.th
   · ffmpeg / ffprobe（D:\\ffmpeg\\bin）
 """
@@ -35,8 +35,9 @@ import soundfile as sf
 
 RVC_ROOT = Path(os.environ.get("FISHSING_RVC_ROOT", r"D:\AI\rvc"))
 RVC_PY = RVC_ROOT / "venv" / "Scripts" / "python.exe"
-SEEDVC_PY = Path(os.environ.get("FISHSING_SEEDVC_PY", r"D:\AI\seed-vc\venv\Scripts\python.exe"))
-SEEDVC_SEP = Path(os.environ.get("FISHSING_SEEDVC_SEP", r"D:\AI\seed-vc-src\separate.py"))
+SEP_PY = Path(os.environ.get("FISHSING_SEP_PY", sys.executable))
+SEP_SCRIPT = Path(os.environ.get("FISHSING_SEP_SCRIPT",
+                         str(Path(__file__).resolve().parent / "separate.py")))
 FFMPEG = Path(os.environ.get("FISHSING_FFMPEG", r"D:\ffmpeg\bin\ffmpeg.exe"))
 
 DEFAULT_MODEL = os.environ.get("FISHSING_MODEL", "dfy2.pth")
@@ -204,7 +205,7 @@ class SingEngine:
 
     def separate(self, src: Path, out_dir: Path, cancel: threading.Event,
                  progress: Optional[Callable[[float, str], None]] = None) -> tuple:
-        """demucs htdemucs 出 vocals/inst。跑在 Seed-VC 环境（那边才有 demucs）。
+        """demucs htdemucs 出 vocals/inst。分离与推理共用一个运行时 venv，脚本是插件自带的 worker/separate.py。
 
         坑：`Popen(stdout=PIPE)` 之后必须**持续读**，否则子进程写满管道缓冲区（Windows 64KB）
         就会永久阻塞在 write 上——现象是 CPU 0%、显存也没动静、看起来"卡死"。
@@ -215,13 +216,13 @@ class SingEngine:
         inst = out_dir / "inst.wav"
         if vocals.is_file() and inst.is_file():
             return vocals, inst
-        if not SEEDVC_PY.is_file():
-            raise RuntimeError(f"找不到 Seed-VC 的 python：{SEEDVC_PY}")
-        if not SEEDVC_SEP.is_file():
-            raise RuntimeError(f"找不到分离脚本：{SEEDVC_SEP}")
+        if not SEP_PY.is_file():
+            raise RuntimeError(f"找不到分离用的 python：{SEP_PY}")
+        if not SEP_SCRIPT.is_file():
+            raise RuntimeError(f"找不到分离脚本：{SEP_SCRIPT}")
 
         proc = subprocess.Popen(
-            [str(SEEDVC_PY), str(SEEDVC_SEP), str(src), str(out_dir)],
+            [str(SEP_PY), str(SEP_SCRIPT), str(src), str(out_dir), "--device", "auto"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="ignore", bufsize=1,
         )
@@ -556,8 +557,8 @@ def doctor() -> dict:
         RVC_ROOT / "assets" / "weights" / DEFAULT_MODEL)
     add("检索索引", Path(DEFAULT_INDEX).is_file(), DEFAULT_INDEX)
     add("ffmpeg", FFMPEG.is_file(), FFMPEG)
-    add("分离环境", SEEDVC_PY.is_file(), SEEDVC_PY)
-    add("分离脚本", SEEDVC_SEP.is_file(), SEEDVC_SEP)
+    add("分离环境", SEP_PY.is_file(), SEP_PY)
+    add("分离脚本", SEP_SCRIPT.is_file(), SEP_SCRIPT)
     try:
         import torch
         add("CUDA", torch.cuda.is_available(),

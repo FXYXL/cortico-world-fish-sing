@@ -16,6 +16,7 @@ import type { Language } from 'cortico/core/language.ts';
 import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
+import { resolvePaths, type WorkerPaths } from './paths.ts';
 import { duration, type FfmpegDeps } from './audio.ts';
 import { Player } from './deliver.ts';
 import { dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
@@ -36,6 +37,8 @@ export class FishSingWorld implements World {
   private readonly opts: FishSingWorldOptions;
   private readonly player = new Player();
   private readonly worker: WorkerClient;
+  /** 解析后的实际路径（自托管 or 外部 RVC），构造函数里算一次。 */
+  private readonly routes: WorkerPaths;
   private lastSong: { title: string; at: number; duration: number } | null = null;
   /** 同一时刻只允许一首在跑（GPU 只有一张卡）。 */
   private busy = false;
@@ -44,13 +47,14 @@ export class FishSingWorld implements World {
     // 不用「参数属性」写法：Node 的类型剥离跑不了它
     this.opts = opts;
     const cfg = opts.cfg || ({} as FishSingConfigSection);
+    this.routes = resolvePaths(cfg, opts.dataDir);
     this.worker = new WorkerClient(
       {
-        rvcRoot: cfg.worker?.rvcRoot ?? 'D:\\AI\\rvc',
-        pythonPath: cfg.worker?.pythonPath ?? 'D:\\AI\\rvc\\venv\\Scripts\\python.exe',
-        separatePython: cfg.worker?.separatePython ?? 'D:\\AI\\seed-vc\\venv\\Scripts\\python.exe',
-        separateScript: cfg.worker?.separateScript ?? 'D:\\AI\\seed-vc-src\\separate.py',
-        ffmpegDir: cfg.worker?.ffmpegDir ?? 'D:\\ffmpeg\\bin',
+        rvcRoot: this.routes.rvcRoot,
+        pythonPath: this.routes.pythonPath,
+        separatePython: this.routes.separatePython,
+        separateScript: this.routes.separateScript,
+        ffmpegDir: this.routes.ffmpegDir,
         port: Number(cfg.worker?.port ?? 9890),
         token: String(cfg.worker?.token ?? ''),
         autoStart: cfg.worker?.autoStart !== false,
@@ -101,7 +105,7 @@ export class FishSingWorld implements World {
   }
 
   private ffmpeg(): FfmpegDeps {
-    return { dir: this.opts.cfg.worker?.ffmpegDir ?? 'D:\\ffmpeg\\bin' };
+    return { dir: this.routes.ffmpegDir };
   }
 
   private onebotToken(): string {
