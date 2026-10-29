@@ -21,7 +21,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -331,30 +330,28 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
              "-sr", SR_TAG, "-sw", "1", "-v", VERSION,
              "-f0", "1", "-l", "1", "-c", "0"]
 
-    log("\n>>> 训练开始（日志写到 logs/%s/train.log）" % exp)
-    proc = subprocess.Popen(
-        [str(a) for a in args],
-        cwd=str(RVC_ROOT),
-        env=child_env(env_extra),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        bufsize=1,
-    )
-
-    # stdout **必须**有人一直读。训练进程每轮都打日志，Windows 管道只有 64KB，
-    # 写满之后子进程会永久阻塞在 write 上——现象是 CPU 归零、日志停在某一轮不动
-    # （本地实测卡在第 3 轮，py-spy 抓栈显示主线程停在 logging.emit）。
-    def drain():
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                log(line)
-
-    threading.Thread(target=drain, daemon=True).start()
+    # 训练进程的输出直接重定向到文件，**不走管道**。两个原因，都踩过：
+    #
+    # 1. 管道只有 64KB，写满后子进程永久阻塞在 write 上（实测卡在第 3 轮，
+    #    CPU 归零，py-spy 抓到主线程停在 logging.emit）。
+    # 2. 管道由 worker 持有，worker 一死（Coo 重启、点停止、崩溃）管道就断，
+    #    训练进程下一次写 stdout 立刻挂掉——三小时的训练白跑。
+    #
+    # 改成写文件之后这两个问题同时消失，而且 worker 意外退出时训练还能自己跑完。
+    stdout_log = exp_dir / "train.stdout.log"
+    log(f">>> 训练开始（进度 logs/{exp}/train.log，原始输出 logs/{exp}/train.stdout.log）")
+    stdout_f = open(stdout_log, "ab")
+    try:
+        proc = subprocess.Popen(
+            [str(a) for a in args],
+            cwd=str(RVC_ROOT),
+            env=child_env(env_extra),
+            stdout=stdout_f,
+            stderr=subprocess.STDOUT,
+        )
+    finally:
+        # 子进程已经继承了这个句柄，父进程这边可以关掉；不关的话取消时文件句柄会挂着
+        stdout_f.close()
 
     # 训练进度只能从日志文件读（stdout 里没有轮次信息）
     last_epoch = 0
