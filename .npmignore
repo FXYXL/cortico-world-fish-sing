@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+*.log
+node_modules/
+npm-debug.log*
+.npmrc
+.git
+.gitignore
+data/
+*.tgz
+__pycache__/
+*.pyc

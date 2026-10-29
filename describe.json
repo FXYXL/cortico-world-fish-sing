@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "name": "cortico-world-fish-sing",
+  "version": "0.1.0",
+  "describe": {
+    "tools": [
+      {
+        "name": "fish_sing",
+        "description": "把一首歌换成她的声音唱出来，本机放或发 QQ 语音条。",
+        "summary": { "zh": "唱一首歌（歌名 / BV 号 / 本地文件）", "en": "Sing a song in her voice" },
+        "tags": ["music", "voice"],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "song": { "type": "string", "description": "歌名、BV 号、链接或本机文件路径" },
+            "to": { "type": "string", "description": "local / group:<群号> / private:<QQ号> / both" },
+            "mode": { "type": "string", "enum": ["full", "vocals"], "description": "带伴奏 / 清唱" },
+            "pitch": { "type": "number", "description": "移调半音" },
+            "indexRate": { "type": "number", "description": "音色检索强度 0~1" },
+            "protect": { "type": "number", "description": "气声保护 0~0.5" },
+            "start": { "type": "number", "description": "从第几秒开始" },
+            "duration": { "type": "number", "description": "唱多长（秒）" },
+            "refresh": { "type": "boolean", "description": "忽略缓存" }
+          },
+          "required": ["song"]
+        }
+      },
+      {
+        "name": "fish_sing_stop",
+        "description": "停掉播放并取消正在处理的歌。",
+        "summary": { "zh": "别唱了", "en": "Stop singing" },
+        "tags": ["music"],
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+      },
+      {
+        "name": "fish_sing_library",
+        "description": "列出 / 回放 / 删除她唱过的歌。",
+        "summary": { "zh": "作品库", "en": "Song library" },
+        "tags": ["music"],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": { "type": "string", "enum": ["list", "play", "delete"] },
+            "query": { "type": "string" },
+            "limit": { "type": "number" }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "fish_sing_status",
+        "description": "唱歌功能是否可用、当前在算什么。",
+        "summary": { "zh": "唱歌状态", "en": "Singing status" },
+        "tags": ["music"],
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+      }
+    ],
+    "events": [],
+    "prompts": [
+      {
+        "key": "fish-sing.envPrompt",
+        "title": "唱歌环境提示词",
+        "role": "envPrompt",
+        "content": "你能用自己的声音唱歌（fish_sing）。默认只在本机播放；要发 QQ 才给 to。一首歌 60~120 秒，同时只能唱一首。"
+      }
+    ]
+  }
+}
