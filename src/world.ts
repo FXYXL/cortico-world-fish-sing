@@ -16,7 +16,18 @@ import type { Language } from 'cortico/core/language.ts';
 import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
-import { resolvePaths, type WorkerPaths } from './paths.ts';
+import { BUNDLED_SEPARATE, MODELS_MANIFEST, PKG_ROOT, resolvePaths, VENDORED_RVC, type WorkerPaths } from './paths.ts';
+import {
+  copyRvcCode,
+  downloadModels,
+  findSystemPython,
+  inspect,
+  installRuntime,
+  loadManifest,
+  probeRuntime,
+  type RuntimeMode,
+  type SetupStatus,
+} from './setup.ts';
 import { duration, type FfmpegDeps } from './audio.ts';
 import { Player } from './deliver.ts';
 import { dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
@@ -38,10 +49,24 @@ export class FishSingWorld implements World {
   private readonly player = new Player();
   private readonly worker: WorkerClient;
   /** 解析后的实际路径（自托管 or 外部 RVC），构造函数里算一次。 */
-  private readonly routes: WorkerPaths;
+  private routes: WorkerPaths;
   private lastSong: { title: string; at: number; duration: number } | null = null;
   /** 同一时刻只允许一首在跑（GPU 只有一张卡）。 */
   private busy = false;
+  /**
+   * 安装/下载任务。只保留最近一个，用它给面板轮询进度。
+   * 不做队列：装运行时和唱一首歌抢同一张卡，同时来两个只会互相拖死。
+   */
+  private setupJob: {
+    kind: 'models' | 'runtime';
+    state: 'running' | 'done' | 'error';
+    pct: number;
+    msg: string;
+    error?: string;
+    startedAt: number;
+  } | null = null;
+  /** 取消用的开关。 */
+  private setupAbort: AbortController | null = null;
 
   constructor(opts: FishSingWorldOptions) {
     // 不用「参数属性」写法：Node 的类型剥离跑不了它
@@ -329,6 +354,7 @@ export class FishSingWorld implements World {
    * 面板走的是「服务端渲染数据 + 前端只管展示」，所以这里只返回纯 JSON。
    */
   private async panelInvoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
+    if (panel === 'setup') return this.setupInvoke(method, args);
     if (panel !== 'library') throw new Error(`未知面板：${panel}`);
     const a0 = String(args[0] ?? '');
     const a1 = String(args[1] ?? '');
@@ -404,6 +430,116 @@ export class FishSingWorld implements World {
     throw new Error(`未知方法：${method}`);
   }
 
+  /** 路径可能因为装上运行时/下好权重而变，面板操作后重算一次。 */
+  private refreshRoutes(): void {
+    this.routes = resolvePaths(this.opts.cfg, this.opts.dataDir);
+  }
+
+  /** 设置面板：状态、开始下载/安装、取消。 */
+  private async setupInvoke(method: string, args: unknown[]): Promise<unknown> {
+    if (method === 'status') {
+      this.refreshRoutes();
+      const st: SetupStatus = inspect(this.routes);
+      const runtime = existsSync(this.routes.pythonPath) ? await probeRuntime(this.routes.pythonPath) : '';
+      return {
+        ...st,
+        runtime,
+        job: this.setupJob,
+        tag: loadManifest().tag,
+        separateScript: existsSync(this.routes.separateScript),
+      };
+    }
+
+    if (method === 'start') {
+      const what = String(args[0] ?? '');
+      if (this.setupJob?.state === 'running') throw new Error('已经有一个任务在跑，先等它结束或点停止');
+
+      if (what === 'models') {
+        this.startSetupJob('models', async (signal, report) => {
+          if (!existsSync(join(this.routes.rvcRoot, 'infer', 'cli.py'))) {
+            report(0, '先复制 RVC 代码');
+            copyRvcCode(this.routes, VENDORED_RVC);
+          }
+          await downloadModels(this.routes, report, signal);
+        });
+        return { text: '开始下载权重（909 MB，可随时停止）' };
+      }
+
+      if (what === 'runtime-gpu' || what === 'runtime-cpu') {
+        const mode: RuntimeMode = what === 'runtime-gpu' ? 'gpu' : 'cpu';
+        const sysPy = findSystemPython();
+        this.startSetupJob('runtime', async (signal, report) => {
+          if (!existsSync(join(this.routes.rvcRoot, 'infer', 'cli.py'))) copyRvcCode(this.routes, VENDORED_RVC);
+          await installRuntime(this.routes, mode, sysPy, report, signal);
+        });
+        return {
+          text: mode === 'gpu'
+            ? '开始安装 GPU 运行时（下载约 2.5 GB，装完约 6 GB 磁盘）'
+            : '开始安装 CPU 运行时（下载约 200 MB，推理慢 6~8 倍）',
+        };
+      }
+
+      if (what === 'code') {
+        copyRvcCode(this.routes, VENDORED_RVC);
+        return { text: `代码已复制到 ${this.routes.rvcRoot}` };
+      }
+
+      throw new Error(`不认识的安装项：${what}`);
+    }
+
+    if (method === 'cancel') {
+      this.setupAbort?.abort();
+      // 立刻把状态落下来：等子进程退出可能要几秒，面板会一直显示"还在跑"，
+      // 用户以为没停掉就会再点一次。
+      if (this.setupJob && this.setupJob.state === 'running') {
+        this.setupJob.state = 'error';
+        this.setupJob.error = '已取消';
+        this.setupJob.msg = '已取消';
+      }
+      return { text: '已停止' };
+    }
+
+    throw new Error(`未知方法：${method}`);
+  }
+
+  /**
+   * 起一个后台安装任务。面板靠轮询 status 拿进度，所以这里不 await。
+   * 只允许一个：装运行时和唱一首歌抢同一张卡，同时来两个会互相拖死。
+   */
+  private startSetupJob(kind: 'models' | 'runtime', task: (signal: AbortSignal, report: (pct: number, msg: string) => void) => Promise<unknown>): void {
+    const abort = new AbortController();
+    const job = { kind, state: 'running' as const, pct: 0, msg: '准备中…', startedAt: Date.now() };
+    this.setupJob = job;
+    this.setupAbort = abort;
+
+    const report = (pct: number, msg: string) => {
+      job.pct = Math.max(0, Math.min(100, Math.round(pct)));
+      job.msg = msg;
+    };
+
+    void task(abort.signal, report)
+      .then(() => {
+        Object.assign(job, { state: 'done', pct: 100, msg: '完成' });
+        this.host?.log.info(`[fish-sing] ${kind} 完成`);
+      })
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        Object.assign(job, { state: 'error', error: msg, msg: abort.signal.aborted ? '已取消' : msg });
+        this.host?.log.warn(`[fish-sing] ${kind} 失败：${msg}`);
+      })
+      .finally(() => {
+        this.setupAbort = null;
+        // 装完运行时：路径变了，worker 那份参数也得跟着换，否则下次唱歌还找旧 python
+        this.refreshRoutes();
+        this.worker.retune({
+          rvcRoot: this.routes.rvcRoot,
+          pythonPath: this.routes.pythonPath,
+          separatePython: this.routes.separatePython,
+          separateScript: this.routes.separateScript,
+        });
+      });
+  }
+
   webUi(_language: Language = 'zh'): WorldWebUiDecl {
     const cfg = this.opts.cfg;
     return {
@@ -429,6 +565,12 @@ export class FishSingWorld implements World {
       // 不是从 World 实例上取。挂错地方的现象就是面板画出来了、但所有请求都报「没有面板数据面」。
       invoke: (panel: string, method: string, args: unknown[]) => this.panelInvoke(panel, method, args),
       panels: [
+        {
+          id: 'setup',
+          title: '安装与运行时',
+          description: '装 Python 运行时、下载模型权重、看当前状态。装完就能唱歌，不用敲命令。',
+          getMethods: ['status'],
+        },
         {
           id: 'library',
           title: '作品库',

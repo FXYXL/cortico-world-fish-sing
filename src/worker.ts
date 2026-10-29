@@ -52,7 +52,7 @@ export interface LoggerLike {
 }
 
 export class WorkerClient {
-  private readonly opts: WorkerOptions;
+  private opts: WorkerOptions;
   private readonly log: LoggerLike;
   private child: ChildProcess | null = null;
   private starting: Promise<void> | null = null;
@@ -85,6 +85,16 @@ export class WorkerClient {
   }
 
   /** 确保 worker 在跑。已在跑就直接返回；否则按配置拉起并等就绪。 */
+  /**
+   * 换掉运行时参数（装好 venv 之后用）。
+   *
+   * 必须重新赋值：pythonPath 从「不存在的 runtime/venv」变成「刚装好的那个」，
+   * 不更新的话下一次唱歌仍然报"找不到 python"。
+   */
+  retune(patch: Partial<WorkerOptions>): void {
+    this.opts = { ...this.opts, ...patch };
+  }
+
   async ensure(): Promise<void> {
     if (await this.health()) return;
     if (!this.opts.autoStart) {

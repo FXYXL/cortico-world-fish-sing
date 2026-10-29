@@ -301,8 +301,189 @@ function mount(ctx) {
   };
 }
 
+
+/* ------------------------------------------------------------------ 安装与运行时 */
+
+const SETUP_STYLE_ID = 'fish-sing-setup-style';
+const SETUP_CSS = `
+.fs-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.fs-card{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px}
+.fs-card .k{font-size:11px;opacity:.6}
+.fs-card .v{font-size:13.5px;margin-top:2px;font-weight:600}
+.fs-card.ok .v{color:#3fae62}
+.fs-card.bad .v{color:#d05555}
+.fs-prog{height:8px;border-radius:5px;background:rgba(127,127,127,.2);overflow:hidden}
+.fs-prog>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4a90e2,#5ac8a8);transition:width .3s}
+.fs-list{display:flex;flex-direction:column;gap:2px}
+.fs-row{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;padding:4px 0;
+  border-bottom:1px solid rgba(127,127,127,.12)}
+.fs-row .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-row .r{white-space:nowrap;font-variant-numeric:tabular-nums}
+.fs-ok{color:#3fae62}
+.fs-bad{color:#d05555}
+.fs-warn{color:#c9962f}
+.fs-hint{font-size:12px;opacity:.65;line-height:1.7}
+`;
+
+function mb(n) {
+  const v = Number(n) || 0;
+  if (v >= 1073741824) return `${(v / 1073741824).toFixed(2)} GB`;
+  return `${(v / 1048576).toFixed(1)} MB`;
+}
+
+function mountSetup(ctx) {
+  if (!document.getElementById(SETUP_STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = SETUP_STYLE_ID;
+    style.textContent = SETUP_CSS;
+    document.head.append(style);
+  }
+
+  const root = ctx.root;
+  root.classList.add('fs-wrap');
+
+  const cards = el('div', 'fs-cards');
+  const bar = el('div', 'fs-bar');
+  const dl = el('button', 'fs-btn', '下载模型权重');
+  const gpu = el('button', 'fs-btn', '安装 GPU 运行时');
+  const cpu = el('button', 'fs-btn', '安装 CPU 运行时');
+  const stopBtn = el('button', 'fs-btn danger', '停止');
+  const refresh = el('button', 'fs-btn', '刷新');
+  bar.append(dl, gpu, cpu, stopBtn, el('span', 'fs-grow'), refresh);
+
+  const prog = el('div', 'fs-prog');
+  const fill = el('i');
+  prog.append(fill);
+
+  const msg = el('div', 'fs-msg');
+  const list = el('div', 'fs-list');
+  const hint = el('div', 'fs-hint');
+  hint.textContent =
+    '权重约 909 MB（模型 + 检索索引 + ContentVec + RMVPE + 底模），下载后会自动校验 sha256。\n'
+    + '运行时是 Python 环境：GPU 版下载约 2.5 GB、装完约 6 GB（55 秒的歌约 8 秒换完）；'
+    + 'CPU 版只要约 200 MB，但慢 6~8 倍。已经装好 torch 的不会被覆盖。';
+
+  root.append(cards, bar, prog, msg, list, hint);
+
+  let timer = null;
+  let lastJob = '';
+
+  const say = (t, bad) => {
+    msg.textContent = t || '';
+    msg.classList.toggle('bad', Boolean(bad));
+  };
+
+  const call = async (method, args) => {
+    try {
+      const res = await ctx.invoke(method, args || []);
+      if (res && typeof res.text === 'string') say(res.text);
+      return res;
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+      throw e;
+    }
+  };
+
+  const card = (k, v, state) => {
+    const c = el('div', `fs-card${state ? ` ${state}` : ''}`);
+    c.append(el('div', 'k', k), el('div', 'v', v));
+    return c;
+  };
+
+  const paint = (st) => {
+    const m = st.models || [];
+    const ready = m.filter((x) => x.ready).length;
+    cards.replaceChildren(
+      card('RVC 代码', st.rvc && st.rvc.ready ? '已就绪' : '缺失', st.rvc && st.rvc.ready ? 'ok' : 'bad'),
+      card('模型权重', `${ready}/${m.length} · ${mb(st.doneBytes)}`, ready === m.length ? 'ok' : ready ? 'warn' : 'bad'),
+      card('Python 运行时', st.python && st.python.ok ? '已就绪' : '未安装', st.python && st.python.ok ? 'ok' : 'bad'),
+      card('ffmpeg', st.ffmpeg && st.ffmpeg.ok ? '已就绪' : '没找到', st.ffmpeg && st.ffmpeg.ok ? 'ok' : 'bad'),
+    );
+
+    if (st.runtime) {
+      list.replaceChildren();
+      const parts = String(st.runtime).split(' · ');
+      for (const p of parts) {
+        const row = el('div', 'fs-row');
+        row.append(el('span', 'n', p));
+        list.append(row);
+      }
+    }
+
+    const job = st.job;
+    const running = job && job.state === 'running';
+    dl.disabled = running;
+    gpu.disabled = running;
+    cpu.disabled = running;
+    stopBtn.disabled = !running;
+    fill.style.width = `${running ? job.pct : job && job.state === 'done' ? 100 : 0}%`;
+
+    if (job) {
+      const head = job.state === 'running' ? `${job.pct}% · ${job.msg}`
+        : job.state === 'done' ? `✓ 完成：${job.kind === 'models' ? '权重下载' : '运行时安装'}`
+          : `✗ ${job.error || job.msg}`;
+      say(head, job.state === 'error');
+      lastJob = `${job.state}${job.pct}${job.msg}`;
+    }
+
+    // 按钮文案跟着状态走，避免"已经装好了还写着安装"
+    dl.textContent = ready === m.length ? '校验 / 补下权重' : `下载模型权重（${mb(st.totalBytes - st.doneBytes)}）`;
+    if (st.python && st.python.ok) {
+      gpu.textContent = '重装 GPU 运行时';
+      cpu.textContent = '重装 CPU 运行时';
+    } else {
+      gpu.textContent = '安装 GPU 运行时（推荐）';
+      cpu.textContent = '安装 CPU 运行时（小）';
+    }
+
+    return running;
+  };
+
+  const load = async () => {
+    let st;
+    try {
+      st = await ctx.invoke('status', []);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+      return;
+    }
+    const running = paint(st);
+    if (timer) clearInterval(timer);
+    // 装的时候 800ms 刷一次，装完就停——不要一直空转打服务端
+    timer = running ? setInterval(() => void load(), 800) : null;
+  };
+
+  const startJob = async (what, confirmText) => {
+    if (confirmText && !window.confirm(confirmText)) return;
+    await call('start', [what]);
+    setTimeout(() => void load(), 300);
+  };
+
+  dl.addEventListener('click', () => void startJob('models'));
+  gpu.addEventListener('click', () =>
+    void startJob('runtime-gpu', '安装 GPU 运行时：下载约 2.5 GB，装完占约 6 GB 磁盘。现在开始？'),
+  );
+  cpu.addEventListener('click', () =>
+    void startJob('runtime-cpu', '安装 CPU 运行时：只要约 200 MB，但换声慢 6~8 倍。现在开始？'),
+  );
+  stopBtn.addEventListener('click', () => {
+    stopBtn.disabled = true;
+    void call('cancel', []).then(() => setTimeout(() => void load(), 300));
+  });
+  refresh.addEventListener('click', () => void load());
+
+  void load();
+
+  return {
+    dispose() {
+      if (timer) clearInterval(timer);
+    },
+  };
+}
+
 export default {
   panels: {
+    setup: { mount: mountSetup },
     library: { mount },
   },
 };
