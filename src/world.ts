@@ -324,7 +324,7 @@ export class FishSingWorld implements World {
    * 作品库面板的数据面。方法名与 `dist/webui.js` 里的调用一一对应。
    * 面板走的是「服务端渲染数据 + 前端只管展示」，所以这里只返回纯 JSON。
    */
-  async invoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
+  private async panelInvoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
     if (panel !== 'library') throw new Error(`未知面板：${panel}`);
     const a0 = String(args[0] ?? '');
     const a1 = String(args[1] ?? '');
@@ -421,6 +421,9 @@ export class FishSingWorld implements World {
           hint: cfg.play?.enabled === false ? '已关' : 'ffplay',
         },
       ],
+      // 注意：框架是从 `webUi()` 的**返回值**里取 invoke（bot.ts: decl?.invoke），
+      // 不是从 World 实例上取。挂错地方的现象就是面板画出来了、但所有请求都报「没有面板数据面」。
+      invoke: (panel: string, method: string, args: unknown[]) => this.panelInvoke(panel, method, args),
       panels: [
         {
           id: 'library',
