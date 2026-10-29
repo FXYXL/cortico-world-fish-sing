@@ -481,9 +481,187 @@ function mountSetup(ctx) {
   };
 }
 
+
+/* ------------------------------------------------------------------ 模型 */
+
+const MODELS_STYLE_ID = 'fish-sing-models-style';
+const MODELS_CSS = `
+.fs-mhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fs-mtable{width:100%;border-collapse:collapse;font-size:12.5px}
+.fs-mtable th,.fs-mtable td{padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.18);
+  text-align:left;vertical-align:middle}
+.fs-mtable th{font-weight:600;opacity:.75;white-space:nowrap}
+.fs-mtable tbody tr:hover{background:rgba(127,127,127,.07)}
+.fs-mtable tr.on{background:rgba(80,160,255,.12)}
+.fs-dot{color:#3fae62;font-weight:700}
+.fs-mname{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.fs-tagx{display:inline-block;padding:0 5px;border-radius:4px;background:rgba(127,127,127,.16);
+  font-size:11px;margin-left:6px}
+`;
+
+function fmtDate(ms) {
+  const d = new Date(Number(ms) || 0);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function mountModels(ctx) {
+  if (!document.getElementById(MODELS_STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = MODELS_STYLE_ID;
+    style.textContent = MODELS_CSS;
+    document.head.append(style);
+  }
+
+  const root = ctx.root;
+  root.classList.add('fs-wrap');
+
+  const bar = el('div', 'fs-mhead');
+  const refresh = el('button', 'fs-btn', '刷新');
+  const imp = el('button', 'fs-btn', '导入 .pth');
+  const reveal = el('button', 'fs-btn', '打开目录');
+  const meta = el('span', 'fs-meta');
+  bar.append(refresh, imp, reveal, el('span', 'fs-meta', ' '), el('span', 'fs-grow'), meta);
+
+  const msg = el('div', 'fs-msg');
+  const box = el('div', '');
+  root.append(bar, msg, box);
+
+  let rows = [];
+  let pendingDelete = '';
+
+  const say = (t, bad) => {
+    msg.textContent = t || '';
+    msg.classList.toggle('bad', Boolean(bad));
+  };
+
+  const call = async (method, args) => {
+    try {
+      const res = await ctx.invoke(method, args || []);
+      if (res && typeof res.text === 'string') say(res.text);
+      return res;
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+      throw e;
+    }
+  };
+
+  const render = () => {
+    box.replaceChildren();
+    if (!rows.length) {
+      box.append(el('div', 'fs-empty', '还没有模型。下载权重或训练一个之后会出现在这里。'));
+      return;
+    }
+    const table = el('table', 'fs-mtable');
+    const thead = el('thead');
+    const htr = el('tr');
+    for (const h of ['', '模型', '轮次', '大小', '时间', '索引', '操作']) htr.append(el('th', '', h));
+    thead.append(htr);
+    const tbody = el('tbody');
+
+    for (const r of rows) {
+      const tr = el('tr', r.current ? 'on' : '');
+      tr.append(el('td', 'fs-dot', r.current ? '●' : ''));
+
+      const nameTd = el('td');
+      nameTd.append(el('span', 'fs-mname', r.name));
+      if (r.current) nameTd.append(el('span', 'fs-tagx', '使用中'));
+      tr.append(nameTd);
+
+      tr.append(el('td', 'fs-num', r.epoch !== null ? `e${r.epoch}` : '最终'));
+      tr.append(el('td', 'fs-num', `${r.sizeMb} MB`));
+      tr.append(el('td', 'fs-num', fmtDate(r.mtime)));
+
+      const idxTd = el('td');
+      if (r.index) {
+        idxTd.append(el('span', 'fs-ok', '有'));
+      } else {
+        idxTd.append(el('span', 'fs-warn', '无'));
+        idxTd.append(el('span', 'fs-meta', `（logs/${r.exp} 里没 .index）`));
+      }
+      tr.append(idxTd);
+
+      const acts = el('td', 'fs-acts');
+      const use = el('button', 'fs-btn', r.current ? '已使用' : '使用');
+      use.disabled = r.current;
+      use.addEventListener('click', async () => {
+        use.disabled = true;
+        try {
+          await call('use', [r.name]);
+          await load();
+        } finally {
+          use.disabled = false;
+        }
+      });
+      acts.append(use);
+
+      if (!r.current) {
+        const del = el('button', 'fs-btn danger', pendingDelete === r.name ? '确认删除？' : '删除');
+        del.addEventListener('click', async () => {
+          if (pendingDelete !== r.name) {
+            pendingDelete = r.name;
+            render();
+            setTimeout(() => {
+              if (pendingDelete === r.name) {
+                pendingDelete = '';
+                render();
+              }
+            }, 4000);
+            return;
+          }
+          pendingDelete = '';
+          try {
+            await call('delete', [r.name]);
+            await load();
+          } catch {
+            render();
+          }
+        });
+        acts.append(del);
+      }
+      tr.append(acts);
+      tbody.append(tr);
+    }
+
+    table.append(thead, tbody);
+    box.append(table);
+  };
+
+  const load = async () => {
+    try {
+      const data = await ctx.invoke('list', []);
+      rows = Array.isArray(data && data.items) ? data.items : [];
+      meta.textContent = rows.length
+        ? `共 ${rows.length} 个 · 当前 ${data.current.model}${data.busy ? ' · 正在唱' : ''}`
+        : '还没有模型';
+      render();
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+  };
+
+  refresh.addEventListener('click', () => void load());
+  reveal.addEventListener('click', () => void call('reveal', []));
+  imp.addEventListener('click', async () => {
+    const path = window.prompt('粘贴 .pth 的完整路径（会复制到 assets/weights）');
+    if (!path) return;
+    try {
+      await call('import', [path.trim()]);
+      await load();
+    } catch {
+      /* 错误已经显示在消息行 */
+    }
+  });
+
+  void load();
+
+  return { dispose() {} };
+}
+
 export default {
   panels: {
     setup: { mount: mountSetup },
+    models: { mount: mountModels },
     library: { mount },
   },
 };

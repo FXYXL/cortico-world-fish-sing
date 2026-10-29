@@ -9,13 +9,21 @@
  */
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { Language } from 'cortico/core/language.ts';
 import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
+import {
+  deleteModel,
+  importModel,
+  listModels,
+  readCurrent,
+  useModel,
+  type CurrentModel,
+} from './models.ts';
 import { BUNDLED_SEPARATE, MODELS_MANIFEST, PKG_ROOT, resolvePaths, VENDORED_RVC, type WorkerPaths } from './paths.ts';
 import {
   copyRvcCode,
@@ -67,12 +75,18 @@ export class FishSingWorld implements World {
   } | null = null;
   /** 取消用的开关。 */
   private setupAbort: AbortController | null = null;
+  /** 当前在用的模型（存在 <dataDir>/model.json，配置里的 voice.model 只是出厂默认）。 */
+  private current: CurrentModel = { model: '', index: '' };
 
   constructor(opts: FishSingWorldOptions) {
     // 不用「参数属性」写法：Node 的类型剥离跑不了它
     this.opts = opts;
     const cfg = opts.cfg || ({} as FishSingConfigSection);
-    this.routes = resolvePaths(cfg, opts.dataDir);
+    this.current = readCurrent(opts.dataDir, {
+      model: String(cfg.voice?.model ?? 'dfy2.pth'),
+      index: String(cfg.voice?.index ?? ''),
+    });
+    this.routes = resolvePaths(this.effCfg(), opts.dataDir);
     this.worker = new WorkerClient(
       {
         rvcRoot: this.routes.rvcRoot,
@@ -85,8 +99,8 @@ export class FishSingWorld implements World {
         autoStart: cfg.worker?.autoStart !== false,
         startTimeoutMs: Number(cfg.worker?.startTimeoutMs ?? 240000),
         workDir: join(opts.dataDir, 'work'),
-        model: String(cfg.voice?.model ?? 'dfy2.pth'),
-        index: String(cfg.voice?.index ?? ''),
+        model: this.current.model,
+        index: this.current.index,
       },
       {
         info: (m: string) => this.host?.log.info(m),
@@ -166,8 +180,8 @@ export class FishSingWorld implements World {
       minScore: Number(cfg.song?.minScore ?? 8),
       excludeWords: String(cfg.song?.excludeWords ?? ''),
       voice: {
-        model: String(cfg.voice?.model ?? 'dfy2.pth'),
-        index: String(cfg.voice?.index ?? ''),
+        model: this.current.model,
+        index: this.current.index,
         indexRate: Number(cfg.voice?.indexRate ?? 0.75),
         protect: Number(cfg.voice?.protect ?? 0.33),
         pitch: Number(cfg.voice?.pitch ?? 0),
@@ -187,7 +201,7 @@ export class FishSingWorld implements World {
     } catch {
       return null;
     }
-    const model = String(cfg.voice?.model ?? '');
+    const model = this.current.model || String(cfg.voice?.model ?? '');
     const where = cfg.play?.defaultTarget === 'none'
       ? '不自动发，由你自己判断要不要发'
       : cfg.play?.defaultTarget === 'both'
@@ -373,6 +387,7 @@ export class FishSingWorld implements World {
    */
   private async panelInvoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
     if (panel === 'setup') return this.setupInvoke(method, args);
+    if (panel === 'models') return this.modelInvoke(method, args);
     if (panel !== 'library') throw new Error(`未知面板：${panel}`);
     const a0 = String(args[0] ?? '');
     const a1 = String(args[1] ?? '');
@@ -448,9 +463,83 @@ export class FishSingWorld implements World {
     throw new Error(`未知方法：${method}`);
   }
 
+  /**
+   * 把「当前模型」盖到配置上再解析路径。
+   *
+   * 为什么不能直接改 opts.cfg：那是 Coo 传进来的配置对象，改了会和它的热重载打架；
+   * 而且 inspect() 判断「权重齐不齐」用的是这个 model 名，不盖就会按出厂默认去报缺失。
+   */
+  private effCfg(): FishSingConfigSection {
+    const cfg = this.opts.cfg || ({} as FishSingConfigSection);
+    return {
+      ...cfg,
+      voice: {
+        ...cfg.voice,
+        model: this.current.model || cfg.voice?.model,
+        index: this.current.index || cfg.voice?.index,
+      },
+    };
+  }
+
   /** 路径可能因为装上运行时/下好权重而变，面板操作后重算一次。 */
   private refreshRoutes(): void {
-    this.routes = resolvePaths(this.opts.cfg, this.opts.dataDir);
+    this.routes = resolvePaths(this.effCfg(), this.opts.dataDir);
+  }
+
+  /** 模型面板：列表、切换、删除、从别处导入。 */
+  private async modelInvoke(method: string, args: unknown[]): Promise<unknown> {
+    const dir = join(this.routes.rvcRoot, 'assets', 'weights');
+    const a0 = String(args[0] ?? '').trim();
+
+    if (method === 'list') {
+      return {
+        items: listModels(this.routes, this.current.model),
+        current: this.current,
+        dir,
+        busy: this.busy,
+      };
+    }
+
+    if (method === 'use') {
+      if (this.busy) throw new Error('正在唱，等这首唱完再切模型');
+      const cur = useModel(this.routes, this.opts.dataDir, a0);
+      this.current = cur;
+      this.worker.retune({ model: cur.model, index: cur.index });
+      // 常驻 worker 里模型已经加载了，必须重启才会换成新的；隔一下等端口释放
+      this.worker.shutdown();
+      setTimeout(() => {
+        void this.worker.ensure().catch((e: unknown) => {
+          this.host?.log.warn(`换模型后 worker 没起来：${e instanceof Error ? e.message : String(e)}`);
+        });
+      }, 1200);
+      this.refreshRoutes();
+      return {
+        text: cur.index
+          ? `已切到 ${cur.model}，索引 ${basename(cur.index)}`
+          : `已切到 ${cur.model}，但这个实验没有检索索引——音色会比平时淡，建议确认 logs 里有没有 .index`,
+      };
+    }
+
+    if (method === 'delete') {
+      deleteModel(this.routes, this.opts.dataDir, a0);
+      return { text: `删掉了 ${a0}` };
+    }
+
+    if (method === 'import') {
+      const r = importModel(this.routes, a0);
+      return {
+        text: r.index
+          ? `导入了 ${r.name}，顺便找到了索引 ${basename(r.index)}`
+          : `导入了 ${r.name}（没找到同名实验的索引，切过去后音色会淡一些）`,
+      };
+    }
+
+    if (method === 'reveal') {
+      spawn('explorer', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+      return { text: `已在资源管理器打开：${dir}` };
+    }
+
+    throw new Error(`未知方法：${method}`);
   }
 
   /** 设置面板：状态、开始下载/安装、取消。 */
@@ -588,6 +677,12 @@ export class FishSingWorld implements World {
           title: '安装与运行时',
           description: '装 Python 运行时、下载模型权重、看当前状态。装完就能唱歌，不用敲命令。',
           getMethods: ['status'],
+        },
+        {
+          id: 'models',
+          title: '模型',
+          description: 'assets/weights 下的所有音色模型：轮次、大小、对应的检索索引，一键切换或删除。',
+          getMethods: ['list'],
         },
         {
           id: 'library',
