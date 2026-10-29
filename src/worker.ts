@@ -200,23 +200,56 @@ export class WorkerClient {
     return body.id;
   }
 
-  /** 轮询直到 done/error/canceled。onProgress 每有变化就调一次。 */
-  async wait(id: string, onProgress?: (p: number, msg: string) => void, timeoutMs = 900_000): Promise<JobState> {
-    const deadline = Date.now() + timeoutMs;
+  /**
+   * 轮询直到 done/error/canceled。
+   *
+   * 两个超时是分开的，别混：
+   * - `stallMs`：**多久没有新进度**才算卡住（默认 15 分钟）。唱歌、分离都会不停更新消息，
+   *   所以这个值是有效的。
+   * - `timeoutMs`：绝对上限，默认**不限**。
+   *
+   * 早先只有一个 15 分钟的绝对上限，结果训练跑到 15 分钟就被判「任务卡住」——
+   * 界面报错、任务却还在跑（dfy3 实测 53 秒/轮 × 200 轮 ≈ 3 小时）。
+   */
+  async wait(
+    id: string,
+    onProgress?: (p: number, msg: string) => void,
+    opts: number | { stallMs?: number; timeoutMs?: number } = {},
+  ): Promise<JobState> {
+    // 兼容旧写法：第三个参数直接给数字 = 绝对超时
+    const o = typeof opts === 'number' ? { timeoutMs: opts } : opts;
+    const stallMs = o.stallMs ?? 15 * 60_000;
+    const timeoutMs = o.timeoutMs ?? Number.POSITIVE_INFINITY;
+    const started = Date.now();
+    let lastChange = Date.now();
     let lastMsg = '';
+    let lastPct = -1;
+
     for (;;) {
       const res = await fetch(`${this.baseUrl}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
       const body = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
       const job = body.job;
       if (!job) throw new Error(`查不到任务 ${id}`);
-      if (job.message && job.message !== lastMsg) {
-        lastMsg = job.message;
-        onProgress?.(job.progress ?? 0, job.message);
+
+      const pct = job.progress ?? 0;
+      if ((job.message && job.message !== lastMsg) || Math.abs(pct - lastPct) > 1e-6) {
+        lastMsg = job.message ?? lastMsg;
+        lastPct = pct;
+        lastChange = Date.now();
+        onProgress?.(pct, job.message ?? '');
       }
+
       if (job.state === 'done') return job;
       if (job.state === 'error') throw new Error(job.message || '未知错误');
       if (job.state === 'canceled') throw new Error('已取消');
-      if (Date.now() > deadline) throw new Error('等太久，任务可能卡住了');
+
+      const now = Date.now();
+      if (now - lastChange > stallMs) {
+        throw new Error(`已经 ${Math.max(1, Math.round(stallMs / 60_000))} 分钟没有任何进展，任务可能真的卡住了`);
+      }
+      if (now - started > timeoutMs) {
+        throw new Error(`超过 ${Math.round(timeoutMs / 60_000)} 分钟上限`);
+      }
       await new Promise((r) => setTimeout(r, 700));
     }
   }

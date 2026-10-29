@@ -630,10 +630,15 @@ export class FishSingWorld implements World {
         throw e;
       }
       void this.worker
-        .wait(job.id, (p, m) => {
-          job.pct = Math.round(p * 100);
-          job.msg = m;
-        })
+        .wait(
+          job.id,
+          (p, m) => {
+            job.pct = Math.round(p * 100);
+            job.msg = m;
+          },
+          // 分离一首歌 20~40 秒，几十首可能十几分钟；只要还在报进度就不算超时
+          { stallMs: 10 * 60_000, timeoutMs: 4 * 3600_000 },
+        )
         .then(() => {
           job.state = 'done';
           job.pct = 100;
@@ -810,6 +815,19 @@ export class FishSingWorld implements World {
       const saveEvery = Math.max(1, Math.min(100, Number(cfg.saveEvery) || 10));
       const exp = String(cfg.exp ?? '').trim().replace(/[^\w.-]/g, '') || `fish${stamp()}`;
 
+      // 同名实验的日志刚刚还在写 → 十有八九另一个训练在跑（包括重启 Coo 后留下的孤儿进程，
+      // 那种情况 worker 已经不认识它了，光靠状态拦不住）。撞上去就是两个训练抢一张卡。
+      const logFile = join(this.expDirFor(exp), 'train.log');
+      if (existsSync(logFile)) {
+        const ageSec = Math.round((Date.now() - statSync(logFile).mtimeMs) / 1000);
+        if (ageSec < 180) {
+          throw new Error(
+            `「${exp}」的日志 ${ageSec} 秒前还在更新，可能有训练正在跑（重启 Coo 留下的孤儿进程也算）。`
+            + '换个实验名，或者等它跑完再开始。',
+          );
+        }
+      }
+
       // 逐片权重：按权重口径算好，键用文件 basename（实验目录里的切片同名）
       const weightCfg = readWeights(dir);
       const weightMap: Record<string, number> = {};
@@ -839,10 +857,15 @@ export class FishSingWorld implements World {
         throw e;
       }
       void this.worker
-        .wait(job.id, (p, msg) => {
-          job.pct = Math.round(p * 100);
-          job.msg = msg;
-        })
+        .wait(
+          job.id,
+          (p, msg) => {
+            job.pct = Math.round(p * 100);
+            job.msg = msg;
+          },
+          // 训练要几小时，不能设绝对上限；30 分钟没有任何进展（连轮次都没动）才算真卡住
+          { stallMs: 30 * 60_000, timeoutMs: 10 * 3600_000 },
+        )
         .then(() => {
           job.state = 'done';
           job.pct = 100;
