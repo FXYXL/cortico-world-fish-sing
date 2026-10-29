@@ -116,6 +116,18 @@ export function findInLibrary(opts: LibraryOptions, query: string): LibraryEntry
   return rows.find((r) => r.title.toLowerCase().includes(q) || r.id === q) ?? null;
 }
 
+/** 改名：只动索引里的标题，不动文件（文件按 id 命名，和标题无关）。 */
+export function renameInLibrary(opts: LibraryOptions, query: string, newTitle: string): LibraryEntry | null {
+  const title = String(newTitle || '').trim().slice(0, 120);
+  if (!title) return null;
+  const rows = loadLibrary(opts);
+  const idx = rows.findIndex((r) => r.id === query || r.title.toLowerCase().includes(query.toLowerCase()));
+  if (idx < 0) return null;
+  rows[idx] = { ...rows[idx], title };
+  saveLibrary(opts, rows);
+  return rows[idx];
+}
+
 export function dropFromLibrary(opts: LibraryOptions, query: string): LibraryEntry | null {
   const hit = findInLibrary(opts, query);
   if (!hit) return null;

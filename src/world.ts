@@ -7,7 +7,8 @@
  *  · 不依赖 fishtools：B 站搜索在这里重新实现了一份（见 bili.ts）；
  *  · 重活全在 Python worker 里（模型常驻、55 秒切片），TS 侧只做编排和投递。
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,7 +18,7 @@ import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/typ
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
 import { duration, type FfmpegDeps } from './audio.ts';
 import { Player } from './deliver.ts';
-import { dropFromLibrary, listLibrary, pruneCache, type LibraryOptions } from './library.ts';
+import { dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
 import { singSong, type SingDeps } from './sing.ts';
 import { WorkerClient } from './worker.ts';
 
@@ -319,6 +320,86 @@ export class FishSingWorld implements World {
 
   // ------------------------------------------------------------ 控制台
 
+  /**
+   * 作品库面板的数据面。方法名与 `dist/webui.js` 里的调用一一对应。
+   * 面板走的是「服务端渲染数据 + 前端只管展示」，所以这里只返回纯 JSON。
+   */
+  async invoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
+    if (panel !== 'library') throw new Error(`未知面板：${panel}`);
+    const a0 = String(args[0] ?? '');
+    const a1 = String(args[1] ?? '');
+
+    if (method === 'list') {
+      const dir = join(this.opts.dataDir, 'library');
+      const rows = loadLibrary(this.data()).map((r) => {
+        let sizeMb = 0;
+        try {
+          sizeMb = Math.round((statSync(r.file).size / 1048576) * 10) / 10;
+        } catch {
+          /* 文件没了就显示 0 */
+        }
+        return {
+          id: r.id,
+          title: r.title,
+          durationSec: Math.round(r.durationSec * 10) / 10,
+          at: r.at,
+          sizeMb,
+          bvid: r.bvid,
+          target: r.target,
+          pitch: r.params?.pitch ?? 0,
+          mode: r.params?.mode ?? 'full',
+          indexRate: r.params?.indexRate ?? 0,
+          missing: sizeMb === 0,
+        };
+      });
+      return {
+        items: rows,
+        playing: this.player.playing ? this.player.playing.split(/[\\/]/).pop() : '',
+        dir,
+        totalMb: Math.round(rows.reduce((n, r) => n + r.sizeMb, 0) * 10) / 10,
+        playingEnabled: this.opts.cfg.play?.enabled !== false,
+      };
+    }
+
+    if (method === 'play') {
+      const rows = loadLibrary(this.data());
+      const hit = rows.find((r) => r.id === a0) ?? rows.find((r) => r.title.includes(a0));
+      if (!hit) throw new Error('作品库里没有这一首');
+      if (!existsSync(hit.file)) throw new Error('文件不见了（可能被清理过）');
+      if (this.opts.cfg.play?.enabled === false) throw new Error('本机播放被关掉了（配置 → 播放与发送）');
+      this.player.play(hit.file, {
+        dir: this.ffmpeg().dir,
+        playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
+        volume: Number(this.opts.cfg.play?.volume ?? 1),
+        log: (m: string) => this.host?.log.warn(m),
+      });
+      return { text: `正在放《${hit.title}》` };
+    }
+
+    if (method === 'stop') {
+      this.player.stop();
+      return { text: '停了' };
+    }
+
+    if (method === 'delete') {
+      const hit = dropFromLibrary(this.data(), a0);
+      return { text: hit ? `删掉了《${hit.title}》` : '没找到这一首' };
+    }
+
+    if (method === 'rename') {
+      const hit = renameInLibrary(this.data(), a0, a1);
+      return { text: hit ? `改成了《${hit.title}》` : '没找到这一首（或者标题是空的）' };
+    }
+
+    if (method === 'reveal') {
+      const dir = join(this.opts.dataDir, 'library');
+      spawn('explorer', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+      return { text: `已在资源管理器打开：${dir}` };
+    }
+
+    throw new Error(`未知方法：${method}`);
+  }
+
   webUi(_language: Language = 'zh'): WorldWebUiDecl {
     const cfg = this.opts.cfg;
     return {
@@ -340,16 +421,23 @@ export class FishSingWorld implements World {
           hint: cfg.play?.enabled === false ? '已关' : 'ffplay',
         },
       ],
+      panels: [
+        {
+          id: 'library',
+          title: '作品库',
+          description: '她唱过的每一首：试听、改名、删除、打开所在文件夹。',
+          getMethods: ['list'],
+        },
+      ],
       config: fishsingConfigGroups(),
       storage: [
         {
-          key: 'library',
-          label: '作品库',
+          key: 'cache',
+          label: '换声缓存',
           kind: 'disk',
           stat: () => {
-            const rows = listLibrary(this.data(), 5);
-            if (!rows.length) return '还一首都没唱过';
-            return `共 ${listLibrary(this.data(), 500).length} 首；最近：${rows.map((r) => `《${r.title}》`).join('、')}`;
+            const rows = listLibrary(this.data(), 500);
+            return `作品库 ${rows.length} 首（在「作品库」页管理）；缓存按参数各存一份，点清理只删缓存不动作品库`;
           },
           clear: async () => {
             const n = pruneCache(this.data(), 0);

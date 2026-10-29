@@ -35,7 +35,8 @@
       "qq",
       "local"
     ],
-    "describe": "describe.json"
+    "describe": "describe.json",
+    "webUiClient": "dist/webui.js"
   },
   "scripts": {
     "doctor": "node tools/doctor.mjs"
