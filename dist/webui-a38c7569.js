@@ -676,6 +676,20 @@ const TRAIN_CSS = `
 .fs-file{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fs-ck{width:14px;height:14px;cursor:pointer}
 .fs-card2{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px;font-size:12px}
+.fs-wtitle{font-size:13px;font-weight:600;opacity:.85}
+.fs-wmodes{display:flex;gap:4px}
+.fs-btn.on{border-color:#378ADD;color:#378ADD;background:rgba(55,138,221,.10)}
+.fs-wpresets{display:flex;gap:6px;flex-wrap:wrap}
+.fs-wrow{display:grid;grid-template-columns:110px 96px 108px 1fr 44px;align-items:center;gap:10px;
+  font-size:12.5px;padding:5px 0;border-bottom:1px solid rgba(127,127,127,.12)}
+.fs-wname{opacity:.85}
+.fs-wmeta{opacity:.55;font-size:11.5px}
+.fs-wshift{font-variant-numeric:tabular-nums;font-size:12px}
+.fs-wshift.up{color:#1D9E75}
+.fs-wshift.down{color:#c9962f}
+.fs-wshift.same{opacity:.55}
+.fs-wrange{width:100%;accent-color:#378ADD}
+.fs-wtimes{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
 .fs-card2 .k{opacity:.6;font-size:11px}
 .fs-card2 .v{font-size:15px;font-weight:600;margin-top:1px}
 `;
@@ -725,8 +739,9 @@ function mountTrain(ctx) {
   prog.append(fill);
   const listBox = el('div', '');
   const resultBox = el('div', '');
+  const weightBox = el('div', '');
 
-  root.append(bar, bar2, prog, msg, listBox, resultBox);
+  root.append(bar, bar2, prog, msg, listBox, resultBox, weightBox);
 
   let items = [];
   let checked = new Set();
@@ -850,6 +865,122 @@ function mountTrain(ctx) {
     }
   };
 
+  let wcfg = { mode: 'median', bands: { low: 1, mid: 1, high: 1, top: 1 } };
+  let wrows = [];
+  let wPresets = [];
+  let wRefs = [];
+
+  const afterShares = () => {
+    const total = wrows.reduce((n, r) => n + r.seconds * (wcfg.bands[r.id] ?? 1), 0) || 1;
+    return wrows.map((r) => (r.seconds * (wcfg.bands[r.id] ?? 1)) / total);
+  };
+
+  const paintWeightNumbers = () => {
+    const afters = afterShares();
+    wrows.forEach((r, i) => {
+      const ref = wRefs[i];
+      if (!ref) return;
+      const now = afters[i];
+      const dir = now > r.share + 0.005 ? 'up' : now < r.share - 0.005 ? 'down' : 'same';
+      ref.share.textContent = `${(r.share * 100).toFixed(0)}% → ${(now * 100).toFixed(0)}%`;
+      ref.share.className = `fs-wshift ${dir}`;
+      ref.times.textContent = `${wcfg.bands[r.id] ?? 1}x`;
+    });
+  };
+
+  const renderWeights = (cfg, rows) => {
+    if (cfg) wcfg = cfg;
+    if (rows) wrows = rows;
+    weightBox.replaceChildren();
+    wRefs = [];
+    if (!wrows.length) return;
+
+    const head = el('div', 'fs-bar');
+    head.append(el('span', 'fs-wtitle', '音域权重'));
+    const modes = el('div', 'fs-wmodes');
+    for (const [m, label, tip] of [
+      ['median', '按主音域', '按每片的中位音高分档：代表这片主要唱在哪个音区'],
+      ['p90', '按最高音', '按每片 90 分位音高分档：代表这片有没有唱上去'],
+      ['mix', '两端兼顾', '低音按主音域判、高音按最高音(540Hz+)判：只有这个口径能同时给两头加量'],
+    ]) {
+      const b = el('button', `fs-btn${wcfg.mode === m ? ' on' : ''}`, label);
+      b.title = tip;
+      b.addEventListener('click', async () => {
+        if (wcfg.mode === m) return;
+        wcfg = { ...wcfg, mode: m };
+        try {
+          const res = await ctx.invoke('weights', [wcfg]);
+          wcfg = res.cfg;
+          renderWeights(res.cfg, res.rows);
+        } catch (e) {
+          say((e && e.message) || String(e), true);
+        }
+      });
+      modes.append(b);
+    }
+    head.append(modes, el('span', 'fs-grow'));
+    weightBox.append(head);
+
+    const presetBar = el('div', 'fs-wpresets');
+    for (const p of wPresets) {
+      const b = el('button', 'fs-btn', p.name);
+      b.title = p.desc;
+      const on = p.cfg.mode === wcfg.mode && ['low', 'mid', 'high', 'top'].every((k) => Math.abs((p.cfg.bands[k] ?? 1) - (wcfg.bands[k] ?? 1)) < 0.01);
+      if (on) b.classList.add('on');
+      b.addEventListener('click', async () => {
+        try {
+          const res = await ctx.invoke('weights', [p.cfg]);
+          wcfg = res.cfg;
+          renderWeights(res.cfg, res.rows);
+          say(`${p.name}：${p.desc}`, false);
+        } catch (e) {
+          say((e && e.message) || String(e), true);
+        }
+      });
+      presetBar.append(b);
+    }
+    weightBox.append(presetBar);
+
+    for (const r of wrows) {
+      const row = el('div', 'fs-wrow');
+      row.append(el('span', 'fs-wname', r.label));
+      row.append(el('span', 'fs-wmeta', `${r.n} 片 · ${(r.seconds / 60).toFixed(1)} 分`));
+      const share = el('span', 'fs-wshift', '');
+      row.append(share);
+      const range = el('input', 'fs-wrange');
+      range.type = 'range';
+      range.min = '0.5';
+      range.max = '5';
+      range.step = '0.5';
+      range.value = String(wcfg.bands[r.id] ?? 1);
+      range.addEventListener('input', () => {
+        wcfg = { ...wcfg, bands: { ...wcfg.bands, [r.id]: Number(range.value) } };
+        paintWeightNumbers();
+      });
+      row.append(range);
+      const times = el('span', 'fs-wtimes', '');
+      row.append(times);
+      weightBox.append(row);
+      wRefs.push({ share, times });
+    }
+
+    const foot = el('div', 'fs-bar');
+    const saveBtn = el('button', 'fs-btn', '保存权重');
+    saveBtn.addEventListener('click', async () => {
+      try {
+        const res = await call('saveWeights', [wcfg]);
+        if (res && res.rows) wrows = res.rows;
+        renderWeights(wcfg, wrows);
+      } catch {
+        /* 错误已显示 */
+      }
+    });
+    foot.append(saveBtn, el('span', 'fs-meta', '保存后训练会用这套权重：同一档的片段被抽到的概率按倍数放大，每轮步数不变'));
+    weightBox.append(foot);
+
+    paintWeightNumbers();
+  };
+
   const poll = async () => {
     let st;
     try {
@@ -873,7 +1004,15 @@ function mountTrain(ctx) {
         timer = null;
       }
     }
-    if (st.dataset) renderResult(st.dataset);
+    if (st.dataset) {
+      renderResult(st.dataset);
+      if (st.dataset.rows && st.dataset.rows.length) {
+        if (st.dataset.presets) wPresets = st.dataset.presets;
+        // 已经渲染过就只更新数字：整块重建会把正在拖的滑块打断（轮询 900ms 一次）
+        if (weightBox.children.length) paintWeightNumbers();
+        else renderWeights(st.dataset.weights, st.dataset.rows);
+      }
+    }
     return Boolean(job && job.state === 'running');
   };
 

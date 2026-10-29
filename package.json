@@ -36,7 +36,7 @@
       "local"
     ],
     "describe": "describe.json",
-    "webUiClient": "dist/webui-b454c09d.js"
+    "webUiClient": "dist/webui-a38c7569.js"
   },
   "scripts": {
     "doctor": "node tools/doctor.mjs"

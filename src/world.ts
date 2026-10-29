@@ -21,9 +21,14 @@ import {
   datasetDirName,
   f0Histogram,
   readManifest,
+  readWeights,
+  saveWeights,
   scanSources,
   summarize,
+  WEIGHT_PRESETS,
+  weightedRows,
   type TrainSource,
+  type WeightConfig,
 } from './train.ts';
 import {
   deleteModel,
@@ -562,7 +567,9 @@ export class FishSingWorld implements World {
             bands: manifest.bands,
             bandLabels: BAND_LABEL,
             histogram: f0Histogram(manifest.slices),
-            recent: (args[0] as string[] | undefined) ?? [],
+            weights: readWeights(j?.dir ?? ''),
+            presets: WEIGHT_PRESETS,
+            rows: weightedRows(manifest, readWeights(j?.dir ?? '')),
             preview: manifest.slices
               .filter((x) => x.kept)
               .slice(0, 8)
@@ -576,6 +583,29 @@ export class FishSingWorld implements World {
               })),
           }
           : null,
+      };
+    }
+
+    if (method === 'weights') {
+      const dir = this.datasetJob?.dir;
+      const m = dir ? readManifest(dir) : null;
+      if (!m) throw new Error('还没有数据集，先在上面扫一遍素材');
+      const cfg = (args[0] as WeightConfig | undefined) ?? readWeights(dir ?? '');
+      return { cfg, rows: weightedRows(m, cfg), presets: WEIGHT_PRESETS };
+    }
+
+    if (method === 'saveWeights') {
+      const dir = this.datasetJob?.dir;
+      const m = dir ? readManifest(dir) : null;
+      if (!m) throw new Error('还没有数据集');
+      const cfg = args[0] as WeightConfig;
+      saveWeights(dir, cfg);
+      const rows = weightedRows(m, cfg);
+      const worst = rows.reduce((a, b) => (b.after > a.after ? b : a), rows[0]);
+      return {
+        text: `已保存：${cfg.mode === 'p90' ? '按最高音' : '按主音域'}分档，${
+          rows.map((r) => `${r.label.split(' ')[0]} ${r.weight}x`).join(' / ')}（占比最大的是${worst.label.split(' ')[0]} ${(worst.after * 100).toFixed(0)}%）`,
+        rows,
       };
     }
 
