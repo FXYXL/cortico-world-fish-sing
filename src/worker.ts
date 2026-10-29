@@ -113,6 +113,8 @@ export class WorkerClient {
       FISHSING_PORT: String(this.opts.port),
       FISHSING_TOKEN: this.opts.token || '',
       FISHSING_RVC_ROOT: this.opts.rvcRoot,
+      // 自托管时 venv 与 rvc 代码平级，doctor 自检需要知道真正的 python 在哪
+      FISHSING_RVC_PY: this.opts.pythonPath,
       FISHSING_MODEL: this.opts.model,
       FISHSING_INDEX: this.opts.index.startsWith('logs') || this.opts.index.startsWith('assets')
         ? join(this.opts.rvcRoot, this.opts.index)

@@ -36,12 +36,64 @@
 
 ## 依赖
 
-- **RVC 项目 + 训练好的模型**（默认 `D:\AI\rvc`，模型 `assets/weights/dfy2.pth`，索引 `logs/dfy2/added_*.index`）
-- **demucs 环境**（默认 `D:\AI\seed-vc\venv`，脚本 `D:\AI\seed-vc-src\separate.py`）
-- **ffmpeg 三件套**（`ffmpeg.exe` / `ffprobe.exe` / `ffplay.exe`，默认 `D:\ffmpeg\bin`）
+插件自带**代码和配置**，你只需要准备两样：
+
+- **Python 运行时**（torch cu118 + demucs + faiss + soundfile）→ `node tools/bootstrap.mjs venv`
+- **模型权重**（909 MB，6 个文件）→ `node tools/bootstrap.mjs models --download`
+- ffmpeg 三件套（`ffmpeg.exe` / `ffprobe.exe` / `ffplay.exe`，默认 `D:\ffmpeg\bin`）
 - 可选：SnowLuma（OneBot HTTP）用于发 QQ 语音条
 
-全部路径都能在控制台「大肥鱼唱歌」页里改。
+## 运行时与权重
+
+一条命令体检，告诉你还缺什么（不动磁盘）：
+
+```bash
+node tools/bootstrap.mjs
+```
+
+逐步安装，每步都能重复跑、失败直接重试：
+
+```bash
+node tools/bootstrap.mjs rvc                  # 复制 RVC 代码到 <数据目录>/runtime/rvc（3 MB）
+node tools/bootstrap.mjs models               # 从已有 RVC 目录复制权重（本机迁移用；--from 可换来源）
+node tools/bootstrap.mjs models --download    # 从 GitHub Release 下载 909 MB 并校验 sha256
+node tools/bootstrap.mjs venv                 # 准备 Python 运行时，并补 demucs
+node tools/bootstrap.mjs verify               # 检查 torch/demucs/faiss 与权重是否齐
+```
+
+装完的目录：
+
+```
+<数据目录>/runtime/
+  rvc/     ← 代码 + 权重（assets/weights、assets/rmvpe、assets/hubert_base、logs/dfy2）
+  venv/    ← Python 运行时
+```
+
+**配置里那四个路径框全部留空 = 自托管**，什么都不用改。
+已经有一份外部 RVC 的开发者，把 `worker.rvcRoot` / `worker.pythonPath` 填上就切回外部模式。
+
+### 迁移已有环境（不重新下载）
+
+本机已经跑通过 RVC 的，从现有项目抄过来最快：
+
+```bash
+node tools/bootstrap.mjs all --link     # 代码 + 权重；--link 用硬链接，同盘几乎不占空间
+node tools/bootstrap.mjs venv           # 复制现有 venv（6 GB，几分钟），自动补 demucs
+node tools/bootstrap.mjs verify
+```
+
+`venv --fresh` 是从零建（要下 torch 2.5 GB，走国内镜像约 10~20 分钟）。
+
+### 发布权重到 Release（维护者）
+
+```bash
+node tools/upload-release.mjs --dry     # 先看要传什么
+$env:GITHUB_TOKEN="ghp_xxx"             # classic 勾 repo，或 fine-grained 给 Contents: Read and write
+node tools/upload-release.mjs           # 自动建 Release（tag=models-v1）+ 上传 + 复核
+```
+
+也可以网页传：<https://github.com/FXYXL/cortico-world-fish-sing/releases/new>，
+**tag 必须填 `models-v1`**（清单里的下载地址按它拼），把 6 个文件拖进去。
 
 ## 安装
 

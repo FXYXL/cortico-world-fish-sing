@@ -34,7 +34,12 @@ import soundfile as sf
 # ---------------------------------------------------------------- 常量
 
 RVC_ROOT = Path(os.environ.get("FISHSING_RVC_ROOT", r"D:\AI\rvc"))
-RVC_PY = RVC_ROOT / "venv" / "Scripts" / "python.exe"
+# 自托管时 venv 和 rvc 代码是**平级**的（runtime/venv 与 runtime/rvc），不在 rvc/venv 里，
+# 所以这个路径必须能被外部指定；回落到老结构（rvc/venv）只是为了兼容开发机。
+RVC_PY = Path(os.environ.get(
+    "FISHSING_RVC_PY",
+    str(RVC_ROOT / "venv" / "Scripts" / "python.exe"),
+))
 SEP_PY = Path(os.environ.get("FISHSING_SEP_PY", sys.executable))
 SEP_SCRIPT = Path(os.environ.get("FISHSING_SEP_SCRIPT",
                          str(Path(__file__).resolve().parent / "separate.py")))
