@@ -1,19 +1,26 @@
 /**
- * 把权重传到 GitHub Release（一次建 Release + 传 6 个文件 + 校验大小）。
+ * 把权重传到 GitHub Release（建 Release + 传 6 个文件 + 复核大小）。
  *
- *   set GITHUB_TOKEN=ghp_xxx           （cmd）
- *   $env:GITHUB_TOKEN="ghp_xxx"        （PowerShell）
+ *   $env:GITHUB_TOKEN="ghp_xxx"     （PowerShell）
+ *   set GITHUB_TOKEN=ghp_xxx        （cmd）
  *
- *   node tools/upload-release.mjs                 # 上传（已存在的同名 asset 会先删再传）
- *   node tools/upload-release.mjs --dry           # 只列出要传什么
+ *   node tools/upload-release.mjs                   # 上传（服务器上已有同尺寸文件的跳过）
+ *   node tools/upload-release.mjs --dry             # 只列出要传什么
  *   node tools/upload-release.mjs --from D:\AI\rvc  # 权重来源目录（默认 D:\AI\rvc）
  *
- * Token 只需一次：GitHub → Settings → Developer settings → Personal access tokens，
- * classic 勾 `repo`，或 fine-grained 只给这个仓库的 Contents: Read and write。
- * 上传 900 MB 建议挂机跑，中断了直接重跑，已上传的文件会跳过。
+ * Token：GitHub → Settings → Developer settings → Personal access tokens，
+ * classic 勾 `repo`，或 fine-grained 只给这个仓库 Contents: Read and write。
+ * 中断或失败直接重跑，已传好的文件会跳过。
+ *
+ * 两个踩过的坑（都在下面处理了）：
+ * 1. 不能把文件流直接给 fetch 当 body —— 上传端点会 307 重定向，undici 自动跟随时无法重放
+ *    已读空的流，抛 `UND_ERR_REQ_CONTENT_LENGTH_MISMATCH`（实际发出 0 字节 vs 声明 52 MB）。
+ *    所以改成 Buffer + `redirect: 'manual'` 自己跟，且每一跳**重新读一次文件**。
+ * 2. 同一个 Buffer 不能复用两次 —— undici 发送时会把底层 ArrayBuffer detach，
+ *    第二次再 slice 就报 "detached ArrayBuffer"。所以每一跳都新建。
  */
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -41,19 +48,20 @@ const NAME = `模型权重 ${TAG}`;
 const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
 const API = 'https://api.github.com';
 const UPLOADS = 'https://uploads.github.com';
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
 const mb = (n) => `${(n / 1048576).toFixed(1)} MB`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function need(args) {
+function need(init) {
   return {
-    method: 'GET',
-    ...args,
+    ...init,
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       'User-Agent': 'fish-sing-uploader',
-      ...(args.headers ?? {}),
+      ...(init.headers ?? {}),
     },
   };
 }
@@ -71,12 +79,89 @@ async function api(path, init = {}) {
 }
 
 function pickFiles() {
-  const out = [];
-  for (const f of MANIFEST.files) {
+  return MANIFEST.files.map((f) => {
     const p = join(fromRoot, f.target);
-    out.push({ ...f, path: p, exists: existsSync(p), actual: existsSync(p) ? statSync(p).size : 0 });
+    const there = existsSync(p);
+    return { ...f, path: p, exists: there, actual: there ? statSync(p).size : 0 };
+  });
+}
+
+/** 上传单个文件，返回是否成功。内部处理重定向与重试。 */
+async function uploadOne(release, f) {
+  const startUrl = `${UPLOADS}/repos/${OWNER}/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(f.name)}`;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let url = startUrl;
+    let fatal = false;
+
+    for (let hop = 1; hop <= 5 && !fatal; hop += 1) {
+      const t0 = Date.now();
+      // 每一跳重新读：Buffer 被 undici detach 过，且重定向需要重放整个 body
+      const body = readFileSync(f.path);
+      process.stdout.write(`\r    上传中 ${mb(f.size)}…   `);
+      const ticker = setInterval(() => {
+        process.stdout.write(`\r    上传中 ${mb(f.size)}… 已 ${((Date.now() - t0) / 1000).toFixed(0)} 秒   `);
+      }, 3000);
+
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(f.size),
+            'User-Agent': 'fish-sing-uploader',
+          },
+          body,
+          redirect: 'manual',
+        });
+      } catch (e) {
+        clearInterval(ticker);
+        process.stdout.write('\n');
+        lastErr = e;
+        break;
+      }
+      clearInterval(ticker);
+      process.stdout.write('\n');
+
+      if (REDIRECTS.has(res.status)) {
+        const loc = res.headers.get('location');
+        if (!loc) {
+          lastErr = new Error(`重定向 ${res.status} 但没有 Location`);
+          break;
+        }
+        const next = new URL(loc, url).href;
+        console.log(`  \x1b[90m· ${res.status} 重定向 → ${new URL(next).host}\x1b[0m`);
+        url = next;
+        continue;
+      }
+
+      const text = await res.text();
+      if (!res.ok) {
+        lastErr = new Error(`HTTP ${res.status}：${text.slice(0, 200)}`);
+        // 4xx（除超时/限流）重试没意义
+        if (res.status >= 400 && res.status < 500 && ![408, 429].includes(res.status)) fatal = true;
+        break;
+      }
+      const asset = JSON.parse(text);
+      console.log(`  \x1b[32m✓\x1b[0m ${f.name}  ${mb(asset.size)}  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return true;
+    }
+
+    if (fatal) break;
+    console.error(`  \x1b[33m第 ${attempt} 次失败：${lastErr?.message ?? '未知'}\x1b[0m`);
+    if (attempt < 3) {
+      const wait = attempt * 3000;
+      console.error(`  ${wait / 1000} 秒后重试…`);
+      await sleep(wait);
+    }
   }
-  return out;
+
+  console.error(`  \x1b[31m✗ ${f.name} 上传失败：${lastErr?.message ?? ''}\x1b[0m`);
+  return false;
 }
 
 async function main() {
@@ -88,7 +173,11 @@ async function main() {
   console.log(`合计   ${mb(MANIFEST.files.reduce((n, f) => n + f.size, 0))}\n`);
 
   for (const f of files) {
-    const state = !f.exists ? '\x1b[31m缺失\x1b[0m' : f.actual === f.size ? '\x1b[32m就绪\x1b[0m' : `\x1b[33m大小不符 ${mb(f.actual)}\x1b[0m`;
+    const state = !f.exists
+      ? '\x1b[31m缺失\x1b[0m'
+      : f.actual === f.size
+        ? '\x1b[32m就绪\x1b[0m'
+        : `\x1b[33m大小不符 ${mb(f.actual)}\x1b[0m`;
     console.log(`  ${f.name.padEnd(44)} ${mb(f.size).padStart(10)}  ${state}`);
   }
   if (files.some((f) => !f.exists)) {
@@ -102,7 +191,7 @@ async function main() {
   if (!token) {
     console.error('\n没给 GITHUB_TOKEN。设置环境变量后再跑：');
     console.error('  PowerShell:  $env:GITHUB_TOKEN="ghp_xxx"');
-    console.error('  或直接网页上传：https://github.com/' + OWNER + '/' + REPO + '/releases/new');
+    console.error(`  或直接网页上传：https://github.com/${OWNER}/${REPO}/releases/new`);
     process.exit(1);
   }
 
@@ -123,7 +212,7 @@ async function main() {
     });
     if (!res.ok) {
       console.error(`建 Release 失败 HTTP ${res.status}：${text.slice(0, 300)}`);
-      console.error('如果是 403，token 缺 repo 权限；如果是 422，tag 可能已被占用。');
+      console.error('403 一般是 token 缺 repo 权限；422 一般是 tag 已被占用（重跑会用已有 Release）。');
       process.exit(1);
     }
     release = json;
@@ -133,7 +222,9 @@ async function main() {
   }
 
   // 2. 已有 asset：大小一致就跳过，不一致就删掉重传
-  const existing = new Map(((await api(`/repos/${OWNER}/${REPO}/releases/${release.id}/assets`)).json ?? []).map((a) => [a.name, a]));
+  const existing = new Map(
+    ((await api(`/repos/${OWNER}/${REPO}/releases/${release.id}/assets`)).json ?? []).map((a) => [a.name, a]),
+  );
 
   for (const f of files) {
     const have = existing.get(f.name);
@@ -142,42 +233,15 @@ async function main() {
         console.log(`  \x1b[90m· ${f.name} 已在服务器上（${mb(have.size)}），跳过\x1b[0m`);
         continue;
       }
-      console.log(`  · ${f.name} 服务器上大小不符，删掉重传`);
+      console.log(`  · ${f.name} 服务器上大小不符（${mb(have.size)}），删掉重传`);
       await api(`/repos/${OWNER}/${REPO}/releases/assets/${have.id}`, { method: 'DELETE' });
     }
-
     console.log(`\n  上传 ${f.name}（${mb(f.size)}）…`);
-    const t0 = Date.now();
-    let sent = 0;
-    const stream = createReadStream(f.path);
-    stream.on('data', (c) => {
-      sent += c.length;
-      const pct = ((sent / f.size) * 100).toFixed(1);
-      const speed = sent / ((Date.now() - t0) / 1000) / 1048576;
-      process.stdout.write(`\r    ${pct}%  ${mb(sent)}/${mb(f.size)}  ${speed.toFixed(1)} MB/s   `);
-    });
-
-    const res = await fetch(`${UPLOADS}/repos/${OWNER}/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(f.name)}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': String(f.size),
-        'User-Agent': 'fish-sing-uploader',
-      },
-      body: stream,
-      duplex: 'half',
-    });
-    const text = await res.text();
-    process.stdout.write('\n');
-    if (!res.ok) {
-      console.error(`  \x1b[31m✗ ${f.name} 上传失败 HTTP ${res.status}\x1b[0m\n  ${text.slice(0, 300)}`);
-      console.error('  重跑本命令会跳过已传好的文件。');
+    const one = await uploadOne(release, f);
+    if (!one) {
+      console.log('\n\x1b[31m停下：单个文件失败，先解决再重跑（已传好的会跳过）。\x1b[0m');
       process.exit(1);
     }
-    const asset = JSON.parse(text);
-    console.log(`  ✓ ${f.name}  ${mb(asset.size)}  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
 
   // 3. 复核
@@ -196,12 +260,13 @@ async function main() {
       console.log(`  ✓ ${f.name}`);
     }
   }
-  console.log(
-    bad
-      ? `\n\x1b[31m还有 ${bad} 个文件不对。\x1b[0m`
-      : `\n\x1b[32m全部就位。\x1b[0m 下载地址前缀：${MANIFEST.base}\n别人装插件后点「下载模型」或跑 node tools/bootstrap.mjs models --download 即可。`,
-  );
-  if (bad) process.exit(1);
+  if (bad) {
+    console.log(`\n\x1b[31m还有 ${bad} 个文件不对，重跑本命令即可。\x1b[0m`);
+    process.exit(1);
+  }
+  console.log('\n\x1b[32m全部就位。\x1b[0m');
+  console.log(`下载地址前缀：${MANIFEST.base}`);
+  console.log('别人装插件后跑 node tools/bootstrap.mjs models --download 即可自动下载并校验。');
 }
 
 await main();
