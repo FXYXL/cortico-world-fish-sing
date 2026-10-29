@@ -99,8 +99,28 @@ def read_audio(path: Path) -> tuple:
 
 
 def write_audio(path: Path, data: np.ndarray, sr: int) -> None:
+    """写 wav。超过满幅先压回来——RVC 有时会返回 int16 量纲的数组，
+    直接当浮点写（PCM_24）会把 99% 的样本削平，听感是"炸/刺/吓人"。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), data, sr, subtype="PCM_24")
+    a = np.asarray(data, dtype=np.float32)
+    peak = float(np.abs(a).max()) if a.size else 0.0
+    if peak > 1.0:
+        a = a * (0.99 / peak)
+    sf.write(str(path), a, sr, subtype="PCM_24")
+
+
+def to_unit_scale(audio: np.ndarray) -> np.ndarray:
+    """
+    RVC 的 `vc_single` 返回的是 **int16 量纲**的数组（±32767，且已按 0.99 归一）。
+    必须除回 32768 才是 [-1,1] 的浮点，否则后面每一步都在处理一个 3 万倍的信号。
+    """
+    a = np.asarray(audio)
+    if np.issubdtype(a.dtype, np.integer):
+        return a.astype(np.float32) / 32768.0
+    a = a.astype(np.float32)
+    if a.size and float(np.abs(a).max()) > 1.5:  # 浮点数组但量纲像 int16
+        return a / 32768.0
+    return a
 
 
 def resample_linear_fallback(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -282,7 +302,7 @@ class SingEngine:
                 )
             if not result or result[0] is None or result[1] is None:
                 raise RuntimeError(f"第 {tag} 片换声失败：{status}")
-            audio = np.asarray(result[1], dtype=np.float32)
+            audio = to_unit_scale(result[1])
             if audio.ndim == 1:
                 audio = audio.reshape(-1, 1)
             osr = int(result[0])

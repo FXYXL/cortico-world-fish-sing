@@ -36,6 +36,12 @@ export interface LibraryOptions {
   dataDir: string;
 }
 
+/**
+ * 缓存格式版本。改了会**影响听感**的算法（削波修复、混音比例、编码前处理）就要 +1，
+ * 否则用户点了同一首歌会命中旧缓存，听到的永远是修复前的坏音频。
+ */
+const CACHE_SCHEMA = 2;
+
 function files(opts: LibraryOptions) {
   const cacheDir = join(opts.dataDir, 'cache');
   const libDir = join(opts.dataDir, 'library');
@@ -47,6 +53,7 @@ function files(opts: LibraryOptions) {
 /** 缓存键：源标识 + 全部音色参数。 */
 export function cacheKey(sourceId: string, p: SingParams): string {
   const raw = [
+    `v${CACHE_SCHEMA}`,
     sourceId,
     p.model,
     p.index,
