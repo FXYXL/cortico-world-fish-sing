@@ -19,6 +19,7 @@ import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from '.
 import {
   BAND_LABEL,
   datasetDirName,
+  findActiveExperiment,
   f0Histogram,
   listDatasets,
   listExperiments,
@@ -36,6 +37,7 @@ import {
   scanSources,
   summarize,
   WEIGHT_PRESETS,
+  writeTrainState,
   writeDatasetState,
   weightedRows,
   sliceWeights,
@@ -976,7 +978,16 @@ export class FishSingWorld implements World {
     }
 
     if (method === 'trainStatus') {
-      const exp = String(args[0] ?? '') || this.trainJob?.exp || this.lastExp || '';
+      const exp = String(args[0] ?? '')
+        || this.trainJob?.exp
+        || this.lastExp
+        // 最后兜底：直接去看哪个实验的日志最近还在写。
+        // 孤儿进程（worker 换过、或 train.json 还没来得及写）就靠这条被发现。
+        || findActiveExperiment(join(this.routes.rvcRoot, 'logs'));
+      if (exp && !this.lastExp) {
+        this.lastExp = exp;
+        writeTrainState(this.opts.dataDir, { exp, epochs: 0, startedAt: 0 });
+      }
       const expDir = this.expDirFor(exp);
       const lg = expDir ? readTrainLog(expDir) : null;
       const models = exp

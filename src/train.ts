@@ -755,3 +755,30 @@ export function logAgeSec(expDir: string): number | null {
     return null;
   }
 }
+
+/**
+ * 找出「正在训练/最近训练过」的实验名。
+ *
+ * 为什么需要：面板原本靠 `train.json` 记的实验名。但那次训练是在加这个功能**之前**
+ * 开始的，重启后既没有 train.json、新 worker 也不认识那个任务（孤儿进程），
+ * 于是面板一片空白——训练明明还在跑。
+ *
+ * 做法：扫每个实验目录下的 train.log，优先挑 3 分钟内还在更新的那个；没有就挑最后改过的那个。
+ */
+export function findActiveExperiment(logsRoot: string, staleSec = 180): string {
+  if (!existsSync(logsRoot)) return '';
+  let fresh = { exp: '', mtime: 0 };
+  let latest = { exp: '', mtime: 0 };
+  for (const e of readdirSync(logsRoot, { withFileTypes: true })) {
+    if (!e.isDirectory()) continue;
+    const f = join(logsRoot, e.name, 'train.log');
+    try {
+      const mt = statSync(f).mtimeMs;
+      if (mt > latest.mtime) latest = { exp: e.name, mtime: mt };
+      if (Date.now() - mt < staleSec * 1000 && mt > fresh.mtime) fresh = { exp: e.name, mtime: mt };
+    } catch {
+      /* 没有 train.log 的实验跳过 */
+    }
+  }
+  return fresh.exp || latest.exp;
+}
