@@ -1205,10 +1205,63 @@ function mountTrain(ctx) {
   const tModels = el('div', 'fs-list');
 
   const tTitle = el('div', 'fs-wtitle', '训练');
-  trainBox.append(tTitle, tForm, chkRow, tProg, tMsg, losses, lossAxis, tModels);
+  const ckptBar = el('div', 'fs-bar');
+  const ckptMeta = el('span', 'fs-meta', '');
+  const keepIn = el('input', 'fs-tin');
+  keepIn.type = 'number';
+  keepIn.min = '1';
+  keepIn.value = '50';
+  keepIn.style.width = '64px';
+  const pruneBtn = el('button', 'fs-btn', '清理中间档');
+  pruneBtn.title = '只删 assets/weights/<exp>_eN_sX.pth 这种导出的小模型；完整存档、索引、最终模型都不动';
+  ckptBar.append(el('span', 'fs-meta', '中间档：'), ckptMeta, el('span', 'fs-meta', '每'),
+    keepIn, el('span', 'fs-meta', '轮留一个'), el('span', 'fs-grow'), pruneBtn);
+  trainBox.append(tTitle, tForm, chkRow, tProg, tMsg, losses, lossAxis, tModels, ckptBar);
 
   let trainExp = '';
   let trainTimer = null;
+  let pendingPrune = false;
+
+  const refreshCkpt = async () => {
+    try {
+      const st2 = await ctx.invoke('trainStatus', [trainExp]);
+      const ck = st2.ckpt || { n: 0, totalMb: 0 };
+      ckptMeta.textContent = ck.n ? `${ck.n} 个 · ${ck.totalMb} MB` : '暂无';
+      pruneBtn.disabled = !ck.n;
+    } catch { /* 忽略 */ }
+  };
+
+  pruneBtn.addEventListener('click', async () => {
+    if (!trainExp) return;
+    const step = Math.max(1, Number(keepIn.value) || 50);
+    if (!pendingPrune) {
+      // 先看要删多少，再确认——中间档删了只能重训才拿得回来
+      try {
+        const st2 = await ctx.invoke('trainStatus', [trainExp]);
+        const n = (st2.ckpt || {}).n || 0;
+        if (!n) return;
+        pendingPrune = true;
+        pruneBtn.textContent = `确认删除？每 ${step} 轮留一个`;
+        setTimeout(() => {
+          if (pendingPrune) {
+            pendingPrune = false;
+            pruneBtn.textContent = '清理中间档';
+          }
+        }, 5000);
+      } catch { /* 忽略 */ }
+      return;
+    }
+    pendingPrune = false;
+    pruneBtn.textContent = '清理中…';
+    pruneBtn.disabled = true;
+    try {
+      await call('prune', [trainExp, step]);
+    } catch {
+      /* 错误已在消息行显示 */
+    }
+    await refreshCkpt();
+    pruneBtn.textContent = '清理中间档';
+  });
 
   const fmtDur = (sec) => {
     const s0 = Math.max(0, Math.round(Number(sec) || 0));
@@ -1291,6 +1344,12 @@ function mountTrain(ctx) {
     if (!ms.length && st.exp) {
       tModels.append(el('div', 'fs-meta', `logs/${st.exp} 还没有产出模型`));
     }
+
+    // 中间档统计：训练时每 10 轮写一个，200 轮会堆 20 个 × 53MB ≈ 1GB
+    const ck = st.ckpt || { n: 0, totalMb: 0 };
+    ckptMeta.textContent = ck.n ? `${ck.n} 个 · ${ck.totalMb} MB` : '暂无';
+    pruneBtn.disabled = !ck.n || running || pendingPrune;
+    if (!pendingPrune) pruneBtn.textContent = '清理中间档';
 
     if (running && !trainTimer) trainTimer = setInterval(() => void pollTrain(), 3000);
     if (!running && trainTimer) {

@@ -4,7 +4,7 @@
  * 所有音频处理都在 Python worker 里做（dataset.py），这里只负责把结果整理成
  * 面板能直接画的结构——统计、分档、直方图分桶。
  */
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import type { WorkerClient } from './worker.ts';
@@ -596,4 +596,120 @@ export function suggestTrainParams(seconds: number): { epochs: number; batch: nu
   if (minutes < 20) return { epochs: 250, batch: 4, note: '数据偏少，250 轮左右' };
   if (minutes < 45) return { epochs: 200, batch: 4, note: '33 分钟左右用 200 轮，之前 dfy2 就是这个配置' };
   return { epochs: 160, batch: 4, note: '数据超过 45 分钟，每轮变慢，160 轮通常够了' };
+}
+
+// ---------------------------------------------------------------- 中间档清理
+
+export interface PrunePlan {
+  /** 会保留的文件 */
+  keep: string[];
+  /** 会删掉的模型文件 */
+  remove: string[];
+  /**
+   * 顺手清掉的临时文件（目前是 `logs/<exp>/total_fea.npy`：建索引时的汇总，
+   * 索引建完就没用了，重建时会自动重新生成，占 200~300 MB）。
+   */
+  scratch: string[];
+  /** 能释放多少 MB */
+  freedMb: number;
+  /** 被删文件总共占多少 MB */
+  totalMb: number;
+}
+
+/**
+ * 规划「每 N 轮留一个」要删哪些 checkpoint。
+ *
+ * 只碰 `assets/weights/<exp>_eN_sX.pth` 这类**导出的小模型**，不碰：
+ * - `<exp>.pth`（最终模型，训练结束时写的）
+ * - `logs/<exp>/G_2333333.pth`、`D_2333333.pth`（完整存档，续训要用）
+ * - `.index`（唱歌时要加载）
+ *
+ * 默认保留：最终模型 + 最新的那个 + 每隔 keepEvery 轮的一个。
+ * 这样既能把 20 个压到 4~5 个，又不至于想 A/B 时手里没档。
+ */
+export function planPruneCheckpoints(weightsDir: string, exp: string, keepEvery = 50): PrunePlan {
+  const dir = weightsDir;
+  const plan: PrunePlan = { keep: [], remove: [], scratch: [], freedMb: 0, totalMb: 0 };
+  if (!existsSync(dir)) return plan;
+
+  const re = new RegExp(`^${exp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_e(\\d+)_s\\d+\\.pth$`);
+  const rows: Array<{ name: string; epoch: number; mb: number }> = [];
+  for (const f of readdirSync(dir)) {
+    const m = re.exec(f);
+    if (!m) continue;
+    let mb = 0;
+    try {
+      mb = Math.round((statSync(join(dir, f)).size / 1048576) * 10) / 10;
+    } catch {
+      /* 读不到就当 0 */
+    }
+    rows.push({ name: f, epoch: Number(m[1]), mb });
+  }
+  if (!rows.length) return plan;
+  rows.sort((a, b) => a.epoch - b.epoch);
+
+  const step = Math.max(1, Math.round(keepEvery));
+  const newest = rows[rows.length - 1].epoch;
+  for (const r of rows) {
+    const keep = r.epoch % step === 0 || r.epoch === newest;
+    if (keep) plan.keep.push(r.name);
+    else {
+      plan.remove.push(r.name);
+      plan.freedMb += r.mb;
+    }
+    plan.totalMb += r.mb;
+  }
+  plan.freedMb = Math.round(plan.freedMb * 10) / 10;
+  plan.totalMb = Math.round(plan.totalMb * 10) / 10;
+  return plan;
+}
+
+/** 执行清理，返回实际删掉的文件名。 */
+export function pruneCheckpoints(
+  weightsDir: string,
+  exp: string,
+  keepEvery = 50,
+  logsRoot?: string,
+): PrunePlan {
+  const plan = planPruneCheckpoints(weightsDir, exp, keepEvery);
+  for (const name of plan.remove) {
+    try {
+      rmSync(join(weightsDir, name), { force: true });
+    } catch {
+      /* 被占用就跳过，下次再删 */
+    }
+  }
+  if (logsRoot) {
+    const scratch = join(logsRoot, exp, 'total_fea.npy');
+    if (existsSync(scratch)) {
+      try {
+        const mb = Math.round((statSync(scratch).size / 1048576) * 10) / 10;
+        rmSync(scratch, { force: true });
+        plan.scratch.push('total_fea.npy');
+        plan.freedMb = Math.round((plan.freedMb + mb) * 10) / 10;
+      } catch {
+        /* 跳过 */
+      }
+    }
+  }
+  return plan;
+}
+
+/** 某个实验目前有几个中间档、共占多大。 */
+export function checkpointStats(weightsDir: string, exp: string): { n: number; totalMb: number } {
+  // 不能复用 planPrune（大 step 会把「最新那个」以外的都算成待删），这里老实扫一遍
+  let n = 0;
+  let totalMb = 0;
+  if (!existsSync(weightsDir)) return { n: 0, totalMb: 0 };
+  const re = new RegExp(`^${exp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_e(\\d+)_s\\d+\\.pth$`);
+  for (const f of readdirSync(weightsDir)) {
+    if (!re.test(f)) continue;
+    n += 1;
+    try {
+      totalMb += statSync(join(weightsDir, f)).size / 1048576;
+    } catch {
+      /* 读不到就当 0 */
+    }
+  }
+  return { n, totalMb: Math.round(totalMb * 10) / 10 };
 }

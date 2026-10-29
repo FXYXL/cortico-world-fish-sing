@@ -24,6 +24,9 @@ import {
   listExperiments,
   readDatasetState,
   readManifest,
+  checkpointStats,
+  planPruneCheckpoints,
+  pruneCheckpoints,
   readTrainLog,
   readWeights,
   saveWeights,
@@ -905,7 +908,28 @@ export class FishSingWorld implements World {
         etaSec,
         models: models.map((x) => ({ name: x.name, epoch: x.epoch, sizeMb: x.sizeMb, current: x.current })),
         datasetBusy: this.datasetJob?.state === 'running',
+        ckpt: exp ? checkpointStats(join(this.routes.rvcRoot, 'assets', 'weights'), exp) : { n: 0, totalMb: 0 },
         weights: exp && expDir ? readWeights(this.datasetJob?.dir ?? '') : null,
+      };
+    }
+
+    if (method === 'prune') {
+      const exp = String(args[0] ?? '');
+      if (!exp) throw new Error('没指定实验名');
+      const dir = join(this.routes.rvcRoot, 'assets', 'weights');
+      const plan = planPruneCheckpoints(dir, exp, Number(args[1]) || 50);
+      if (!plan.remove.length) {
+        return { text: `没有可清理的中间档（现在 ${plan.keep.length} 个 / ${plan.totalMb} MB）`, removed: 0 };
+      }
+      const done = pruneCheckpoints(dir, exp, Number(args[1]) || 50, join(this.routes.rvcRoot, 'logs'));
+      // 正在用的模型被删了就得换一个，否则下一次唱歌指向一个不存在的文件
+      const gone = done.remove.includes(basename(this.current.model));
+      return {
+        text: `清掉 ${done.remove.length} 个中间档${done.scratch.length ? ` + ${done.scratch.join('/')}` : ''}，`
+          + `释放 ${done.freedMb} MB（保留 ${done.keep.length} 个）`
+          + (gone ? '；注意：正在用的那一个被删了，去「模型」页换一档' : ''),
+        removed: done.remove.length,
+        freedMb: done.freedMb,
       };
     }
 
