@@ -1188,13 +1188,18 @@ function mountTrain(ctx) {
     mkField('批大小', bsSel, '8G 显存用 4，爆显存就降到 2'),
     mkField('每 N 轮存档', seIn, '每 N 轮导出一个小模型到「模型」页'),
   );
+  const pruneAfterChk = el('input', 'fs-ck');
+  pruneAfterChk.type = 'checkbox';
   const chkRow = el('div', 'fs-bar');
   const resumeLbl = el('label', 'fs-meta', '从上次存档继续');
   resumeLbl.prepend(resumeChk);
   const rebuildLbl = el('label', 'fs-meta', '重算特征');
   rebuildLbl.prepend(rebuildChk);
   rebuildLbl.title = '数据集换过、或上次特征提取失败时勾上';
-  chkRow.append(resumeLbl, rebuildLbl, el('span', 'fs-grow'), startT, stopT);
+  const pruneAfterLbl = el('label', 'fs-meta', '训练完自动清理中间档');
+  pruneAfterLbl.prepend(pruneAfterChk);
+  pruneAfterLbl.title = '按下面「每 N 轮留一个」保留，其余删掉。不勾就只是提醒你手动清。';
+  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, el('span', 'fs-grow'), startT, stopT);
 
   const tProg = el('div', 'fs-prog');
   const tFill = el('i');
@@ -1297,26 +1302,39 @@ function mountTrain(ctx) {
 
   const paintTrain = (st) => {
     const job = st.job;
-    const running = job && job.state === 'running';
+    // 有 job 就看 job；没有但日志还在写 = 重启前留下的训练还在跑，一样要当成「进行中」
+    const owned = Boolean(job && job.id);
+    const fresh = st.logAgeSec !== null && st.logAgeSec !== undefined && st.logAgeSec < 180;
+    const running = (job && job.state === 'running') || (!job && fresh) || Boolean(job && job.state === 'running');
     const log = st.log || { done: 0, losses: [], latest: null, secPerEpoch: null, error: '' };
     const total = st.total || 0;
 
     startT.disabled = running || st.datasetBusy;
-    stopT.disabled = !running;
-    tFill.style.width = `${running ? job.pct : job && job.state === 'done' ? 100 : 0}%`;
+    stopT.disabled = !running || !owned;
+    stopT.title = owned ? '' : '这个训练不是本次启动的（可能是重启前留下的），面板管不了它，要停只能结束 python 进程';
+    tFill.style.width = `${running ? (job ? job.pct : Math.min(99, Math.round((log.done / Math.max(1, total)) * 100))) : job && job.state === 'done' ? 100 : 0}%`;
 
     if (job) {
       trainExp = job.exp || trainExp;
       if (!expIn.value) expIn.value = job.exp || '';
+    } else if (st.exp) {
+      trainExp = st.exp;
+      if (!expIn.value) expIn.value = st.exp;
     }
 
-    if (running) {
+    if (running && !job) {
+      const per = log.secPerEpoch ? ` · ${log.secPerEpoch.toFixed(0)} 秒/轮` : '';
+      tMsg.textContent = `训练中（日志 ${st.logAgeSec} 秒前更新，进程不由面板接管）：${log.done}/${total || '?'} 轮${per}`;
+      tMsg.classList.remove('bad');
+    } else if (running) {
       const eta = st.etaSec ? ` · 预计还要 ${fmtDur(st.etaSec)}` : '';
       const per = log.secPerEpoch ? ` · ${log.secPerEpoch.toFixed(0)} 秒/轮` : '';
       tMsg.textContent = `${job.pct}% · ${job.msg}（${Math.min(log.done, total || job.epochs)}/${total || job.epochs} 轮${per}${eta}）`;
       tMsg.classList.remove('bad');
     } else if (job && job.state === 'done') {
-      tMsg.textContent = `训练完成：${job.exp}，共 ${log.done} 轮。去「模型」页挑一档试听（不会自动切换）。`;
+      const ck = st.ckpt || { n: 0, totalMb: 0 };
+      tMsg.textContent = `训练完成：${job.exp}，共 ${log.done} 轮。去「模型」页挑一档试听（不会自动切换）`
+        + (ck.n > 1 ? ` · 中间档 ${ck.n} 个 / ${ck.totalMb} MB，不会自动删，记得在下面清理` : '');
       tMsg.classList.remove('bad');
     } else if (job && job.state === 'error') {
       tMsg.textContent = `训练中断：${job.error || job.msg}`;
@@ -1388,6 +1406,8 @@ function mountTrain(ctx) {
         saveEvery: Number(seIn.value) || 10,
         resume: resumeChk.checked,
         rebuild: rebuildChk.checked,
+        pruneAfter: pruneAfterChk.checked,
+        keepEvery: Math.max(1, Number(keepIn.value) || 50),
       }]);
       if (r && r.exp) {
         trainExp = r.exp;

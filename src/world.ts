@@ -28,6 +28,8 @@ import {
   planPruneCheckpoints,
   pruneCheckpoints,
   readTrainLog,
+  logAgeSec,
+  readTrainState,
   readWeights,
   saveWeights,
   suggestTrainParams,
@@ -114,6 +116,8 @@ export class FishSingWorld implements World {
    * 训练任务。和 datasetJob 分开：训练要跑几小时，中途还可能去看数据集/模型页，
    * 混在一个字段里会被互相覆盖。
    */
+  /** 上次训练的实验名（存在 <dataDir>/train.json，重启后用来找回进度）。 */
+  private lastExp = '';
   private trainJob: {
     id: string;
     state: 'running' | 'done' | 'error';
@@ -147,6 +151,25 @@ export class FishSingWorld implements World {
     const saved = readDatasetState(opts.dataDir);
     if (saved && existsSync(join(saved, 'manifest.json'))) {
       this.datasetJob = { id: '', state: 'done', pct: 100, msg: '上次选中的数据集', dir: saved };
+    }
+    // 恢复上次训练的实验名；日志还在写就说明它还在跑（进程可能是重启前留下的）
+    const ts = readTrainState(opts.dataDir);
+    this.lastExp = ts.exp;
+    if (ts.exp) {
+      const dir = this.expDirFor(ts.exp);
+      const age = logAgeSec(dir);
+      if (age !== null && age < 180) {
+        const done = readTrainLog(dir).done;
+        this.trainJob = {
+          id: '',
+          state: 'running',
+          pct: ts.epochs ? Math.min(99, Math.round((done / ts.epochs) * 100)) : 50,
+          msg: '训练中（本次启动之前开始的，进程不由面板接管）',
+          exp: ts.exp,
+          epochs: ts.epochs,
+          startedAt: ts.startedAt || Date.now(),
+        };
+      }
     }
     this.worker = new WorkerClient(
       {
@@ -820,6 +843,9 @@ export class FishSingWorld implements World {
         saveEvery?: number;
         resume?: boolean;
         rebuild?: boolean;
+        /** 训练完自动清理中间档（默认不勾：删了只能重训才拿得回来） */
+        pruneAfter?: boolean;
+        keepEvery?: number;
       };
       const dir = this.datasetJob?.dir;
       const m = dir ? readManifest(dir) : null;
@@ -873,6 +899,8 @@ export class FishSingWorld implements World {
         });
         job.id = id;
         this.ownedJob = 'train';
+        this.lastExp = exp;
+        writeTrainState(this.opts.dataDir, { exp, epochs, startedAt: Date.now() });
       } catch (e) {
         job.state = 'error';
         job.error = e instanceof Error ? e.message : String(e);
@@ -893,6 +921,19 @@ export class FishSingWorld implements World {
           job.pct = 100;
           job.msg = '完成';
           this.host?.log.info(`[fish-sing] 训练完成：${exp}`);
+          // 勾了「训练完自动清理」才动文件：中间档删了只能重训才拿得回来，
+          // 默认不自动删，宁可让用户自己点那一下。
+          if (cfg.pruneAfter === true) {
+            const step = Math.max(1, Number(cfg.keepEvery) || 50);
+            const done = pruneCheckpoints(
+              join(this.routes.rvcRoot, 'assets', 'weights'),
+              exp, step, join(this.routes.rvcRoot, 'logs'),
+            );
+            if (done.remove.length) {
+              job.msg = `完成（自动清理 ${done.remove.length} 个中间档，释放 ${done.freedMb} MB）`;
+              this.host?.log.info(`[fish-sing] 已清理中间档：${done.remove.length} 个 / ${done.freedMb} MB`);
+            }
+          }
         })
         .catch((e: unknown) => {
           job.state = 'error';
@@ -908,7 +949,7 @@ export class FishSingWorld implements World {
     }
 
     if (method === 'trainStatus') {
-      const exp = String(args[0] ?? '') || this.trainJob?.exp || '';
+      const exp = String(args[0] ?? '') || this.trainJob?.exp || this.lastExp || '';
       const expDir = this.expDirFor(exp);
       const lg = expDir ? readTrainLog(expDir) : null;
       const models = exp
@@ -927,6 +968,10 @@ export class FishSingWorld implements World {
         etaSec,
         models: models.map((x) => ({ name: x.name, epoch: x.epoch, sizeMb: x.sizeMb, current: x.current })),
         datasetBusy: this.datasetJob?.state === 'running',
+        /** 这个训练是不是本次启动的（不是的话「停止训练」按不动，得去杀进程） */
+        owned: Boolean(this.trainJob?.id),
+        /** 日志多久没更新了，秒。用来判断「日志还在写 = 还在跑」 */
+        logAgeSec: logAgeSec(expDir),
         ckpt: exp ? checkpointStats(join(this.routes.rvcRoot, 'assets', 'weights'), exp) : { n: 0, totalMb: 0 },
         weights: exp && expDir ? readWeights(this.datasetJob?.dir ?? '') : null,
       };

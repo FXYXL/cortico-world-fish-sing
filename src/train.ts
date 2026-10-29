@@ -713,3 +713,45 @@ export function checkpointStats(weightsDir: string, exp: string): { n: number; t
   }
   return { n, totalMb: Math.round(totalMb * 10) / 10 };
 }
+
+// ---------------------------------------------------------------- 训练状态持久化
+
+export interface TrainState {
+  exp: string;
+  epochs: number;
+  startedAt: number;
+}
+
+const TRAIN_STATE = 'train.json';
+
+/**
+ * 记住上次训练的实验名。
+ *
+ * 为什么需要：Coo 重启后 `trainJob` 是内存里的东西，没了。
+ * 不记住的话面板打开是空的，明明训练还在跑（日志一直在写），却什么也看不到。
+ */
+export function readTrainState(dataDir: string): TrainState {
+  const f = join(dataDir, TRAIN_STATE);
+  if (!existsSync(f)) return { exp: '', epochs: 0, startedAt: 0 };
+  try {
+    const j = JSON.parse(readFileSync(f, 'utf8')) as Partial<TrainState>;
+    return { exp: String(j.exp ?? ''), epochs: Number(j.epochs ?? 0), startedAt: Number(j.startedAt ?? 0) };
+  } catch {
+    return { exp: '', epochs: 0, startedAt: 0 };
+  }
+}
+
+export function writeTrainState(dataDir: string, st: TrainState): void {
+  writeFileSync(join(dataDir, TRAIN_STATE), `${JSON.stringify(st, null, 2)}\n`, 'utf8');
+}
+
+/** 训练日志最后一次更新距今多少秒；没有日志返回 null。 */
+export function logAgeSec(expDir: string): number | null {
+  const f = join(expDir, 'train.log');
+  if (!existsSync(f)) return null;
+  try {
+    return Math.round((Date.now() - statSync(f).mtimeMs) / 1000);
+  } catch {
+    return null;
+  }
+}
