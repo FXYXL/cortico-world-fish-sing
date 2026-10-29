@@ -183,6 +183,9 @@ export class FishSingWorld implements World {
       description: [
         '唱一首歌：把这首歌换成她自己的声音唱出来，可以只在电脑上放，也可以发成 QQ 语音条。',
         '来源三选一：歌名（去 B 站搜）、BV 号或 B 站链接、本机文件绝对路径。',
+        '不确定哪条视频对时，先 search=true 只搜索不下载，看一眼标题再决定——正则打分分不出「女声翻唱」和「电音版」的区别，你自己读标题能分清。',
+        '看完候选用 pick 指定：给序号（从 1 开始）或 BV 号。pick 会跳过相关性阈值，所以只挑你确认过的。',
+        'order 可以换 B 站排序：default 综合、click 按播放、pubdate 按最新。找冷门翻唱时 click 常比综合靠谱。',
         '什么时候用：用户说「唱一首 X」「用你的声音唱 X」「来首 X 呗」，或者她自己想唱。',
         'to 决定声音去哪：local=只在本机放（默认、不打扰群）；group:<群号> 或 private:<QQ号> 发语音条（长歌会自动切成多条，每条 ≤60 秒）；both=两边都要。会话号从消息事件里原样取，不要自己编。',
         '耗时 60~120 秒，期间别的唱歌请求会被拒。返回 ok=false 时，把 message 里的真实原因如实告诉用户，不要假装唱了。',
@@ -200,6 +203,13 @@ export class FishSingWorld implements World {
           start: { type: 'number', description: '从第几秒开始唱（只想唱副歌时用）' },
           duration: { type: 'number', description: '唱多长（秒）；配合 start 可只发一段' },
           refresh: { type: 'boolean', description: '忽略缓存重唱一遍' },
+          search: { type: 'boolean', description: '只搜索不下载，返回候选列表（标题/时长/UP主/播放/BV）让你自己挑' },
+          pick: { type: 'string', description: '选定第几条：序号（从 1 开始）或 BV 号；配合 search 使用' },
+          order: {
+            type: 'string',
+            enum: ['default', 'click', 'pubdate'],
+            description: 'B 站排序：default 综合 / click 播放多 / pubdate 最新',
+          },
         },
         required: ['song'],
       },
@@ -218,6 +228,9 @@ export class FishSingWorld implements World {
             start: args.start === undefined ? undefined : Number(args.start),
             duration: args.duration === undefined ? undefined : Number(args.duration),
             refresh: args.refresh === true,
+            search: args.search === true,
+            pick: args.pick === undefined ? undefined : String(args.pick),
+            order: args.order === 'click' || args.order === 'pubdate' ? args.order : 'default',
           }, this.deps());
           if (r.ok && r.detail) {
             this.lastSong = {

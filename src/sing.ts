@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 
-import { audioUrlOf, download, extractBvid, isBvid, rankHits, searchBili } from './bili.ts';
+import { audioUrlOf, download, extractBvid, isBvid, rankHits, searchBili, type SearchHit, type SearchOrder } from './bili.ts';
 import { cut, duration, split, toMp3, type FfmpegDeps } from './audio.ts';
 import { parseTarget, sendRecord, type OneBotOptions, type Player } from './deliver.ts';
 import {
@@ -59,6 +59,12 @@ export interface SingRequest {
   duration?: number;
   /** 跳过缓存（想重唱一遍时用） */
   refresh?: boolean;
+  /** 只搜索不下载：把候选列表交回去，让她自己挑 */
+  search?: boolean;
+  /** 指定要下哪一条：序号（从 1 开始）或 BV 号 */
+  pick?: string;
+  /** B 站排序：default 综合 / click 播放多 / pubdate 最新 */
+  order?: SearchOrder;
 }
 
 export interface SingResult {
@@ -126,17 +132,31 @@ async function resolveSource(req: SingRequest, deps: SingDeps, tmp: string): Pro
 
   // 3) 关键词搜索
   if (!deps.songEnabled) throw new Error('从 B 站找歌被关掉了（配置 → 点歌），只能给 BV 号或本地文件');
-  const hits = await searchBili(raw);
+  const hits = await searchBili(raw, 20, req.order ?? 'default');
   if (!hits.length) throw new Error(`B 站没搜到「${raw}」，换个写法或者直接给 BV 号`);
   const pool = hits.filter((h) => h.durationSec >= 20 && h.durationSec <= deps.maxDurationSec);
   if (!pool.length) {
     throw new Error(`搜到 ${hits.length} 条，但没有一条时长在 20~${Math.round(deps.maxDurationSec)} 秒内（可能都是合集/直播）`);
   }
   const ranked = rankHits(pool, raw, deps.excludeWords);
-  const best = ranked[0];
-  if ((best.score ?? 0) < deps.minScore) {
+  let best = ranked[0];
+  const pickRaw = String(req.pick ?? '').trim();
+  if (pickRaw) {
+    // 她看过候选列表后点名要某一条：序号或 BV
+    const bv = extractBvid(pickRaw);
+    if (bv) {
+      best = ranked.find((h) => h.bvid === bv) ?? { ...best, bvid: bv, title: bv, score: 100 };
+    } else {
+      const idx = Number(pickRaw);
+      if (!Number.isInteger(idx) || idx < 1 || idx > ranked.length) {
+        throw new Error(`pick「${pickRaw}」不对：要给 1~${ranked.length} 的序号，或者 BV 号`);
+      }
+      best = ranked[idx - 1];
+    }
+    deps.log.info(`按 pick 选了第 ${pickRaw} 条：${best.title}（${best.bvid}）`);
+  } else if ((best.score ?? 0) < deps.minScore) {
     const top = ranked.slice(0, 3).map((h) => `《${h.title}》（${human(h.durationSec)}，${h.bvid}，${h.score} 分）`);
-    throw new Error(`没把握是这首（最高 ${best.score} 分，阈值 ${deps.minScore}）。候补：${top.join('；')}。要么换个写法（歌名+歌手），要么直接给 BV 号`);
+    throw new Error(`没把握是这首（最高 ${best.score} 分，阈值 ${deps.minScore}）。候补：${top.join('；')}。要么换个写法（歌名+歌手），要么直接给 BV 号，要么先 search=true 看候选`);
   }
   const info = await audioUrlOf(best.bvid);
   const m4a = join(tmp, 'src.m4a');
@@ -146,6 +166,49 @@ async function resolveSource(req: SingRequest, deps: SingDeps, tmp: string): Pro
     title: info.title || best.title, bvid: best.bvid,
     durationSec: info.durationSec || best.durationSec, alreadyVocal: false,
     note: `搜到《${best.title}》${best.score} 分`,
+  };
+}
+
+/**
+ * 只搜索、不下歌：把候选列表交回去让她自己挑。
+ *
+ * 为什么要这一步：rankHits 是正则打分，不懂语义——「女声翻唱」「电音版」「合唱」
+ * 这几种标题它分不出来。模型读标题一眼就懂，所以把选择权交出去，换一次往返。
+ */
+async function previewSearch(req: SingRequest, deps: SingDeps): Promise<SingResult> {
+  const raw = String(req.song || '').trim();
+  if (!raw) return { ok: false, message: '没给歌名' };
+  if (!deps.songEnabled) return { ok: false, message: '从 B 站找歌被关掉了（配置 → 点歌）' };
+
+  let hits: SearchHit[];
+  try {
+    hits = await searchBili(raw, 20, req.order ?? 'default');
+  } catch (e) {
+    return { ok: false, message: `搜索失败：${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!hits.length) return { ok: false, message: `B 站没搜到「${raw}」，换个写法（歌名 + 歌手）试试` };
+
+  const pool = hits.filter((h) => h.durationSec >= 20 && h.durationSec <= deps.maxDurationSec);
+  const ranked = rankHits(pool.length ? pool : hits, raw, deps.excludeWords).slice(0, 8);
+  const orderLabel = req.order === 'click' ? '按播放量' : req.order === 'pubdate' ? '按最新' : '综合排序';
+  const lines = ranked.map((h, i) => {
+    const wan = h.play >= 10000 ? `${(h.play / 10000).toFixed(1)}万` : String(h.play);
+    return `${i + 1}. 《${h.title}》｜${human(h.durationSec)}｜${h.author}｜${wan}播放｜${h.bvid}｜${h.score}分`;
+  });
+  return {
+    ok: true,
+    message: [
+      `「${raw}」搜到 ${ranked.length} 条（${orderLabel}）。看完标题挑一条，用 pick 给序号或 BV：`,
+      ...lines,
+    ].join('\n'),
+    detail: {
+      keyword: raw,
+      order: req.order ?? 'default',
+      candidates: ranked.map((h, i) => ({
+        index: i + 1, title: h.title, bvid: h.bvid, author: h.author,
+        durationSec: h.durationSec, play: h.play, score: h.score,
+      })),
+    },
   };
 }
 
@@ -162,6 +225,8 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     pitch: Number(req.pitch ?? deps.voice.pitch),
     mode: req.mode ?? deps.voice.mode,
   };
+
+  if (req.search) return previewSearch(req, deps);
 
   const root = join(deps.data.dataDir, 'tmp', `${stamp()}-${Math.random().toString(36).slice(2, 6)}`);
   mkdirSync(root, { recursive: true });

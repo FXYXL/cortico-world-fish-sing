@@ -58,7 +58,20 @@ async function jsonGet<T>(url: string, extra: Record<string, string> = {}): Prom
   return (await res.json()) as T;
 }
 
-export async function searchBili(keyword: string, limit = 20): Promise<SearchHit[]> {
+export type SearchOrder = 'default' | 'click' | 'pubdate';
+
+/** B 站的排序参数：默认综合；找冷门女声翻唱时「按播放」往往比综合靠谱。 */
+const ORDER_PARAM: Record<SearchOrder, string> = {
+  default: 'totalrank',
+  click: 'click',
+  pubdate: 'pubdate',
+};
+
+export async function searchBili(
+  keyword: string,
+  limit = 20,
+  order: SearchOrder = 'default',
+): Promise<SearchHit[]> {
   let buvid = '';
   try {
     const spi = await jsonGet<{ data?: { b_3?: string } }>('https://api.bilibili.com/x/frontend/finger/spi');
@@ -66,7 +79,8 @@ export async function searchBili(keyword: string, limit = 20): Promise<SearchHit
   } catch {
     /* 拿不到就裸搜，风控会更凶，但不是硬失败 */
   }
-  const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&page=1&keyword=${encodeURIComponent(keyword)}`;
+  const ord = ORDER_PARAM[order] ?? ORDER_PARAM.default;
+  const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&page=1&order=${ord}&keyword=${encodeURIComponent(keyword)}`;
   const data = await jsonGet<{ code: number; message?: string; data?: { result?: unknown[] } }>(
     url,
     buvid ? { Cookie: `buvid3=${buvid}` } : {},
