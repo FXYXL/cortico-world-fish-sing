@@ -92,6 +92,8 @@ export class FishSingWorld implements World {
   private lastSong: { title: string; at: number; duration: number } | null = null;
   /** 同一时刻只允许一首在跑（GPU 只有一张卡）。 */
   private busy = false;
+  /** 本实例提交过的任务类型。stop() 用它判断要不要顺手取消。 */
+  private ownedJob: 'song' | 'dataset' | 'train' | null = null;
   /**
    * 安装/下载任务。只保留最近一个，用它给面板轮询进度。
    * 不做队列：装运行时和唱一首歌抢同一张卡，同时来两个只会互相拖死。
@@ -201,7 +203,19 @@ export class FishSingWorld implements World {
 
   async stop(): Promise<void> {
     this.player.stop();
-    await this.worker.cancel().catch(() => undefined);
+    /**
+     * 退出时**不要**发 /stop 取消任务。
+     *
+     * /stop 会杀掉 worker 里正在跑的那一个 job。Coo 退出时被调一次，于是：
+     * 重启一次 Coo = 掐掉一次训练（dfy3 就是这么断了两次，一次在第 28 轮、一次又在第 28 轮）。
+     * 唱歌任务被掐问题不大，训练是几小时的活，不能跟着一起没。
+     *
+     * 只有显式点「停止训练」才会走 trainStop → cancel()。
+     * 另外：本实例没有提交过任务时也不该取消，否则别人（另一个面板、别的 world）的活会被误伤。
+     */
+    if (this.ownedJob === 'song') {
+      await this.worker.cancel().catch(() => undefined);
+    }
     this.worker.shutdown();
     this.host = null;
   }
@@ -351,6 +365,7 @@ export class FishSingWorld implements World {
         }
         if (this.busy) return '上一首还在处理中（同一时刻只能处理一首，显卡就一张）。等她唱完再说，或者先 fish_sing_stop 停掉。';
         this.busy = true;
+        this.ownedJob = 'song';
         try {
           const r = await singSong({
             song: String(args.song ?? ''),
@@ -627,6 +642,7 @@ export class FishSingWorld implements World {
       this.datasetJob = job;
       try {
         const id = await this.worker.submit('dataset', { ...params, sources, out: dir });
+        this.ownedJob = 'dataset';
         job.id = id;
       } catch (e) {
         job.state = 'error';
@@ -744,6 +760,7 @@ export class FishSingWorld implements World {
       this.datasetJob = job;
       try {
         const id = await this.worker.submit('dataset', {
+          // 导入已有实验的切片，用来在旧模型基础上补音域
           mode: 'import',
           gtDir: info.gtDir,
           out: dir,
@@ -844,6 +861,7 @@ export class FishSingWorld implements World {
       this.trainJob = job;
       try {
         const id = await this.worker.submit('train', {
+          /* 训练是几小时的活，别让 Coo 退出把它的取消按钮也按下去 */
           exp,
           dataset: dir,
           epochs,
@@ -854,6 +872,7 @@ export class FishSingWorld implements World {
           weightMap,
         });
         job.id = id;
+        this.ownedJob = 'train';
       } catch (e) {
         job.state = 'error';
         job.error = e instanceof Error ? e.message : String(e);
