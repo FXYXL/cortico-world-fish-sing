@@ -658,9 +658,284 @@ function mountModels(ctx) {
   return { dispose() {} };
 }
 
+
+/* ------------------------------------------------------------------ 训练数据 */
+
+const TRAIN_STYLE_ID = 'fish-sing-train-style';
+const TRAIN_CSS = `
+.fs-tpath{flex:1;min-width:280px;padding:5px 8px;border-radius:6px;
+  border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12.5px}
+.fs-tsum{font-size:12.5px;line-height:1.7}
+.fs-hist{display:flex;align-items:flex-end;gap:2px;height:96px;padding:4px 0;
+  border-bottom:1px solid rgba(127,127,127,.25)}
+.fs-hist .bar{flex:1;min-width:3px;background:#5b8dd6;border-radius:2px 2px 0 0;position:relative}
+.fs-hist .bar.peak{background:#1D9E75}
+.fs-haxis{display:flex;justify-content:space-between;font-size:11px;opacity:.6;margin-top:3px}
+.fs-bandrow{display:flex;gap:6px;flex-wrap:wrap;font-size:12px}
+.fs-band{padding:3px 8px;border-radius:5px;background:rgba(127,127,127,.14)}
+.fs-file{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-ck{width:14px;height:14px;cursor:pointer}
+.fs-card2{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px;font-size:12px}
+.fs-card2 .k{opacity:.6;font-size:11px}
+.fs-card2 .v{font-size:15px;font-weight:600;margin-top:1px}
+`;
+
+function fmtSec(v) {
+  const s = Math.max(0, Math.round(Number(v) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function mountTrain(ctx) {
+  if (!document.getElementById(TRAIN_STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = TRAIN_STYLE_ID;
+    style.textContent = TRAIN_CSS;
+    document.head.append(style);
+  }
+
+  const root = ctx.root;
+  root.classList.add('fs-wrap');
+
+  const bar = el('div', 'fs-bar');
+  const pathIn = el('input', 'fs-tpath');
+  pathIn.placeholder = '粘贴素材文件夹或单个文件路径，可多个用 ; 分隔';
+  const scanBtn = el('button', 'fs-btn', '扫描');
+  bar.append(pathIn, scanBtn);
+
+  const bar2 = el('div', 'fs-bar');
+  const modeSel = el('select', 'fs-btn');
+  for (const [v, t] of [['auto', '自动切片（按乐句，2–4.5 秒）'], ['fixed', '固定长度']]) {
+    const o = el('option', '', t);
+    o.value = v;
+    modeSel.append(o);
+  }
+  const lenIn = el('input', 'fs-input');
+  lenIn.placeholder = '固定秒数（如 3.7）';
+  lenIn.style.display = 'none';
+  const startBtn = el('button', 'fs-btn', '开始处理');
+  startBtn.disabled = true;
+  const stopBtn = el('button', 'fs-btn danger', '停止');
+  stopBtn.disabled = true;
+  const revealBtn = el('button', 'fs-btn', '打开目录');
+  bar2.append(modeSel, lenIn, startBtn, stopBtn, el('span', 'fs-grow'), revealBtn);
+
+  const msg = el('div', 'fs-msg');
+  const prog = el('div', 'fs-prog');
+  const fill = el('i');
+  prog.append(fill);
+  const listBox = el('div', '');
+  const resultBox = el('div', '');
+
+  root.append(bar, bar2, prog, msg, listBox, resultBox);
+
+  let items = [];
+  let checked = new Set();
+  let timer = null;
+
+  const say = (t, bad) => {
+    msg.textContent = t || '';
+    msg.classList.toggle('bad', Boolean(bad));
+  };
+
+  const call = async (method, args) => {
+    try {
+      const res = await ctx.invoke(method, args || []);
+      if (res && typeof res.text === 'string') say(res.text);
+      return res;
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+      throw e;
+    }
+  };
+
+  const renderList = () => {
+    listBox.replaceChildren();
+    if (!items.length) return;
+    const table = el('table', 'fs-mtable');
+    const thead = el('thead');
+    const htr = el('tr');
+    const all = el('input', 'fs-ck');
+    all.type = 'checkbox';
+    all.checked = items.length > 0 && checked.size === items.length;
+    all.addEventListener('change', () => {
+      checked = all.checked ? new Set(items.map((x) => x.path)) : new Set();
+      renderList();
+    });
+    const th0 = el('th', '');
+    th0.append(all);
+    for (const h of [th0, el('th', '', '文件'), el('th', '', '时长'), el('th', '', '格式'), el('th', '', '处理方式')]) htr.append(h);
+    thead.append(htr);
+    const tbody = el('tbody');
+
+    for (const it of items) {
+      const tr = el('tr', '');
+      const td0 = el('td', '');
+      if (!it.error) {
+        const ck = el('input', 'fs-ck');
+        ck.type = 'checkbox';
+        ck.checked = checked.has(it.path);
+        ck.addEventListener('change', () => {
+          if (ck.checked) checked.add(it.path);
+          else checked.delete(it.path);
+          startBtn.disabled = checked.size === 0;
+        });
+        td0.append(ck);
+      }
+      tr.append(td0);
+      tr.append(el('td', 'fs-file', it.name));
+      tr.append(el('td', 'fs-num', it.error ? '—' : fmtSec(it.duration)));
+      tr.append(el('td', 'fs-num', it.error ? '读不出' : `${it.codec} ${it.sr}Hz`));
+      tr.append(el('td', '', it.error ? it.error.slice(0, 40) : it.dry ? '已是干声，跳过分离' : '会分离人声'));
+      tbody.append(tr);
+    }
+    table.append(thead, tbody);
+    listBox.append(table);
+    startBtn.disabled = checked.size === 0;
+  };
+
+  const renderResult = (ds) => {
+    resultBox.replaceChildren();
+    if (!ds) return;
+    const st = ds.stats;
+
+    const cards = el('div', 'fs-cards');
+    const mk = (k, v) => {
+      const c = el('div', 'fs-card2');
+      c.append(el('div', 'k', k), el('div', 'v', v));
+      return c;
+    };
+    cards.append(
+      mk('素材', `${st.sources} 首`),
+      mk('有效切片', `${st.kept} 片`),
+      mk('总时长', `${(st.seconds / 60).toFixed(1)} 分钟`),
+      mk('丢弃', `${st.dropped} 片`),
+    );
+    resultBox.append(cards);
+
+    const sum = el('div', 'fs-tsum', ds.summary);
+    resultBox.append(sum);
+
+    const hist = ds.histogram || [];
+    if (hist.length) {
+      const maxN = Math.max(...hist.map((b) => b.n), 1);
+      const box = el('div', 'fs-hist');
+      hist.forEach((b, i) => {
+        const bar = el('div', `bar${b.n === maxN ? ' peak' : ''}`);
+        bar.style.height = `${Math.max(3, (b.n / maxN) * 92)}px`;
+        bar.title = `${b.from}–${b.to} Hz：${b.n} 片`;
+        box.append(bar);
+      });
+      resultBox.append(box);
+      const axis = el('div', 'fs-haxis');
+      axis.append(el('span', '', `${hist[0].from} Hz`), el('span', '', `${hist[hist.length - 1].to} Hz`));
+      resultBox.append(axis);
+    }
+
+    const bands = el('div', 'fs-bandrow');
+    const labels = ds.bandLabels || {};
+    for (const [id, n] of Object.entries(st.byBand || {})) {
+      bands.append(el('span', 'fs-band', `${labels[id] || id}：${n} 片`));
+    }
+    resultBox.append(bands);
+
+    if (ds.preview && ds.preview.length) {
+      const pv = el('div', 'fs-list');
+      for (const p of ds.preview) {
+        const row = el('div', 'fs-row');
+        row.append(el('span', 'n', `${p.file} · ${p.source.slice(0, 18)}`));
+        row.append(el('span', 'r', `${p.dur.toFixed(1)}s · ${p.f0}Hz`));
+        pv.append(row);
+      }
+      resultBox.append(pv);
+    }
+  };
+
+  const poll = async () => {
+    let st;
+    try {
+      st = await ctx.invoke('status', []);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+      return;
+    }
+    const job = st.job;
+    if (job) {
+      const running = job.state === 'running';
+      startBtn.disabled = running || checked.size === 0;
+      stopBtn.disabled = !running;
+      fill.style.width = `${running ? job.pct : job.state === 'done' ? 100 : 0}%`;
+      if (running) say(`${job.pct}% · ${job.msg}`);
+      else if (job.state === 'done') say(`完成 · ${job.dir}`);
+      else if (job.state === 'error') say(`失败：${job.msg}`, true);
+      if (running && !timer) timer = setInterval(() => void poll(), 900);
+      if (!running && timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
+    if (st.dataset) renderResult(st.dataset);
+    return Boolean(job && job.state === 'running');
+  };
+
+  scanBtn.addEventListener('click', async () => {
+    const raw = String(pathIn.value || '').trim();
+    if (!raw) {
+      say('先填路径', true);
+      return;
+    }
+    const paths = raw.split(/[;\n]+/).map((x) => x.trim()).filter(Boolean);
+    say('扫描中…');
+    try {
+      const res = await call('scan', [paths]);
+      items = (res && res.items) || [];
+      checked = new Set(items.filter((x) => !x.error).map((x) => x.path));
+      renderList();
+      const bad = items.filter((x) => x.error).length;
+      say(`扫到 ${items.length} 个文件${bad ? `，${bad} 个读不了` : ''}`);
+    } catch {
+      items = [];
+      renderList();
+    }
+  });
+
+  modeSel.addEventListener('change', () => {
+    lenIn.style.display = modeSel.value === 'fixed' ? '' : 'none';
+  });
+
+  startBtn.addEventListener('click', async () => {
+    const picked = items.filter((x) => checked.has(x.path));
+    if (!picked.length) {
+      say('没勾选任何素材', true);
+      return;
+    }
+    const params = { sliceMode: modeSel.value };
+    if (modeSel.value === 'fixed') params.targetLen = Number(lenIn.value) || 3.7;
+    startBtn.disabled = true;
+    try {
+      await call('start', [picked, params]);
+      timer = setInterval(() => void poll(), 900);
+      await poll();
+    } catch {
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener('click', () => void call('cancel', []).then(() => poll()));
+  revealBtn.addEventListener('click', () => void call('reveal', []).catch(() => {}));
+
+  void poll();
+
+  return {
+    dispose() {
+      if (timer) clearInterval(timer);
+    },
+  };
+}
+
 export default {
   panels: {
     setup: { mount: mountSetup },
+    train: { mount: mountTrain },
     models: { mount: mountModels },
     library: { mount },
   },

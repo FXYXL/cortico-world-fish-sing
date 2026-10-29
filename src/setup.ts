@@ -345,13 +345,18 @@ export async function installRuntime(
     await run(py, ['-m', 'pip', 'install', '-r', req], (line) => report(84, line.slice(0, 120)), signal);
   }
 
-  report(90, '安装 demucs（分离人声）');
-  await run(py, ['-m', 'pip', 'install', 'demucs>=4.0.1', '-i', pipIndex], (line) => report(94, line.slice(0, 120)), signal);
+  report(89, '安装 demucs（分离人声）与 pyworld（音域分析）');
+  await run(
+    py,
+    ['-m', 'pip', 'install', 'demucs>=4.0.1', 'pyworld>=0.3.4', '-i', pipIndex],
+    (line) => report(94, line.slice(0, 120)),
+    signal,
+  );
 
   report(97, '检查依赖');
   await run(
     py,
-    ['-c', 'import torch, torchaudio, faiss, soundfile, librosa, demucs; print("ok")'],
+    ['-c', 'import torch, torchaudio, faiss, soundfile, librosa, demucs, pyworld; print("ok")'],
     (line) => report(98, line.slice(0, 120)),
     signal,
   );

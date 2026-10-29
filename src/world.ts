@@ -17,6 +17,15 @@ import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/typ
 
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
 import {
+  BAND_LABEL,
+  datasetDirName,
+  f0Histogram,
+  readManifest,
+  scanSources,
+  summarize,
+  type TrainSource,
+} from './train.ts';
+import {
   deleteModel,
   importModel,
   listModels,
@@ -77,6 +86,15 @@ export class FishSingWorld implements World {
   private setupAbort: AbortController | null = null;
   /** 当前在用的模型（存在 <dataDir>/model.json，配置里的 voice.model 只是出厂默认）。 */
   private current: CurrentModel = { model: '', index: '' };
+  /** 数据准备任务（扫描 → 分离 → 切片）。面板靠轮询它拿进度。 */
+  private datasetJob: {
+    id: string;
+    state: 'running' | 'done' | 'error';
+    pct: number;
+    msg: string;
+    dir: string;
+    error?: string;
+  } | null = null;
 
   constructor(opts: FishSingWorldOptions) {
     // 不用「参数属性」写法：Node 的类型剥离跑不了它
@@ -388,6 +406,7 @@ export class FishSingWorld implements World {
   private async panelInvoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
     if (panel === 'setup') return this.setupInvoke(method, args);
     if (panel === 'models') return this.modelInvoke(method, args);
+    if (panel === 'train') return this.trainInvoke(method, args);
     if (panel !== 'library') throw new Error(`未知面板：${panel}`);
     const a0 = String(args[0] ?? '');
     const a1 = String(args[1] ?? '');
@@ -484,6 +503,99 @@ export class FishSingWorld implements World {
   /** 路径可能因为装上运行时/下好权重而变，面板操作后重算一次。 */
   private refreshRoutes(): void {
     this.routes = resolvePaths(this.effCfg(), this.opts.dataDir);
+  }
+
+  /** 训练面板（数据准备阶段）：扫描、开始、进度、结果。 */
+  private async trainInvoke(method: string, args: unknown[]): Promise<unknown> {
+    if (method === 'scan') {
+      const paths = (args[0] as string[]) ?? [];
+      if (!paths.length) throw new Error('先填一个文件夹或文件路径');
+      const items = await scanSources(this.worker, paths);
+      return { items, root: String(paths[0] ?? '') };
+    }
+
+    if (method === 'start') {
+      if (this.datasetJob?.state === 'running') throw new Error('已经有一个数据准备任务在跑，等它结束');
+      const sources = (args[0] as TrainSource[]) ?? [];
+      const params = (args[1] as Record<string, unknown>) ?? {};
+      if (!sources.length) throw new Error('先勾选至少一首素材');
+
+      const dir = datasetDirName(this.opts.dataDir);
+      const job = { id: '', state: 'running' as const, pct: 0, msg: '排队中', dir };
+      this.datasetJob = job;
+      try {
+        const id = await this.worker.submit('dataset', { ...params, sources, out: dir });
+        job.id = id;
+      } catch (e) {
+        job.state = 'error';
+        throw e;
+      }
+      void this.worker
+        .wait(job.id, (p, m) => {
+          job.pct = Math.round(p * 100);
+          job.msg = m;
+        })
+        .then(() => {
+          job.state = 'done';
+          job.pct = 100;
+          job.msg = '完成';
+          this.host?.log.info(`[fish-sing] 数据集完成：${dir}`);
+        })
+        .catch((e: unknown) => {
+          job.state = 'error';
+          job.msg = e instanceof Error ? e.message : String(e);
+          this.host?.log.warn(`[fish-sing] 数据集中断：${job.msg}`);
+        });
+      return { text: `开始处理 ${sources.length} 首，产物在 ${dir}` };
+    }
+
+    if (method === 'status') {
+      const j = this.datasetJob;
+      const manifest = j?.dir ? readManifest(j.dir) : null;
+      return {
+        job: j,
+        dataset: manifest
+          ? {
+            dir: j?.dir ?? '',
+            stats: manifest.stats,
+            summary: summarize(manifest),
+            bands: manifest.bands,
+            bandLabels: BAND_LABEL,
+            histogram: f0Histogram(manifest.slices),
+            recent: (args[0] as string[] | undefined) ?? [],
+            preview: manifest.slices
+              .filter((x) => x.kept)
+              .slice(0, 8)
+              .map((x) => ({
+                file: x.file,
+                dur: x.dur,
+                f0: x.f0_median,
+                p90: x.f0_p90,
+                band: x.band,
+                source: x.source,
+              })),
+          }
+          : null,
+      };
+    }
+
+    if (method === 'cancel') {
+      await this.worker.cancel();
+      if (this.datasetJob?.state === 'running') {
+        this.datasetJob.state = 'error';
+        this.datasetJob.msg = '已取消';
+      }
+      return { text: '已取消' };
+    }
+
+    if (method === 'reveal') {
+      const dir = this.datasetJob?.dir;
+      if (!dir) throw new Error('还没有数据集目录');
+      spawn('explorer', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+      return { text: `已打开：${dir}` };
+    }
+
+    throw new Error(`未知方法：${method}`);
   }
 
   /** 模型面板：列表、切换、删除、从别处导入。 */
@@ -676,6 +788,12 @@ export class FishSingWorld implements World {
           id: 'setup',
           title: '安装与运行时',
           description: '装 Python 运行时、下载模型权重、看当前状态。装完就能唱歌，不用敲命令。',
+          getMethods: ['status'],
+        },
+        {
+          id: 'train',
+          title: '训练数据',
+          description: '选素材 → 分离人声 → 自适应切片 → 音域分布。这一步跑完才知道数据值不值得练。',
           getMethods: ['status'],
         },
         {

@@ -272,12 +272,12 @@ function installDeps(full) {
   }
   const req = join(rvcRoot, 'requirments_cu118_py312.txt');
   if (existsSync(req)) pip(['install', '-r', req]);
-  pip(['install', 'demucs>=4.0.1', '-i', 'https://mirrors.pku.edu.cn/pypi/simple']);
+  pip(['install', 'demucs>=4.0.1', 'pyworld>=0.3.4', '-i', 'https://mirrors.pku.edu.cn/pypi/simple']);
 }
 
 function ensureDemucs() {
   if (!existsSync(venvPy)) return;
-  const probe = spawnSync(venvPy, ['-c', 'import demucs, torch, faiss, soundfile, librosa'], { encoding: 'utf8' });
+  const probe = spawnSync(venvPy, ['-c', 'import demucs, pyworld, torch, faiss, soundfile, librosa'], { encoding: 'utf8' });
   if (probe.status === 0) {
     ok('依赖齐（torch/demucs/faiss/soundfile/librosa）');
     return;
@@ -285,7 +285,7 @@ function ensureDemucs() {
   const err = (probe.stderr || '').split('\n').filter((l) => l.includes('No module') || l.includes('Error')).slice(-1)[0] || '';
   dot(`缺依赖：${err.trim() || '未知'}`);
   // 只补 demucs —— 其余是在复制来的 venv 里本来就有；真缺就引导到 --fresh
-  const r = spawnSync(venvPy, ['-m', 'pip', 'install', 'demucs>=4.0.1', '-i', 'https://mirrors.pku.edu.cn/pypi/simple'], {
+  const r = spawnSync(venvPy, ['-m', 'pip', 'install', 'demucs>=4.0.1', 'pyworld>=0.3.4', '-i', 'https://mirrors.pku.edu.cn/pypi/simple'], {
     stdio: 'inherit',
   });
   if (r.status !== 0) no('装 demucs 失败，检查网络或改用 venv --fresh');
@@ -300,7 +300,7 @@ function verify() {
   const code = `
 import importlib, sys
 print('python', sys.version.split()[0])
-mods = ['torch','torchaudio','faiss','soundfile','librosa','numpy','demucs','einops','transformers']
+mods = ['torch','torchaudio','faiss','soundfile','librosa','numpy','demucs','pyworld','einops','transformers']
 bad = []
 for m in mods:
     try:

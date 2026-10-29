@@ -64,11 +64,13 @@ export class WorkerClient {
     this.log = log;
   }
 
-  private get base(): string {
+  /** 供外部（train.ts 等）直接调接口用。 */
+  get baseUrl(): string {
     return `http://127.0.0.1:${this.opts.port}`;
   }
 
-  private headers(): Record<string, string> {
+  /** 鉴权头；外部直接请求 worker 时也用这个，免得两处写法不一致。 */
+  authHeaders(): Record<string, string> {
     const h: Record<string, string> = { 'content-type': 'application/json' };
     if (this.opts.token) h.authorization = `Bearer ${this.opts.token}`;
     return h;
@@ -76,7 +78,7 @@ export class WorkerClient {
 
   async health(timeoutMs = 2500): Promise<WorkerHealth | null> {
     try {
-      const res = await fetch(`${this.base}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) return null;
       return (await res.json()) as WorkerHealth;
     } catch {
@@ -98,7 +100,7 @@ export class WorkerClient {
   async ensure(): Promise<void> {
     if (await this.health()) return;
     if (!this.opts.autoStart) {
-      throw new Error(`worker 没在跑（${this.base}），而「自动拉起」是关的。先手动起：${this.opts.pythonPath} worker\\server.py`);
+      throw new Error(`worker 没在跑（${this.baseUrl}），而「自动拉起」是关的。先手动起：${this.opts.pythonPath} worker\\server.py`);
     }
     if (this.starting) return this.starting;
     if (Date.now() - this.lastSpawnAt < 8000) {
@@ -165,8 +167,13 @@ export class WorkerClient {
           return;
         }
         const h = await this.health(1500);
-        if (h?.engine?.ready) {
-          this.log.info(`worker 就绪：${h.engine.model}（加载 ${h.engine.loadMs} ms）`);
+        // 只要服务在监听就算就绪：engine 可能是关预热（FISHSING_NO_WARMUP=1）的，
+        // 那种情况下模型由 run_job 在真正要唱歌时再加载。
+        if (h?.ok) {
+          const e = h.engine;
+          this.log.info(e?.ready
+            ? `worker 就绪：${e.model}（加载 ${e.loadMs} ms）`
+            : 'worker 就绪（模型未预热，第一次唱歌会多等几秒）');
           resolve();
           return;
         }
@@ -182,9 +189,9 @@ export class WorkerClient {
 
   async submit(kind: string, params: Record<string, unknown>): Promise<string> {
     await this.ensure();
-    const res = await fetch(`${this.base}/job`, {
+    const res = await fetch(`${this.baseUrl}/job`, {
       method: 'POST',
-      headers: this.headers(),
+      headers: this.authHeaders(),
       body: JSON.stringify({ kind, ...params }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -198,7 +205,7 @@ export class WorkerClient {
     const deadline = Date.now() + timeoutMs;
     let lastMsg = '';
     for (;;) {
-      const res = await fetch(`${this.base}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
+      const res = await fetch(`${this.baseUrl}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
       const body = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
       const job = body.job;
       if (!job) throw new Error(`查不到任务 ${id}`);
@@ -216,9 +223,9 @@ export class WorkerClient {
 
   async cancel(): Promise<void> {
     try {
-      await fetch(`${this.base}/stop`, {
+      await fetch(`${this.baseUrl}/stop`, {
         method: 'POST',
-        headers: this.headers(),
+        headers: this.authHeaders(),
         body: '{}',
         signal: AbortSignal.timeout(5000),
       });

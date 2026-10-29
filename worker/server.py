@@ -104,7 +104,8 @@ def worker_loop() -> None:
 
 
 def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
-    if not ENGINE.ready:
+    # 做数据集不需要唱歌模型：白加载会占用 1.5 GB 显存，还会让 demucs 更容易 OOM
+    if kind in ("song", "convert") and not ENGINE.ready:
         update(jid, message="加载模型")
         ENGINE.load()
 
@@ -138,6 +139,17 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             index_rate=float(params.get("index_rate", 0.75)),
             protect=float(params.get("protect", 0.33)),
             progress=progress, cancel=cancel,
+        )
+
+    if kind == "dataset":
+        import dataset as ds
+        out = Path(params.get("out") or (WORK_ROOT / "datasets" / jid))
+        return ds.build(
+            sources=params.get("sources") or [],
+            out_dir=out,
+            params=params,
+            progress=progress,
+            cancel=cancel,
         )
 
     raise RuntimeError(f"未知任务类型：{kind}")
@@ -216,6 +228,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self._auth_ok():
                 self._json(401, {"ok": False, "message": "令牌不对"})
                 return
+            if self.path.startswith("/scan"):
+                import dataset as ds
+                body = self._body()
+                paths = body.get("paths") or []
+                if not paths:
+                    self._json(400, {"ok": False, "message": "没给路径"})
+                    return
+                self._json(200, {"ok": True, "items": ds.scan(paths)})
+                return
             if self.path.startswith("/stop"):
                 with LOCK:
                     cancel = CURRENT["cancel"]
@@ -228,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/job"):
                 body = self._body()
                 kind = str(body.pop("kind", "song"))
-                if kind not in ("song", "convert"):
+                if kind not in ("song", "convert", "dataset"):
                     self._json(400, {"ok": False, "message": f"未知任务类型：{kind}"})
                     return
                 job = new_job(kind, body)
@@ -245,8 +266,11 @@ def main() -> None:
     t.start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log(f"fish-sing worker 监听 127.0.0.1:{PORT}（工作目录 {WORK_ROOT}）")
-    # 预热：先把模型读进来，第一个请求就不用等 8 秒
-    threading.Thread(target=lambda: ENGINE.load(), daemon=True).start()
+    # 预热：先把模型读进来，第一个请求就不用等 8 秒。
+    # FISHSING_NO_WARMUP=1 可关掉——做准备数据集这类不需要唱歌模型的任务时，
+    # 白占 1.5 GB 显存会让 demucs 更容易 OOM。
+    if os.environ.get("FISHSING_NO_WARMUP") != "1":
+        threading.Thread(target=lambda: ENGINE.load(), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
