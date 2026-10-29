@@ -185,6 +185,32 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         rank=rank,
         shuffle=True,
     )
+    # 按音域加权：由外部通过 FISHSING_SAMPLE_WEIGHTS 指定一份 {文件名: 权重} 的 json。
+    # 只影响「桶内抽谁」，不改桶、不改 batch 数——所以步数和显存占用与不加权时一致。
+    _wfile = os.environ.get("FISHSING_SAMPLE_WEIGHTS", "")
+    if _wfile and os.path.isfile(_wfile):
+        try:
+            import json as _json
+
+            with open(_wfile, "r", encoding="utf8") as _f:
+                _wmap = _json.load(_f)
+            _names = [os.path.basename(r[0]) for r in train_dataset.audiopaths_and_text]
+            _w = []
+            for _n in _names:
+                _v = _wmap.get(_n, _wmap.get(os.path.splitext(_n)[0], 1.0))
+                _w.append(float(_v))
+            train_sampler.set_weights(_w)
+            _hit = sum(1 for x in _w if abs(x - 1.0) > 1e-9)
+            _eff = ""
+            if _hit:
+                _tot = sum(_w) or 1.0
+                _hi = sum(x for x in _w if x > 1.0)
+                _eff = f"，加权档样本占权重 {_hi / _tot * 100:.0f}%"
+            # 用 print 而不是 logger：这段跑在 logger 绑定 FileHandler 之前，logger.info 会被丢掉
+            print(f"[fish-sing] 采样权重：{len(_w)} 片，其中 {_hit} 片被加权{_eff}", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[fish-sing] 采样权重加载失败，退回均匀采样：{_e}", flush=True)
+
     # It is possible that dataloader's workers are out of shared memory. Please try to raise your shared memory limit.
     # num_workers=8 -> num_workers=4
     if hps.if_f0 == 1:

@@ -496,3 +496,104 @@ export function listDatasets(dataDir: string, weights: string[], currentDir: str
   }
   return out.sort((a, b) => b.createdAt - a.createdAt);
 }
+
+// ---------------------------------------------------------------- 训练进度
+
+export interface LossPoint {
+  epoch: number;
+  mel: number;
+  gen: number;
+  disc: number;
+  fm: number;
+  kl: number;
+}
+
+export interface TrainLog {
+  /** 已完成的轮次（从日志里的「====> 轮次：N」推算，N 从 0 开始） */
+  done: number;
+  /** 每轮平均耗时（秒），只有拿到两轮以上才有 */
+  secPerEpoch: number | null;
+  losses: LossPoint[];
+  /** 最近一行 loss，面板显示当前值用 */
+  latest: LossPoint | null;
+  /** 日志里的最后一条错误（有就说明训练可能出事了） */
+  error: string;
+}
+
+/**
+ * 从 logs/<exp>/train.log 里读训练进度。
+ *
+ * 为什么读文件而不是读 stdout：RVC 的训练日志只走 FileHandler（`utils.get_logger`），
+ * stdout 里根本没有轮次信息。所以进度只能 tail 这个文件。
+ */
+export function readTrainLog(expDir: string, maxLines = 400): TrainLog {
+  const file = join(expDir, 'train.log');
+  const empty: TrainLog = { done: 0, secPerEpoch: null, losses: [], latest: null, error: '' };
+  if (!existsSync(file)) return empty;
+  let text = '';
+  try {
+    const buf = readFileSync(file);
+    // 只读尾部：3 小时的日志能到几 MB，全读进内存没必要
+    text = buf.subarray(Math.max(0, buf.length - 262144)).toString('utf8');
+  } catch {
+    return empty;
+  }
+  const lines = text.split(/\r?\n/).slice(-maxLines);
+  let done = 0;
+  const secs: number[] = [];
+  const losses: LossPoint[] = [];
+  let error = '';
+  let pending: Partial<LossPoint> = {};
+
+  for (const line of lines) {
+    const m = /====>\s*轮次：(\d+).*?\((\d+):(\d+):([\d.]+)\)/.exec(line);
+    if (m) {
+      done = Number(m[1]) + 1;
+      secs.push(Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4]));
+      continue;
+    }
+    if (line.includes('loss_disc')) {
+      const pick = (k: string) => {
+        const r = new RegExp(`${k}=([0-9.]+)`).exec(line);
+        return r ? Number(r[1]) : 0;
+      };
+      pending = {
+        epoch: done,
+        mel: pick('loss_mel'),
+        gen: pick('loss_gen'),
+        disc: pick('loss_disc'),
+        fm: pick('loss_fm'),
+        kl: pick('loss_kl'),
+      };
+      if (pending.mel) {
+        losses.push(pending as LossPoint);
+        pending = {};
+      }
+      continue;
+    }
+    if (line.includes('ERROR') || line.includes('Traceback') || line.includes('RuntimeError')) {
+      error = line.replace(/^.*?(ERROR|Traceback|RuntimeError)\s*/, '$1 ').slice(0, 200);
+    }
+  }
+
+  // 去掉第一轮（含模型加载，时间偏大），取中位数更稳
+  const steady = secs.length > 2 ? secs.slice(1) : secs;
+  const secPerEpoch = steady.length ? steady.sort((a, b) => a - b)[Math.floor(steady.length / 2)] : null;
+
+  return {
+    done,
+    secPerEpoch,
+    losses: losses.slice(-120),
+    latest: losses.length ? losses[losses.length - 1] : null,
+    error,
+  };
+}
+
+/** 训练建议参数：批大小按显存给，轮次按数据量给。 */
+export function suggestTrainParams(seconds: number): { epochs: number; batch: number; note: string } {
+  const minutes = seconds / 60;
+  if (minutes < 10) return { epochs: 300, batch: 4, note: '数据不到 10 分钟，轮次要更多才学得动' };
+  if (minutes < 20) return { epochs: 250, batch: 4, note: '数据偏少，250 轮左右' };
+  if (minutes < 45) return { epochs: 200, batch: 4, note: '33 分钟左右用 200 轮，之前 dfy2 就是这个配置' };
+  return { epochs: 160, batch: 4, note: '数据超过 45 分钟，每轮变慢，160 轮通常够了' };
+}

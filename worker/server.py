@@ -141,6 +141,17 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             progress=progress, cancel=cancel,
         )
 
+    if kind == "train":
+        import trainer
+        return trainer.train_run(
+            exp=str(params.get("exp") or "fishsing"),
+            dataset_dir=str(params.get("dataset") or ""),
+            params=params,
+            progress=progress,
+            cancel=cancel,
+            weights=params.get("weightMap") or {},
+        )
+
     if kind == "dataset":
         import dataset as ds
         out = Path(params.get("out") or (WORK_ROOT / "datasets" / jid))
@@ -258,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/job"):
                 body = self._body()
                 kind = str(body.pop("kind", "song"))
-                if kind not in ("song", "convert", "dataset"):
+                if kind not in ("song", "convert", "dataset", "train"):
                     self._json(400, {"ok": False, "message": f"未知任务类型：{kind}"})
                     return
                 job = new_job(kind, body)

@@ -16,7 +16,7 @@ import {
   rmSync,
   statSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import { MODELS_MANIFEST } from './paths.ts';
 import type { WorkerPaths } from './paths.ts';
@@ -107,15 +107,34 @@ export function inspect(paths: WorkerPaths): SetupStatus {
 export function copyRvcCode(paths: WorkerPaths, vendorRoot: string): number {
   if (!existsSync(vendorRoot)) throw new Error(`插件包里没有 vendor/rvc：${vendorRoot}`);
   mkdirSync(paths.rvcRoot, { recursive: true });
-  // 已有文件不覆盖：权重可能已经下好了，别让空目录把 .pth 冲掉
+  let copied = 0;
+  /**
+   * 代码覆盖、数据保留。
+   *
+   * 之前整个目录 `force: false`，结果是**插件升级后 runtime 里的 RVC 代码永不更新**——
+   * 改了 train/data_utils 也传不到已装环境，训练还在跑旧逻辑。
+   * 现在只保护 assets/（权重）和 logs/（索引、实验记录），其余（.py/.json）每次都覆盖。
+   */
   cpSync(vendorRoot, paths.rvcRoot, {
     recursive: true,
-    force: false,
+    force: true,
     errorOnExist: false,
-    filter: (p: string) => !p.includes('__pycache__'),
+    filter: (src: string) => {
+      if (src.includes('__pycache__')) return false;
+      const rel = relative(vendorRoot, src).replace(/\\/g, '/');
+      if (!rel) return true; // 根目录本身
+      if (rel.startsWith('assets/') || rel.startsWith('logs/')) {
+        // 目录要进（里面的子项各自判断），已存在的文件跳过
+        const dst = join(paths.rvcRoot, rel);
+        if (existsSync(dst) && statSync(dst).isDirectory()) return true;
+        if (existsSync(dst)) return false;
+      }
+      copied += 1;
+      return true;
+    },
   });
   for (const f of loadManifest().files) mkdirSync(dirname(join(paths.rvcRoot, f.target)), { recursive: true });
-  return 1;
+  return copied;
 }
 
 /** 下载一个文件，带进度；中途可用 signal 取消。 */

@@ -690,6 +690,13 @@ const TRAIN_CSS = `
 .fs-wshift.same{opacity:.55}
 .fs-wrange{width:100%;accent-color:#378ADD}
 .fs-wtimes{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.fs-tform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.fs-field{display:flex;flex-direction:column;gap:3px}
+.fs-flabel{font-size:11px;opacity:.6}
+.fs-tin{padding:4px 7px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
+  background:transparent;color:inherit;font-size:12.5px;width:110px}
+.fs-loss{display:flex;align-items:flex-end;gap:1px;height:60px;padding-top:6px}
+.fs-lbar{flex:1;min-width:2px;background:#5b8dd6;border-radius:1px 1px 0 0;opacity:.85}
 .fs-card2 .k{opacity:.6;font-size:11px}
 .fs-card2 .v{font-size:15px;font-weight:600;margin-top:1px}
 `;
@@ -766,7 +773,8 @@ function mountTrain(ctx) {
   const resultBox = el('div', '');
   const weightBox = el('div', '');
 
-  root.append(bar, dsBar, importBar, bar2, prog, msg, listBox, resultBox, weightBox);
+  const trainBox = el('div', '');
+  root.append(bar, dsBar, importBar, bar2, prog, msg, listBox, resultBox, weightBox, trainBox);
 
   let items = [];
   let checked = new Set();
@@ -1029,7 +1037,10 @@ function mountTrain(ctx) {
         clearInterval(timer);
         timer = null;
       }
-      if (wasRunning && !running) void loadDatasets(true);
+      if (wasRunning && !running) {
+        void loadDatasets(true);
+        void pollTrain();
+      }
       wasRunning = running;
     }
     if (st.dataset) {
@@ -1135,6 +1146,210 @@ function mountTrain(ctx) {
     }
   });
 
+  /* ---------------- 训练 ---------------- */
+  const tForm = el('div', 'fs-tform');
+  const expIn = el('input', 'fs-tin');
+  expIn.placeholder = '实验名（英文，如 fish1029）';
+  const epIn = el('input', 'fs-tin');
+  epIn.type = 'number';
+  epIn.min = '10';
+  epIn.max = '600';
+  epIn.value = '200';
+  const bsSel = el('select', 'fs-tin');
+  for (const v of [2, 4, 6, 8]) {
+    const o = el('option', '', `batch ${v}`);
+    o.value = String(v);
+    o.selected = v === 4;
+    bsSel.append(o);
+  }
+  const seIn = el('input', 'fs-tin');
+  seIn.type = 'number';
+  seIn.min = '1';
+  seIn.max = '100';
+  seIn.value = '10';
+  const resumeChk = el('input', 'fs-ck');
+  resumeChk.type = 'checkbox';
+  const rebuildChk = el('input', 'fs-ck');
+  rebuildChk.type = 'checkbox';
+  const startT = el('button', 'fs-btn', '开始训练');
+  const stopT = el('button', 'fs-btn danger', '停止训练');
+  stopT.disabled = true;
+
+  const mkField = (label, node, tip) => {
+    const wrap = el('label', 'fs-field');
+    wrap.append(el('span', 'fs-flabel', label), node);
+    if (tip) wrap.title = tip;
+    return wrap;
+  };
+
+  tForm.append(
+    mkField('实验名', expIn, '产物会落在 logs/<实验名>，同名会复用目录'),
+    mkField('轮次', epIn, '200 轮 / 33 分钟数据约 3 小时'),
+    mkField('批大小', bsSel, '8G 显存用 4，爆显存就降到 2'),
+    mkField('每 N 轮存档', seIn, '每 N 轮导出一个小模型到「模型」页'),
+  );
+  const chkRow = el('div', 'fs-bar');
+  const resumeLbl = el('label', 'fs-meta', '从上次存档继续');
+  resumeLbl.prepend(resumeChk);
+  const rebuildLbl = el('label', 'fs-meta', '重算特征');
+  rebuildLbl.prepend(rebuildChk);
+  rebuildLbl.title = '数据集换过、或上次特征提取失败时勾上';
+  chkRow.append(resumeLbl, rebuildLbl, el('span', 'fs-grow'), startT, stopT);
+
+  const tProg = el('div', 'fs-prog');
+  const tFill = el('i');
+  tProg.append(tFill);
+  const tMsg = el('div', 'fs-msg');
+  const losses = el('div', 'fs-loss');
+  const lossAxis = el('div', 'fs-haxis');
+  const tModels = el('div', 'fs-list');
+
+  const tTitle = el('div', 'fs-wtitle', '训练');
+  trainBox.append(tTitle, tForm, chkRow, tProg, tMsg, losses, lossAxis, tModels);
+
+  let trainExp = '';
+  let trainTimer = null;
+
+  const fmtDur = (sec) => {
+    const s0 = Math.max(0, Math.round(Number(sec) || 0));
+    const h = Math.floor(s0 / 3600);
+    const m = Math.floor((s0 % 3600) / 60);
+    if (h) return `${h} 小时 ${m} 分`;
+    if (m) return `${m} 分 ${s0 % 60} 秒`;
+    return `${s0} 秒`;
+  };
+
+  const paintLoss = (log) => {
+    losses.replaceChildren();
+    lossAxis.replaceChildren();
+    const pts = (log && log.losses) || [];
+    if (!pts.length) return;
+    const mel = pts.map((p) => p.mel).filter((v) => v > 0);
+    const hi = Math.max(...mel);
+    const lo = Math.min(...mel);
+    const span = Math.max(0.001, hi - lo);
+    for (const p of pts) {
+      const bar = el('div', 'fs-lbar');
+      // mel 越小越好，所以越低的柱子画得越高，视觉上「往下走 = 在进步」
+      const h = 4 + 52 * (1 - (p.mel - lo) / span);
+      bar.style.height = `${Math.round(h)}px`;
+      bar.title = `第 ${p.epoch} 轮 · mel ${p.mel}`;
+      losses.append(bar);
+    }
+    lossAxis.append(
+      el('span', '', `mel ${hi.toFixed(1)} → ${mel[mel.length - 1].toFixed(1)}`),
+      el('span', '', `${pts.length} 个记录点`),
+    );
+  };
+
+  const paintTrain = (st) => {
+    const job = st.job;
+    const running = job && job.state === 'running';
+    const log = st.log || { done: 0, losses: [], latest: null, secPerEpoch: null, error: '' };
+    const total = st.total || 0;
+
+    startT.disabled = running || st.datasetBusy;
+    stopT.disabled = !running;
+    tFill.style.width = `${running ? job.pct : job && job.state === 'done' ? 100 : 0}%`;
+
+    if (job) {
+      trainExp = job.exp || trainExp;
+      if (!expIn.value) expIn.value = job.exp || '';
+    }
+
+    if (running) {
+      const eta = st.etaSec ? ` · 预计还要 ${fmtDur(st.etaSec)}` : '';
+      const per = log.secPerEpoch ? ` · ${log.secPerEpoch.toFixed(0)} 秒/轮` : '';
+      tMsg.textContent = `${job.pct}% · ${job.msg}（${Math.min(log.done, total || job.epochs)}/${total || job.epochs} 轮${per}${eta}）`;
+      tMsg.classList.remove('bad');
+    } else if (job && job.state === 'done') {
+      tMsg.textContent = `训练完成：${job.exp}，共 ${log.done} 轮。去「模型」页挑一档试听（不会自动切换）。`;
+      tMsg.classList.remove('bad');
+    } else if (job && job.state === 'error') {
+      tMsg.textContent = `训练中断：${job.error || job.msg}`;
+      tMsg.classList.add('bad');
+    } else if (log.done) {
+      tMsg.textContent = `logs/${st.exp} 里已有 ${log.done} 轮记录`;
+      tMsg.classList.remove('bad');
+    }
+
+    if (log.error && running) {
+      tMsg.textContent += ` · 日志里有报错：${log.error}`;
+      tMsg.classList.add('bad');
+    }
+
+    paintLoss(log);
+
+    tModels.replaceChildren();
+    const ms = st.models || [];
+    for (const m of ms.slice(-8)) {
+      const row = el('div', 'fs-row');
+      row.append(el('span', 'n', `${m.name}${m.current ? '（使用中）' : ''}`));
+      row.append(el('span', 'r', `${m.epoch !== null ? 'e' + m.epoch : '最终'} · ${m.sizeMb} MB`));
+      tModels.append(row);
+    }
+    if (!ms.length && st.exp) {
+      tModels.append(el('div', 'fs-meta', `logs/${st.exp} 还没有产出模型`));
+    }
+
+    if (running && !trainTimer) trainTimer = setInterval(() => void pollTrain(), 3000);
+    if (!running && trainTimer) {
+      clearInterval(trainTimer);
+      trainTimer = null;
+    }
+  };
+
+  const pollTrain = async () => {
+    try {
+      const st = await ctx.invoke('trainStatus', [trainExp]);
+      if (st.exp) trainExp = st.exp;
+      paintTrain(st);
+      if (st.job && st.job.state !== 'running' && trainTimer) {
+        clearInterval(trainTimer);
+        trainTimer = null;
+        await loadDatasets(true);
+      }
+    } catch (e) {
+      tMsg.textContent = (e && e.message) || String(e);
+      tMsg.classList.add('bad');
+    }
+  };
+
+  startT.addEventListener('click', async () => {
+    if (!lastDir) {
+      say('先选一个数据集', true);
+      return;
+    }
+    startT.disabled = true;
+    try {
+      const r = await call('trainStart', [{
+        exp: String(expIn.value || '').trim(),
+        epochs: Number(epIn.value) || 200,
+        batch: Number(bsSel.value) || 4,
+        saveEvery: Number(seIn.value) || 10,
+        resume: resumeChk.checked,
+        rebuild: rebuildChk.checked,
+      }]);
+      if (r && r.exp) {
+        trainExp = r.exp;
+        expIn.value = r.exp;
+      }
+      await pollTrain();
+    } catch {
+      startT.disabled = false;
+    }
+  });
+
+  stopT.addEventListener('click', async () => {
+    stopT.disabled = true;
+    try {
+      await call('trainStop', []);
+    } catch {
+      /* 已显示 */
+    }
+    await pollTrain();
+  });
+
   let exps = [];
 
   const loadExperiments = async () => {
@@ -1231,6 +1446,7 @@ function mountTrain(ctx) {
   void poll();
   void loadDatasets();
   void loadExperiments();
+  void pollTrain();
 
   return {
     dispose() {

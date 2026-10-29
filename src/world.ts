@@ -24,13 +24,16 @@ import {
   listExperiments,
   readDatasetState,
   readManifest,
+  readTrainLog,
   readWeights,
   saveWeights,
+  suggestTrainParams,
   scanSources,
   summarize,
   WEIGHT_PRESETS,
   writeDatasetState,
   weightedRows,
+  sliceWeights,
   type TrainSource,
   type WeightConfig,
 } from './train.ts';
@@ -68,6 +71,13 @@ export interface FishSingWorldOptions {
   secret: (name: string) => string | undefined;
 }
 
+/** 实验名默认后缀：fish261029（年月日）。RVC 的实验名会直接变成 logs/<exp> 目录。 */
+function stamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${String(d.getFullYear()).slice(2)}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+}
+
 export class FishSingWorld implements World {
   readonly id = FISHSING_ID;
   private host: WorldHost | null = null;
@@ -95,6 +105,20 @@ export class FishSingWorld implements World {
   private setupAbort: AbortController | null = null;
   /** 当前在用的模型（存在 <dataDir>/model.json，配置里的 voice.model 只是出厂默认）。 */
   private current: CurrentModel = { model: '', index: '' };
+  /**
+   * 训练任务。和 datasetJob 分开：训练要跑几小时，中途还可能去看数据集/模型页，
+   * 混在一个字段里会被互相覆盖。
+   */
+  private trainJob: {
+    id: string;
+    state: 'running' | 'done' | 'error';
+    pct: number;
+    msg: string;
+    exp: string;
+    epochs: number;
+    startedAt: number;
+    error?: string;
+  } | null = null;
   /** 数据准备任务（扫描 → 分离 → 切片）。面板靠轮询它拿进度。 */
   private datasetJob: {
     id: string;
@@ -147,6 +171,16 @@ export class FishSingWorld implements World {
     this.host = host;
     host.log.info(`fish-sing 就绪：模型 ${this.opts.cfg.voice?.model ?? '?'}，本机播放${this.opts.cfg.play?.enabled === false ? '关' : '开'}`);
     if (this.opts.cfg.enabled === false) return;
+    // 自托管时每次启动刷新一遍 RVC 代码（约 3 MB）。
+    // 不这么做的话，插件升级后 runtime/ 里还是旧代码——改了训练逻辑也传不下去。
+    // 权重和 logs 不受影响（copyRvcCode 只覆盖代码文件）。
+    if (this.routes.selfHosted && existsSync(this.routes.rvcRoot)) {
+      try {
+        copyRvcCode(this.routes, VENDORED_RVC);
+      } catch (e) {
+        host.log.warn(`刷新 RVC 代码失败（不影响唱歌，但训练可能用旧代码）：${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     // 顺手把 worker 拉起来：省掉第一次请求的模型加载（约 6 秒）
     if (this.opts.cfg.worker?.autoStart !== false) {
       void this.worker.ensure().catch((e: unknown) => {
@@ -309,6 +343,9 @@ export class FishSingWorld implements World {
       },
       handler: async (args) => {
         if (cfg.enabled === false) return '唱歌功能被关掉了。';
+        if (this.trainJob?.state === 'running') {
+          return '正在训练模型（显存被占着），这会儿唱不了。训练完再唱，或者在控制台「训练」页停掉训练。';
+        }
         if (this.busy) return '上一首还在处理中（同一时刻只能处理一首，显卡就一张）。等她唱完再说，或者先 fish_sing_stop 停掉。';
         this.busy = true;
         try {
@@ -542,6 +579,27 @@ export class FishSingWorld implements World {
     return items.sort((a, b) => b.slices - a.slices);
   }
 
+  /**
+   * 实验目录（logs/<exp>）。
+   *
+   * 自托管后 rvcRoot 是 runtime/rvc，里面只有最近训练过的实验；历史实验（dfy2 等）
+   * 的日志和存档都在老项目里。所以两个根都找，先看自托管。
+   */
+  private expDirFor(exp: string): string {
+    if (!exp) return '';
+    const roots = [this.routes.rvcRoot, ...LEGACY_RVC_ROOTS.filter((p) => existsSync(p))];
+    // 优先挑**有 train.log** 的那个：runtime 里也可能存在 logs/dfy2（只放了下载来的索引），
+    // 那个目录是空的，拿它当实验目录会显示 0 轮。
+    let fallback = '';
+    for (const root of roots) {
+      const dir = join(root, 'logs', exp);
+      if (!existsSync(dir)) continue;
+      if (existsSync(join(dir, 'train.log'))) return dir;
+      if (!fallback) fallback = dir;
+    }
+    return fallback || join(this.routes.rvcRoot, 'logs', exp);
+  }
+
   /** 训练面板（数据准备阶段）：扫描、开始、进度、结果。 */
   private async trainInvoke(method: string, args: unknown[]): Promise<unknown> {
     if (method === 'scan') {
@@ -729,11 +787,126 @@ export class FishSingWorld implements World {
       };
     }
 
+    if (method === 'trainStart') {
+      const cfg = (args[0] ?? {}) as {
+        exp?: string;
+        epochs?: number;
+        batch?: number;
+        saveEvery?: number;
+        resume?: boolean;
+        rebuild?: boolean;
+      };
+      const dir = this.datasetJob?.dir;
+      const m = dir ? readManifest(dir) : null;
+      if (!dir || !m) throw new Error('先在上面选一个数据集');
+      if (this.trainJob?.state === 'running') throw new Error('已经在训练了');
+      if (this.datasetJob?.state === 'running') throw new Error('数据准备还没跑完，等它结束');
+      if (!existsSync(this.routes.pythonPath)) {
+        throw new Error('运行时没装好：去「安装与运行时」页点「安装 GPU 运行时」');
+      }
+
+      const epochs = Math.max(10, Math.min(600, Number(cfg.epochs) || 200));
+      const batch = Math.max(1, Math.min(16, Number(cfg.batch) || 4));
+      const saveEvery = Math.max(1, Math.min(100, Number(cfg.saveEvery) || 10));
+      const exp = String(cfg.exp ?? '').trim().replace(/[^\w.-]/g, '') || `fish${stamp()}`;
+
+      // 逐片权重：按权重口径算好，键用文件 basename（实验目录里的切片同名）
+      const weightCfg = readWeights(dir);
+      const weightMap: Record<string, number> = {};
+      for (const it of sliceWeights(m, weightCfg)) weightMap[basename(it.file)] = it.weight;
+      const weighted = Object.values(weightMap).filter((v) => Math.abs(v - 1) > 1e-9).length;
+
+      const job = {
+        id: '', state: 'running' as const, pct: 0, msg: '排队中',
+        exp, epochs, startedAt: Date.now(),
+      };
+      this.trainJob = job;
+      try {
+        const id = await this.worker.submit('train', {
+          exp,
+          dataset: dir,
+          epochs,
+          batch,
+          saveEvery,
+          resume: cfg.resume === true,
+          rebuild: cfg.rebuild === true,
+          weightMap,
+        });
+        job.id = id;
+      } catch (e) {
+        job.state = 'error';
+        job.error = e instanceof Error ? e.message : String(e);
+        throw e;
+      }
+      void this.worker
+        .wait(job.id, (p, msg) => {
+          job.pct = Math.round(p * 100);
+          job.msg = msg;
+        })
+        .then(() => {
+          job.state = 'done';
+          job.pct = 100;
+          job.msg = '完成';
+          this.host?.log.info(`[fish-sing] 训练完成：${exp}`);
+        })
+        .catch((e: unknown) => {
+          job.state = 'error';
+          job.error = e instanceof Error ? e.message : String(e);
+          job.msg = job.error;
+          this.host?.log.warn(`[fish-sing] 训练中断：${job.error}`);
+        });
+      return {
+        text: `开始训练「${exp}」：${epochs} 轮 / batch ${batch} / ${m.stats.kept} 片${
+          weighted ? ` / 其中 ${weighted} 片带音域加权` : '（均匀采样）'}`,
+        exp,
+      };
+    }
+
+    if (method === 'trainStatus') {
+      const exp = String(args[0] ?? '') || this.trainJob?.exp || '';
+      const expDir = this.expDirFor(exp);
+      const lg = expDir ? readTrainLog(expDir) : null;
+      const models = exp
+        ? listModels(this.routes, this.current.model).filter((x) => x.exp === exp)
+        : [];
+      const total = this.trainJob?.exp === exp ? this.trainJob.epochs : 0;
+      const etaSec = lg && lg.secPerEpoch && total
+        ? Math.max(0, Math.round(lg.secPerEpoch * Math.max(0, total - lg.done)))
+        : null;
+      return {
+        job: this.trainJob,
+        exp,
+        expDir,
+        total,
+        log: lg,
+        etaSec,
+        models: models.map((x) => ({ name: x.name, epoch: x.epoch, sizeMb: x.sizeMb, current: x.current })),
+        datasetBusy: this.datasetJob?.state === 'running',
+        weights: exp && expDir ? readWeights(this.datasetJob?.dir ?? '') : null,
+      };
+    }
+
+    if (method === 'trainStop') {
+      await this.worker.cancel();
+      if (this.trainJob?.state === 'running') {
+        // 立刻落状态：子进程可能还在收尾，面板会一直显示"训练中"，用户以为没停
+        this.trainJob.state = 'error';
+        this.trainJob.error = '已手动停止';
+        this.trainJob.msg = '已手动停止';
+      }
+      return { text: '已停止训练。最近的存档还在 logs 里，可以勾「从上次存档继续」接着练。' };
+    }
+
     if (method === 'cancel') {
       await this.worker.cancel();
       if (this.datasetJob?.state === 'running') {
         this.datasetJob.state = 'error';
         this.datasetJob.msg = '已取消';
+      }
+      if (this.trainJob?.state === 'running') {
+        this.trainJob.state = 'error';
+        this.trainJob.error = '已取消';
+        this.trainJob.msg = '已取消';
       }
       return { text: '已取消' };
     }

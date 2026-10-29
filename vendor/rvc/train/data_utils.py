@@ -423,10 +423,25 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         self.lengths = dataset.lengths
         self.batch_size = batch_size
         self.boundaries = boundaries
+        # 逐样本采样权重（可选）。None = 原本的均匀随机。
+        # 这是「按音域加权」的落点：只改桶内抽谁，不改桶、不改 batch 数，
+        # 所以每个 epoch 的步数和显存占用与不加权时完全一致。
+        self.sample_weights = None
 
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         self.total_size = sum(self.num_samples_per_bucket)
         self.num_samples = self.total_size // self.num_replicas
+
+    def set_weights(self, weights):
+        """设置逐样本采样权重（长度必须等于 len(self.lengths)）。"""
+        import torch as _torch
+
+        w = _torch.as_tensor(list(weights), dtype=_torch.float64)
+        if w.numel() != len(self.lengths):
+            raise ValueError(f"权重数量 {w.numel()} 与样本数 {len(self.lengths)} 不一致")
+        w = w.clamp_min(1e-6)
+        # 全 1 时退回原路径，保证「不加权」和官方行为逐位一致
+        self.sample_weights = None if bool((w - 1.0).abs().max() < 1e-9) else w
 
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
@@ -471,14 +486,21 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
 
-            # add extra samples to make it evenly divisible
-            rem = num_samples_bucket - len_bucket
-            ids_bucket = (
-                ids_bucket
-                + ids_bucket * (rem // len_bucket)
-                + ids_bucket[: (rem % len_bucket)]
-            )
-
+            if self.sample_weights is not None:
+                # 有权重时按权重**有放回**抽 num_samples_bucket 个桶内下标。
+                # 数量与原来相同 → 步数不变；只在桶内抽 → padding 效率不受影响。
+                w = self.sample_weights[bucket]
+                ids_bucket = torch.multinomial(
+                    w, num_samples_bucket, replacement=True, generator=g
+                ).tolist()
+            else:
+                # add extra samples to make it evenly divisible
+                rem = num_samples_bucket - len_bucket
+                ids_bucket = (
+                    ids_bucket
+                    + ids_bucket * (rem // len_bucket)
+                    + ids_bucket[: (rem % len_bucket)]
+                )
             # subsample
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
