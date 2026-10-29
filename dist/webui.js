@@ -716,6 +716,17 @@ function mountTrain(ctx) {
   const scanBtn = el('button', 'fs-btn', '扫描');
   bar.append(pathIn, scanBtn);
 
+  const dsBar = el('div', 'fs-bar');
+  const dsSel = el('select', 'fs-btn');
+  dsSel.title = '已切好片的数据集。切完没训练的数据集会一直占磁盘，可以在这里删。';
+  dsSel.style.maxWidth = '520px';
+  const dsMeta = el('span', 'fs-meta', '');
+  const dsDel = el('button', 'fs-btn danger', '删除数据集');
+  dsDel.disabled = true;
+  const dsReveal = el('button', 'fs-btn', '打开目录');
+  dsReveal.disabled = true;
+  dsBar.append(el('span', 'fs-meta', '数据集：'), dsSel, dsMeta, el('span', 'fs-grow'), dsDel, dsReveal);
+
   const importBar = el('div', 'fs-bar');
   const expSel = el('select', 'fs-btn');
   expSel.title = '本机已有的训练实验（logs/<实验>/0_gt_wavs 里还留着切片的）';
@@ -755,7 +766,7 @@ function mountTrain(ctx) {
   const resultBox = el('div', '');
   const weightBox = el('div', '');
 
-  root.append(bar, importBar, bar2, prog, msg, listBox, resultBox, weightBox);
+  root.append(bar, dsBar, importBar, bar2, prog, msg, listBox, resultBox, weightBox);
 
   let items = [];
   let checked = new Set();
@@ -1018,6 +1029,8 @@ function mountTrain(ctx) {
         clearInterval(timer);
         timer = null;
       }
+      if (wasRunning && !running) void loadDatasets(true);
+      wasRunning = running;
     }
     if (st.dataset) {
       lastDir = st.dataset.dir || '';
@@ -1033,6 +1046,94 @@ function mountTrain(ctx) {
     }
     return Boolean(job && job.state === 'running');
   };
+
+  let datasets = [];
+  let pendingDel = '';
+  let wasRunning = false;
+
+  const loadDatasets = async (keepSelection) => {
+    try {
+      const r = await ctx.invoke('datasets', []);
+      datasets = (r && r.items) || [];
+      const cur = (r && r.current) || '';
+      dsSel.replaceChildren();
+      if (!datasets.length) {
+        const o = el('option', '', '（还没有数据集）');
+        o.value = '';
+        dsSel.append(o);
+        dsDel.disabled = true;
+        dsReveal.disabled = true;
+        dsMeta.textContent = '';
+        return;
+      }
+      for (const d of datasets) {
+        const tag = d.imported ? `导入·${d.fromExp}` : '自建';
+        const o = el('option', '', `${d.name} · ${d.slices}片 · ${(d.seconds / 60).toFixed(1)}分 · ${d.sizeMb}MB · ${tag}`);
+        o.value = d.dir;
+        if (d.dir === cur) o.selected = true;
+        dsSel.append(o);
+      }
+      if (!keepSelection && cur) dsSel.value = cur;
+      const hit = datasets.find((d) => d.dir === (dsSel.value || cur)) || datasets[0];
+      dsMeta.textContent = hit && hit.models.length ? `已训出 ${hit.models.join(',')}` : '';
+      dsDel.disabled = false;
+      dsReveal.disabled = false;
+    } catch (e) {
+      dsMeta.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  dsSel.addEventListener('change', async () => {
+    const dir = String(dsSel.value || '');
+    if (!dir) return;
+    try {
+      await call('select', [dir]);
+      pendingDel = '';
+      dsDel.textContent = '删除数据集';
+      await poll();
+      await loadDatasets(true);
+    } catch {
+      /* 已显示错误 */
+    }
+  });
+
+  dsDel.addEventListener('click', async () => {
+    const dir = String(dsSel.value || '');
+    const hit = datasets.find((d) => d.dir === dir);
+    if (!hit) return;
+    if (pendingDel !== dir) {
+      pendingDel = dir;
+      dsDel.textContent = hit.models.length
+        ? `确认删除？（已训出 ${hit.models.join(',')}，数据删了模型还在）`
+        : `确认删除？${hit.sizeMb} MB`;
+      setTimeout(() => {
+        if (pendingDel === dir) {
+          pendingDel = '';
+          dsDel.textContent = '删除数据集';
+        }
+      }, 5000);
+      return;
+    }
+    pendingDel = '';
+    dsDel.textContent = '删除数据集';
+    try {
+      await call('deleteDataset', [dir]);
+      await loadDatasets();
+      await poll();
+    } catch {
+      /* 已显示错误 */
+    }
+  });
+
+  dsReveal.addEventListener('click', async () => {
+    const dir = String(dsSel.value || '');
+    if (!dir) return;
+    try {
+      await call('reveal', [dir]);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+  });
 
   let exps = [];
 
@@ -1128,6 +1229,7 @@ function mountTrain(ctx) {
   revealBtn.addEventListener('click', () => void call('reveal', []).catch(() => {}));
 
   void poll();
+  void loadDatasets();
   void loadExperiments();
 
   return {

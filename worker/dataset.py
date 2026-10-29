@@ -303,8 +303,15 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
         if need_sep:
             try:
                 from separate import separate_file
-                vpath, _ipath, _sr = separate_file(str(src_path), str(sep_dir), device="auto", quiet=True)
+                vpath, ipath, _sr = separate_file(str(src_path), str(sep_dir), device="auto", quiet=True)
                 vocal_wav = Path(vpath)
+                # 伴奏要它没用（训练只用干声），但一首歌 40 MB，十几首就是 500 MB。
+                # 干声留着：换切片参数时可以不用重新分离。
+                if not params.get("keepInst", False):
+                    try:
+                        os.remove(ipath)
+                    except OSError:
+                        pass
                 log(f"分离完成：{label} → {vpath}")
             except Exception as e:  # noqa: BLE001
                 # 不退回原文件：混音里伴奏会被当成"人声"切进去，训出来的模型会把钢琴当元音。

@@ -4,7 +4,7 @@
  * 所有音频处理都在 Python worker 里做（dataset.py），这里只负责把结果整理成
  * 面板能直接画的结构——统计、分档、直方图分桶。
  */
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import type { WorkerClient } from './worker.ts';
@@ -393,4 +393,106 @@ function findIndexIn(logs: string, exp: string): string | null {
   if (!existsSync(dir)) return null;
   const idx = readdirSync(dir).filter((f) => f.endsWith('.index'));
   return idx.length ? join('logs', exp, idx[0]) : null;
+}
+
+// ---------------------------------------------------------------- 数据集管理
+
+export interface DatasetInfo {
+  dir: string;
+  name: string;
+  slices: number;
+  seconds: number;
+  sources: number;
+  /** 是从已有实验导入的，还是自己分离切出来的 */
+  imported: boolean;
+  /** 导入自哪个实验（imported 时才有） */
+  fromExp: string;
+  /** 关联的模型文件（说明这份数据已经训出模型了，删之前要想想） */
+  models: string[];
+  sizeMb: number;
+  createdAt: number;
+  current: boolean;
+}
+
+const DATASET_STATE = 'dataset.json';
+
+export function readDatasetState(dataDir: string): string {
+  const f = join(dataDir, DATASET_STATE);
+  if (!existsSync(f)) return '';
+  try {
+    return String((JSON.parse(readFileSync(f, 'utf8')) as { dir?: string }).dir ?? '');
+  } catch {
+    return '';
+  }
+}
+
+export function writeDatasetState(dataDir: string, dir: string): void {
+  writeFileSync(join(dataDir, DATASET_STATE), `${JSON.stringify({ dir }, null, 2)}\n`, 'utf8');
+}
+
+function dirSizeMb(dir: string): number {
+  let total = 0;
+  const walk = (d: string) => {
+    let entries;
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else {
+        try {
+          total += statSync(p).size;
+        } catch {
+          /* 被占用的文件跳过 */
+        }
+      }
+    }
+  };
+  walk(dir);
+  return Math.round((total / 1048576) * 10) / 10;
+}
+
+/** 从 manifest 里的 importFrom 反推实验名：...\logs\dfy2\0_gt_wavs → dfy2 */
+function expFromGtDir(p: string): string {
+  const m = String(p ?? '').match(/logs[\\/]([^\\/]+)[\\/]0_gt_wavs/i);
+  return m ? m[1] : '';
+}
+
+/**
+ * 列出所有数据集（扫 datasets/*\/manifest.json）。
+ *
+ * 为什么要单独列：当前数据集只存在内存里，重启 Coo 就看不到了；
+ * 而且切完片没训练的数据集会一直占着磁盘（几百 MB 一份），得能删。
+ */
+export function listDatasets(dataDir: string, weights: string[], currentDir: string): DatasetInfo[] {
+  const root = join(dataDir, 'datasets');
+  if (!existsSync(root)) return [];
+  const out: DatasetInfo[] = [];
+  for (const e of readdirSync(root, { withFileTypes: true })) {
+    if (!e.isDirectory()) continue;
+    const dir = join(root, e.name);
+    const m = readManifest(dir);
+    if (!m) continue;
+    const fromExp = expFromGtDir(String(m.params?.importFrom ?? ''));
+    const models = fromExp
+      ? weights.filter((w) => w.replace(/\.pth$/i, '').replace(/_e\d+(_s\d+)?$/, '') === fromExp)
+      : [];
+    out.push({
+      dir,
+      name: e.name,
+      slices: m.stats.kept,
+      seconds: m.stats.seconds,
+      sources: m.stats.sources,
+      imported: Boolean(m.params?.importFrom),
+      fromExp,
+      models,
+      sizeMb: dirSizeMb(dir),
+      createdAt: m.createdAt,
+      current: dir === currentDir,
+    });
+  }
+  return out.sort((a, b) => b.createdAt - a.createdAt);
 }

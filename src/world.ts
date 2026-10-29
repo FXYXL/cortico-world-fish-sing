@@ -8,8 +8,8 @@
  *  · 重活全在 Python worker 里（模型常驻、55 秒切片），TS 侧只做编排和投递。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { Language } from 'cortico/core/language.ts';
@@ -20,13 +20,16 @@ import {
   BAND_LABEL,
   datasetDirName,
   f0Histogram,
+  listDatasets,
   listExperiments,
+  readDatasetState,
   readManifest,
   readWeights,
   saveWeights,
   scanSources,
   summarize,
   WEIGHT_PRESETS,
+  writeDatasetState,
   weightedRows,
   type TrainSource,
   type WeightConfig,
@@ -111,6 +114,11 @@ export class FishSingWorld implements World {
       index: String(cfg.voice?.index ?? ''),
     });
     this.routes = resolvePaths(this.effCfg(), opts.dataDir);
+    // 恢复上次选中的数据集：只存在内存里的话，重启 Coo 就看不到自己切好的数据了
+    const saved = readDatasetState(opts.dataDir);
+    if (saved && existsSync(join(saved, 'manifest.json'))) {
+      this.datasetJob = { id: '', state: 'done', pct: 100, msg: '上次选中的数据集', dir: saved };
+    }
     this.worker = new WorkerClient(
       {
         rvcRoot: this.routes.rvcRoot,
@@ -553,6 +561,7 @@ export class FishSingWorld implements World {
       // 追加到当前数据集（在同一模型的基础上补音域），否则新建
       const dir = opts.dir || datasetDirName(this.opts.dataDir);
       if (opts.append) params.append = true;
+      writeDatasetState(this.opts.dataDir, dir);
       const job = { id: '', state: 'running' as const, pct: 0, msg: '排队中', dir };
       this.datasetJob = job;
       try {
@@ -613,6 +622,40 @@ export class FishSingWorld implements World {
       };
     }
 
+    if (method === 'datasets') {
+      const weights = listModels(this.routes, this.current.model).map((m) => m.name);
+      return {
+        items: listDatasets(this.opts.dataDir, weights, this.datasetJob?.dir ?? ''),
+        current: this.datasetJob?.dir ?? '',
+      };
+    }
+
+    if (method === 'select') {
+      const dir = String(args[0] ?? '').trim();
+      if (!dir) throw new Error('没指定数据集');
+      if (!readManifest(dir)) throw new Error('这个目录里没有 manifest.json，不是数据集');
+      this.datasetJob = { id: '', state: 'done', pct: 100, msg: '已载入', dir };
+      writeDatasetState(this.opts.dataDir, dir);
+      return { text: `已载入 ${basename(dir)}` };
+    }
+
+    if (method === 'deleteDataset') {
+      const dir = String(args[0] ?? '').trim();
+      if (!dir) throw new Error('没指定数据集');
+      // 只允许删 datasets/ 下面的目录，防止参数被传成别的地方造成误删
+      const root = join(this.opts.dataDir, 'datasets');
+      const parent = dirname(dir);
+      if (parent !== root) throw new Error(`只允许删除 ${root} 下面的数据集`);
+      if (!existsSync(dir)) throw new Error('目录已经不在了');
+      if (this.datasetJob?.state === 'running') throw new Error('有任务在跑，等它结束');
+      rmSync(dir, { recursive: true, force: true });
+      if (this.datasetJob?.dir === dir) {
+        this.datasetJob = null;
+        writeDatasetState(this.opts.dataDir, '');
+      }
+      return { text: `删掉了 ${basename(dir)}` };
+    }
+
     if (method === 'experiments') {
       return {
         items: this.allExperiments(),
@@ -630,6 +673,7 @@ export class FishSingWorld implements World {
         throw new Error(`找不到实验「${exp}」的切片。训练完清理过 logs 的话就只能从原始音频重建。`);
       }
       const dir = appendTo || datasetDirName(this.opts.dataDir);
+      writeDatasetState(this.opts.dataDir, dir);
       const job = { id: '', state: 'running' as const, pct: 0, msg: '排队中', dir };
       this.datasetJob = job;
       try {
@@ -695,7 +739,7 @@ export class FishSingWorld implements World {
     }
 
     if (method === 'reveal') {
-      const dir = this.datasetJob?.dir;
+      const dir = String(args[0] ?? '') || this.datasetJob?.dir;
       if (!dir) throw new Error('还没有数据集目录');
       spawn('explorer', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
       return { text: `已打开：${dir}` };
