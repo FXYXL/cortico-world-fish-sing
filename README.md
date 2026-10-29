@@ -121,6 +121,23 @@ node D:/Coopanion/resources/app/node_modules/pnpm/bin/pnpm.cjs add cortico-world
 
 > 用桌宠内置的 pnpm（v11），不要用命令行那个 v10，会 store 冲突。
 
+## 环境提示词
+
+`ENV_PROMPT.md` 是这个 World 注入给模型的环境说明——她"怎么用唱歌工具"全在这里：装机状态、点歌七步流程、参数表、出错怎么回话、男声歌怎么办。
+
+控制台「大肥鱼唱歌」页有对应的一栏，可以预览渲染结果（变量会被替换成当前值）并直接编辑；改动写到 `<Coo 根>/worlds/fish-sing/ENV_PROMPT.md`，**升级插件不会覆盖**。删掉这个文件就回退到插件自带的模板。
+
+占位符：
+
+| 变量 | 内容 |
+|---|---|
+| `{{singState}}` | 装机状态。缺什么、去哪补，一句话讲完（值是给人话的，模板没有条件语法） |
+| `{{singModel}}` | 当前音色模型文件名 |
+| `{{singTarget}}` | 默认投递方式 |
+| `{{singOnebot}}` | QQ 语音条可用性 |
+| `{{singLast}}` | 上一次唱的歌 |
+| `{{singLangs}}` | F0 提取方法，排障用 |
+
 ## 配置
 
 控制台 →「大肥鱼唱歌」→ 四组配置：

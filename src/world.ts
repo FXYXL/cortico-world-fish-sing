@@ -188,16 +188,34 @@ export class FishSingWorld implements World {
       return null;
     }
     const model = String(cfg.voice?.model ?? '');
-    const where = cfg.play?.defaultTarget === 'none' ? '不自动发，由你自己判断要不要发' : '默认只在本机放（不打扰群里）';
+    const where = cfg.play?.defaultTarget === 'none'
+      ? '不自动发，由你自己判断要不要发'
+      : cfg.play?.defaultTarget === 'both'
+        ? '本机 + QQ 都发'
+        : '本机（不打扰群里）';
     const last = this.lastSong
       ? `上一次唱的是《${this.lastSong.title}》（${Math.round(this.lastSong.duration)} 秒前）`
       : '还没唱过';
+    // 装机状态：让她一眼知道现在能不能唱，而不是调了工具才发现缺权重
+    const st = inspect(this.routes);
+    const missModels = st.models.filter((m) => !m.ready).length;
+    const ready = st.rvc.ready && st.python.ok && missModels === 0;
+    // 值写成**人话**而不是枚举：模板只做占位符替换、没有条件语法，
+    // 所以这句话本身就是"缺什么 + 去哪补"的行动指引。
+    const state = ready
+      ? '已就绪，可以直接唱。'
+      : !st.rvc.ready
+        ? '还缺插件代码，现在唱不了 —— 让她在控制台「大肥鱼唱歌 → 安装与运行时」页点「刷新」，或重装插件。'
+        : !st.python.ok
+          ? '还缺 Python 运行时，现在唱不了 —— 让她在「安装与运行时」页点「安装 GPU 运行时」。'
+          : `还缺 ${missModels} 个模型权重，现在唱不了 —— 让她在「安装与运行时」页点「下载模型权重」。`;
     return {
       singModel: model || '未配置',
       singTarget: where,
       singLast: last,
-      singOnebot: String(cfg.send?.httpUrl ?? '') ? '已配置（能发 QQ 语音条）' : '未配置（只能本机播放）',
-      singBody: text,
+      singOnebot: String(cfg.send?.httpUrl ?? '') ? '可用' : '没配（只能本机播放）',
+      singState: state,
+      singLangs: String(cfg.voice?.f0Method ?? 'rmvpe'),
     };
   }
 
@@ -576,6 +594,25 @@ export class FishSingWorld implements World {
           title: '作品库',
           description: '她唱过的每一首：试听、改名、删除、打开所在文件夹。',
           getMethods: ['list'],
+        },
+      ],
+      // 环境提示词：声明后控制台会出现可编辑的一栏，模板在 ENV_PROMPT.md。
+      // 用户改的内容写到 <部署>/worlds/fish-sing/ENV_PROMPT.md，升级插件不会冲掉。
+      promptDocs: [
+        {
+          key: `worlds.${FISHSING_ID}.envPrompt`,
+          title: '大肥鱼唱歌 · 环境提示词',
+          description: '她怎么用唱歌工具：装机状态、点歌流程、参数、出错怎么回话。',
+          path: ENV_PROMPT_FILE,
+          role: 'envPrompt',
+          vars: [
+            { name: 'singState', description: '装机状态：已就绪，或缺什么、去哪补。' },
+            { name: 'singModel', description: '当前音色模型文件名。' },
+            { name: 'singTarget', description: '默认投递方式。' },
+            { name: 'singOnebot', description: 'QQ 语音条是否可用。' },
+            { name: 'singLast', description: '上一次唱的歌（可能为空）。' },
+            { name: 'singLangs', description: 'F0 提取方法，排障时用。' },
+          ],
         },
       ],
       config: fishsingConfigGroups(),
