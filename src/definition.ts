@@ -1,6 +1,7 @@
 /**
  * World 定义：Coo 的装配层按这个挂载，Core 按这个构造实例。
  */
+import { join } from 'node:path';
 import type { WorldContext, WorldDefinition } from 'cortico/world.ts';
 import { FISHSING_DEFAULTS, FISHSING_ID, type FishSingConfigSection } from './config.ts';
 import { FishSingWorld } from './world.ts';
@@ -21,7 +22,8 @@ export const FISHSING: WorldDefinition<FishSingConfigSection> = {
   create: (ctx: WorldContext<FishSingConfigSection>) =>
     new FishSingWorld({
       cfg: ctx.cfg,
-      dataDir: ctx.dataDir,
+      // 每个插件一个子目录：ctx.dataDir 是整个部署的 data/，别把 cache/library 摊在它根上
+      dataDir: join(ctx.dataDir, FISHSING_ID),
       secret: (name: string) => ctx.secret(name),
     }),
   describe: {

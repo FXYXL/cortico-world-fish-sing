@@ -282,6 +282,7 @@ export class FishSingWorld implements World {
           dir: this.ffmpeg().dir,
           playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
           volume: Number(this.opts.cfg.play?.volume ?? 1),
+          log: (m: string) => this.host?.log.warn(m),
         });
         return `放《${hit.title}》。`;
       },

@@ -230,12 +230,29 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     const delivered: string[] = [];
     const problems: string[] = [];
 
+    // 先放进作品库：本地播放要播**库里的持久副本**，不能播临时文件——
+    // 临时目录在函数返回前就被删了，ffplay 还没打开文件就没了，表现是"一声不响"。
+    const libEntry = addToLibrary(deps.data, {
+      id,
+      title: src.title,
+      source: src.bvid || src.input,
+      bvid: src.bvid,
+      file: mp3,
+      durationSec: totalSec,
+      at: Date.now(),
+      params,
+      target: '',
+    }, mp3);
+
     const doLocal = lower === 'local' || isBoth || (!toRaw && deps.defaultTarget === 'local');
     if (doLocal) {
       if (!deps.playEnabled) {
         problems.push('本机播放被关掉了（配置 → 播放与发送）');
       } else {
-        deps.player.play(mp3, { dir: deps.ffmpeg.dir, playerPath: deps.playerPath, volume: deps.volume });
+        deps.player.play(libEntry.file, {
+          dir: deps.ffmpeg.dir, playerPath: deps.playerPath, volume: deps.volume,
+          log: (m: string) => deps.log.warn(m),
+        });
         delivered.push('本机在放');
       }
     }
@@ -257,18 +274,10 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       problems.push(`不认识的会话地址「${toRaw}」，要 group:<群号> 或 private:<QQ号>`);
     }
 
-    // ---- 7. 进作品库
-    addToLibrary(deps.data, {
-      id,
-      title: src.title,
-      source: src.bvid || src.input,
-      bvid: src.bvid,
-      file: mp3,
-      durationSec: totalSec,
-      at: Date.now(),
-      params,
-      target: delivered.join(' + '),
-    }, mp3);
+    // ---- 7. 作品库条目补充"投递到哪"
+    if (delivered.length) {
+      addToLibrary(deps.data, { ...libEntry, target: delivered.join(' + ') }, libEntry.file);
+    }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
     const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}`;

@@ -14,6 +14,8 @@ export interface PlayOptions {
   dir: string;
   playerPath: string;
   volume: number;
+  /** 出问题时用它留痕：ffplay 静默失败最坑，不报就永远查不到 */
+  log?: (msg: string) => void;
 }
 
 export class Player {
@@ -27,16 +29,32 @@ export class Player {
   /** 放一首；新的一来就把旧的掐掉（同时放两首只会互相盖住）。 */
   play(file: string, opts: PlayOptions): void {
     this.stop();
+    if (!existsSync(file)) throw new Error(`要播的文件不存在：${file}`);
     const exe = opts.playerPath && existsSync(opts.playerPath)
       ? opts.playerPath
       : join(opts.dir, 'ffplay.exe');
     if (!existsSync(exe)) throw new Error(`找不到 ffplay：${exe}（配置 → 运行时 → ffmpeg 目录）`);
     const vol = Math.max(0, Math.min(1, Number(opts.volume) || 1));
-    const child = spawn(exe, ['-nodisp', '-autoexit', '-loglevel', 'quiet', '-volume', String(Math.round(vol * 100)), file], {
+    const child = spawn(exe, ['-nodisp', '-autoexit', '-loglevel', 'error', '-volume', String(Math.round(vol * 100)), file], {
       windowsHide: true,
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
-    child.once('exit', () => {
+    let err = '';
+    child.stderr?.on('data', (c: Buffer) => {
+      err += c.toString('utf8');
+      if (err.length > 2000) err = err.slice(-2000);
+    });
+    child.once('error', (e) => {
+      opts.log?.(`ffplay 起不来：${e.message}`);
+      if (this.proc === child) {
+        this.proc = null;
+        this.current = '';
+      }
+    });
+    child.once('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        opts.log?.(`ffplay 退出码 ${code}：${err.trim().split('\n').slice(-2).join(' ') || '无输出'}`);
+      }
       if (this.proc === child) {
         this.proc = null;
         this.current = '';
