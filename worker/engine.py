@@ -170,6 +170,34 @@ def resample_linear_fallback(data: np.ndarray, src_sr: int, dst_sr: int) -> np.n
 
 # ---------------------------------------------------------------- 引擎
 
+#: 音域分析脚本：由 _f0_stats 在子进程里执行（sys.executable 与引擎同解释器，librosa 可用）。
+#: 输出一行 JSON；无人声/读不了时输出 null。
+_F0_ANALYZE_SRC = r"""
+import json, sys
+import numpy as np
+
+def main():
+    from pathlib import Path
+    import librosa
+    path = Path(sys.argv[1])
+    max_sec = float(sys.argv[2]) if len(sys.argv) > 2 else 90.0
+    dur = librosa.get_duration(path=str(path))
+    if dur > max_sec:
+        offset = (dur - max_sec) / 2
+        y, sr = librosa.load(str(path), sr=16000, mono=True, offset=offset, duration=max_sec)
+    else:
+        y, sr = librosa.load(str(path), sr=16000, mono=True)
+    f0, vflag, _ = librosa.pyin(y, fmin=80.0, fmax=800.0, sr=sr, frame_length=1024)
+    v = f0[vflag & ~np.isnan(f0)]
+    if v.size < 50:
+        print(json.dumps(None))
+        return
+    q = lambda p: float(np.percentile(v, p))
+    print(json.dumps({"p5": q(5), "p25": q(25), "median": q(50), "p95": q(95), "frames": int(v.size)}))
+
+main()
+"""
+
 
 class SingEngine:
     """一个进程里只建一次，之后所有请求共用（模型常驻）。"""
@@ -526,22 +554,21 @@ class SingEngine:
     # -- 音域与变调推荐 ---------------------------------------------
 
     def _f0_stats(self, path: "Path | str", *, max_sec: float = 90.0) -> Optional[dict]:
-        """一段人声的音域统计。只分析中段 90 秒——整首跑 pyin 要 40 秒，会把唱歌调用顶超时。"""
+        """一段人声的音域统计。在**子进程**里跑——pyin 会长时间持有 GIL，
+        进程内分析会把 HTTP 线程卡死，进度轮询 10 秒收不到响应就超时（0.1.6 实测）。
+        只分析中段 90 秒，成本可控。"""
         path = Path(path)
         try:
-            import librosa
-            dur = librosa.get_duration(path=str(path))
-            if dur > max_sec:
-                offset = (dur - max_sec) / 2
-                y, sr = librosa.load(str(path), sr=16000, mono=True, offset=offset, duration=max_sec)
-            else:
-                y, sr = librosa.load(str(path), sr=16000, mono=True)
-            f0, vflag, _ = librosa.pyin(y, fmin=80.0, fmax=800.0, sr=sr, frame_length=1024)
-            v = f0[vflag & ~np.isnan(f0)]
-            if v.size < 50:
-                return None
-            q = lambda p: float(np.percentile(v, p))
-            return {"p5": q(5), "p25": q(25), "median": q(50), "p95": q(95), "frames": int(v.size)}
+            proc = subprocess.run(
+                [sys.executable, "-c", _F0_ANALYZE_SRC, str(path), str(max_sec)],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                timeout=180,
+            )
+            out = (proc.stdout or "").strip().splitlines()
+            d = json.loads(out[-1]) if out else None
+            if isinstance(d, dict) and d.get("frames", 0) > 0:
+                return d
+            return None
         except Exception as e:  # noqa: BLE001
             log(f"音域分析失败（{path.name}）：{e}")
             return None
