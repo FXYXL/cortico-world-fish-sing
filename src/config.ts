@@ -59,6 +59,10 @@ export interface FishSingConfigSection {
     /** QQ 通知发到哪：group:<群号> 或 private:<QQ号>；空 = 只用桌宠 */
     qqTarget?: string;
   };
+  train?: {
+    /** 训练完成后自动生成选模对比试听（同一句训练切片，最后几个存档各唱一遍）；默认开 */
+    abTest?: boolean;
+  };
   worker: {
     /** 自托管根目录；留空 = <数据目录>/runtime（推荐） */
     runtimeRoot: string;
@@ -128,6 +132,9 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     enabled: true,
     channel: 'auto',
     qqTarget: '',
+  },
+  train: {
+    abTest: true,
   },
 };
 

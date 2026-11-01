@@ -204,12 +204,51 @@ class SingEngine:
 
     def __init__(self, model: str = DEFAULT_MODEL, index: str = DEFAULT_INDEX):
         self.model = model
+        self.model_path = str(RVC_ROOT / "assets" / "weights" / model)  # 绝对路径，恢复原模型时要用
         self.index = index if index and Path(index).is_file() else ""
         self.ready = False
         self.load_ms = 0
         self.sr = 40000
         self._lock = threading.Lock()
         self._vc = None
+
+    # -- 模型热切换（选模对比试听用） --------------------------------
+
+    def set_model(self, ckpt: "Path | str", index: str = "") -> None:
+        """热切换加载的模型/索引，不用重启进程。
+
+        ckpt 可以是任意位置的 .pth：RVC 的 get_vc 用 f'{weight_root}/{sid}' 拼路径，
+        所以这里临时把 weight_root 指到 ckpt 所在目录。线程安全由任务串行保证。
+        """
+        ckpt = Path(ckpt)
+        index = index if index and Path(index).is_file() else ""
+        if self.ready and str(ckpt) == self.model_path and index == self.index:
+            return
+        if not self.ready:
+            self.model = ckpt.name
+            self.index = index
+            self.load()
+            self.model_path = str(ckpt)
+            return
+        cwd_bak = os.getcwd()
+        os.chdir(RVC_ROOT)
+        old_root = os.environ.get("weight_root")
+        try:
+            os.environ["weight_root"] = str(ckpt.parent)
+            with self._lock:
+                self._vc.get_vc(ckpt.name)
+            self.model = ckpt.name
+            self.model_path = str(ckpt)
+            self.index = index
+            try:
+                self.sr = int(self._vc.cpt["config"][-1])
+            except Exception:  # noqa: BLE001
+                pass
+            log(f"已切换模型：{self.model}（索引={'有' if self.index else '无'}）")
+        finally:
+            if old_root is not None:
+                os.environ["weight_root"] = old_root
+            os.chdir(cwd_bak)
 
     # -- 加载 ------------------------------------------------------
 
@@ -248,6 +287,7 @@ class SingEngine:
             self.sr = 40000
         os.chdir(cwd_bak)
         self.ready = True
+        self.model_path = str(RVC_ROOT / "assets" / "weights" / self.model)
         self.load_ms = int((time.time() - t0) * 1000)
         log(f"模型就绪：{self.model}（{self.load_ms} ms）索引={'有' if self.index else '无'}")
 
@@ -697,6 +737,48 @@ class SingEngine:
         if suggestion is not None:
             result["pitchSuggest"] = suggestion
         return result
+
+    # -- 选模对比试听 -----------------------------------------------
+
+    def ab_test(self, test: Path, out_dir: Path, variants: list, *, pitch: int = 0,
+                index_rate: float = 0.75, protect: float = 0.33,
+                progress: Optional[Callable[[float, str], None]] = None,
+                cancel: Optional[threading.Event] = None) -> dict:
+        """
+        选模对比：同一测试句，每个变体（.pth）各换声一遍，结束后恢复原模型。
+
+        variants: [{"ckpt": <pth 路径>, "label": "e100", "index": <index 路径或 "">}, ...]
+        测试句用训练切片（0_gt_wavs，目标音色清唱）——换回模型本身就是最干净的
+        存档对比：输入完全一致，听出来的差异全是模型/存档本身的差别。
+        """
+        cancel = cancel or threading.Event()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report = progress or (lambda p, m: None)
+        original = (self.model_path or str(RVC_ROOT / "assets" / "weights" / self.model), self.index)
+        outputs: list = []
+        n = max(1, len(variants))
+        try:
+            for i, v in enumerate(variants):
+                if cancel.is_set():
+                    raise RuntimeError("已取消")
+                label = str(v.get("label") or Path(str(v["ckpt"])).stem)
+                report(i / n, f"切换到 {label}")
+                self.set_model(Path(str(v["ckpt"])), str(v.get("index") or ""))
+                dst = out_dir / f"{label}.wav"
+                report((i + 0.25) / n, f"换声：{label}")
+                self.convert(
+                    test, dst, pitch=pitch, index_rate=index_rate, protect=protect,
+                    progress=lambda p, m, _i=i, _n=n: report((_i + 0.25 + 0.7 * p) / _n, m),
+                    cancel=cancel,
+                )
+                outputs.append({"label": label, "ckpt": str(v["ckpt"]), "file": str(dst)})
+        finally:
+            try:
+                self.set_model(Path(original[0]), original[1])  # 恢复原模型，别让唱歌用错档
+            except Exception as e:  # noqa: BLE001
+                log(f"恢复原模型失败：{e}")
+        report(1.0, "完成")
+        return {"outputs": outputs}
 
 
 # ---------------------------------------------------------------- 自检

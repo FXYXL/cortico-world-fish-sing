@@ -8,7 +8,7 @@
  *  · 重活全在 Python worker 里（模型常驻、55 秒切片），TS 侧只做编排和投递。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -64,9 +64,9 @@ import {
   type RuntimeMode,
   type SetupStatus,
 } from './setup.ts';
-import { duration, type FfmpegDeps } from './audio.ts';
-import { Player } from './deliver.ts';
-import { dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
+import { duration, toMp3, type FfmpegDeps } from './audio.ts';
+import { parseTarget, Player, sendRecord } from './deliver.ts';
+import { addToLibrary, dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
 import { singSong, type SingDeps } from './sing.ts';
 import { notify } from './notify.ts';
 import { WorkerClient } from './worker.ts';
@@ -307,6 +307,100 @@ export class FishSingWorld implements World {
       if (r.via !== 'off') this.host?.log.info(`[fish-sing] 通知（${r.via}）：${r.note}`);
       return r;
     });
+  }
+
+  /**
+   * 训练完成后自动生成选模对比试听：同一句训练切片（目标音色清唱），用
+   * final + 最后两个中间档各换声一遍。输入完全一致，听出来的差异全是存档本身
+   * 的差别——比拿着不同版本整首唱一遍再凭记忆比要靠谱。
+   * 片段进作品库；配了 notify.qqTarget 就同时发 QQ。
+   */
+  private async runAbTest(exp: string): Promise<void> {
+    if (this.opts.cfg.train?.abTest === false) return;
+    const weights = join(this.routes.rvcRoot, 'assets', 'weights');
+    const logDir = join(this.routes.rvcRoot, 'logs', exp);
+    const indexOf = (dir: string): string => {
+      try {
+        const idx = readdirSync(dir).find((f) => f.endsWith('.index'));
+        return idx ? join(dir, idx) : '';
+      } catch {
+        return '';
+      }
+    };
+    const variants: { ckpt: string; label: string; index: string }[] = [];
+    const finalPth = join(weights, `${exp}.pth`);
+    if (existsSync(finalPth)) variants.push({ ckpt: finalPth, label: 'final', index: indexOf(logDir) });
+    try {
+      // 中间档从新到旧取 2 个（G_2333333 是完整存档，跟 final 重复，不算）
+      const gs = readdirSync(logDir)
+        .map((f) => /^G_(\d+)\.pth$/.exec(f))
+        .filter((m): m is RegExpExecArray => Boolean(m) && m[1] !== '2333333')
+        .sort((a, b) => Number(b[1]) - Number(a[1]))
+        .slice(0, 2);
+      for (const m of gs) variants.push({ ckpt: join(logDir, m[0]), label: `e${m[1]}`, index: indexOf(logDir) });
+    } catch {
+      /* 没有中间档就只用 final */
+    }
+    if (variants.length < 2) {
+      this.host?.log.info(`[fish-sing] ${exp} 只有一个可用存档（中间档可能被清理了），跳过选模对比`);
+      return;
+    }
+    const gtDir = join(logDir, '0_gt_wavs');
+    let test = '';
+    try {
+      const wavs = readdirSync(gtDir).filter((f) => f.endsWith('.wav')).sort();
+      const mid = wavs[Math.floor(wavs.length / 2)];
+      test = mid ? join(gtDir, mid) : '';
+    } catch {
+      test = '';
+    }
+    if (!test || !existsSync(test)) {
+      this.host?.log.warn('[fish-sing] 没找到可用的训练切片当测试句，跳过选模对比');
+      return;
+    }
+    const ts = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
+    const outDir = join(this.data().dataDir, 'ab', `${exp}-${ts}`);
+    const jobId = await this.worker.submit('ab', {
+      test, out: outDir, variants, pitch: 0, index_rate: 0.75, protect: 0.33,
+    });
+    const job = await this.worker.wait(
+      jobId,
+      (p, msg) => this.host?.log.info(`[fish-sing] 选模对比 ${Math.round(p * 100)}%：${msg}`),
+      { stallMs: 10 * 60_000 },
+    );
+    const outputs = ((job.result?.outputs ?? []) as { label: string; file: string }[])
+      .filter((o) => existsSync(o.file));
+    if (!outputs.length) return;
+    const labels: string[] = [];
+    const obTarget = parseTarget(String(this.opts.cfg.notify?.qqTarget ?? ''));
+    const onebot = { httpUrl: String(this.opts.cfg.send?.httpUrl ?? ''), token: this.onebotToken() };
+    for (const o of outputs) {
+      const mp3 = join(outDir, `${o.label}.mp3`);
+      await toMp3(o.file, mp3, this.ffmpeg(), '192k');
+      labels.push(o.label);
+      addToLibrary(this.data(), {
+        id: `ab-${exp}-${o.label}`,
+        title: `${exp} 选模对比 · ${o.label}`,
+        source: 'ab-test', bvid: '',
+        file: mp3,
+        durationSec: await duration(mp3, this.ffmpeg()).catch(() => 0),
+        at: Date.now(),
+        params: { model: o.label, index: '', indexRate: 0.75, protect: 0.33, pitch: 0, mode: 'vocals' },
+        target: '',
+      }, mp3);
+      if (obTarget && onebot.httpUrl) {
+        try {
+          await sendRecord(onebot, obTarget, mp3);
+        } catch (e) {
+          this.host?.log.warn(`[fish-sing] 选模片段发 QQ 失败：${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+    this.host?.log.info(`[fish-sing] 选模对比已生成：${labels.join(' / ')}（${outDir}）`);
+    void this.notifyEvent(
+      `选模试听已生成：${exp}`,
+      `同一句训练切片，用 ${labels.join('、')} 各唱了一遍。在作品库里对比听（fish_sing_library）${obTarget ? '，QQ 那边也各发了一条' : ''}。`,
+    );
   }
 
   private deps(): SingDeps {
@@ -983,6 +1077,9 @@ export class FishSingWorld implements World {
             }
           }
           void this.notifyEvent(`训练完成：${exp}`, `${epochs} 轮全部完成。${job.msg}`);
+          void this.runAbTest(exp).catch((e: unknown) => {
+            this.host?.log.warn(`[fish-sing] 选模对比失败：${e instanceof Error ? e.message : String(e)}`);
+          });
         })
         .catch((e: unknown) => {
           job.state = 'error';
