@@ -33,7 +33,31 @@ import soundfile as sf
 
 # ---------------------------------------------------------------- 常量
 
-RVC_ROOT = Path(os.environ.get("FISHSING_RVC_ROOT", r"D:\AI\rvc"))
+def _resolve_rvc_root() -> Path:
+    """RVC 根目录的探测链。
+
+    之前默认写死 D:\\AI\\rvc，导致手动起 worker（没传 FISHSING_RVC_ROOT）时
+    引擎去 os.chdir 一个不存在的目录，报错还不直观。现在按顺序找：
+
+    1. FISHSING_RVC_ROOT（插件拉起时必传）
+    2. 自托管位置：FISHSING_WORK 的上级 runtime/rvc（runtime 里 venv 与 rvc 平级）
+    3. 老机器的开发目录 D:\\AI\\rvc、C:\\rvc
+    """
+    env = os.environ.get("FISHSING_RVC_ROOT", "").strip()
+    if env:
+        return Path(env)
+    work = os.environ.get("FISHSING_WORK", "").strip()
+    if work:
+        cand = Path(work).parent / "runtime" / "rvc"
+        if (cand / "assets" / "weights").is_dir():
+            return cand
+    for legacy in (r"D:\AI\rvc", r"C:\rvc"):
+        if (Path(legacy) / "assets" / "weights").is_dir():
+            return Path(legacy)
+    return Path(work).parent / "runtime" / "rvc" if work else Path(r"D:\AI\rvc")
+
+
+RVC_ROOT = _resolve_rvc_root()
 # 自托管时 venv 和 rvc 代码是**平级**的（runtime/venv 与 runtime/rvc），不在 rvc/venv 里，
 # 所以这个路径必须能被外部指定；回落到老结构（rvc/venv）只是为了兼容开发机。
 RVC_PY = Path(os.environ.get(
@@ -43,7 +67,9 @@ RVC_PY = Path(os.environ.get(
 SEP_PY = Path(os.environ.get("FISHSING_SEP_PY", sys.executable))
 SEP_SCRIPT = Path(os.environ.get("FISHSING_SEP_SCRIPT",
                          str(Path(__file__).resolve().parent / "separate.py")))
-FFMPEG = Path(os.environ.get("FISHSING_FFMPEG", r"D:\ffmpeg\bin\ffmpeg.exe"))
+FFMPEG = Path(os.environ.get("FISHSING_FFMPEG")
+              or shutil.which("ffmpeg")
+              or r"D:\ffmpeg\bin\ffmpeg.exe")
 
 DEFAULT_MODEL = os.environ.get("FISHSING_MODEL", "dfy2.pth")
 DEFAULT_INDEX = os.environ.get(
