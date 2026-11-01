@@ -315,8 +315,8 @@ export class FishSingWorld implements World {
    * 的差别——比拿着不同版本整首唱一遍再凭记忆比要靠谱。
    * 片段进作品库；配了 notify.qqTarget 就同时发 QQ。
    */
-  private async runAbTest(exp: string): Promise<void> {
-    if (this.opts.cfg.train?.abTest === false) return;
+  private async runAbTest(exp: string, enabled?: boolean): Promise<string> {
+    if (enabled === false || this.opts.cfg.train?.abTest === false) return '';
     const weights = join(this.routes.rvcRoot, 'assets', 'weights');
     const logDir = join(this.routes.rvcRoot, 'logs', exp);
     const indexOf = (dir: string): string => {
@@ -343,7 +343,7 @@ export class FishSingWorld implements World {
     }
     if (variants.length < 2) {
       this.host?.log.info(`[fish-sing] ${exp} 只有一个可用存档（中间档可能被清理了），跳过选模对比`);
-      return;
+      return '';
     }
     const gtDir = join(logDir, '0_gt_wavs');
     let test = '';
@@ -356,7 +356,7 @@ export class FishSingWorld implements World {
     }
     if (!test || !existsSync(test)) {
       this.host?.log.warn('[fish-sing] 没找到可用的训练切片当测试句，跳过选模对比');
-      return;
+      return '';
     }
     const ts = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
     const outDir = join(this.data().dataDir, 'ab', `${exp}-${ts}`);
@@ -401,6 +401,7 @@ export class FishSingWorld implements World {
       `选模试听已生成：${exp}`,
       `同一句训练切片，用 ${labels.join('、')} 各唱了一遍。在作品库里对比听（fish_sing_library）${obTarget ? '，QQ 那边也各发了一条' : ''}。`,
     );
+    return labels.join(' / ');
   }
 
   private deps(): SingDeps {
@@ -987,6 +988,8 @@ export class FishSingWorld implements World {
         rebuild?: boolean;
         /** 训练完自动清理中间档（默认不勾：删了只能重训才拿得回来） */
         pruneAfter?: boolean;
+        /** 训练完生成选模对比试听（默认开） */
+        abTest?: boolean;
         keepEvery?: number;
       };
       const dir = this.datasetJob?.dir;
@@ -1077,7 +1080,7 @@ export class FishSingWorld implements World {
             }
           }
           void this.notifyEvent(`训练完成：${exp}`, `${epochs} 轮全部完成。${job.msg}`);
-          void this.runAbTest(exp).catch((e: unknown) => {
+          void this.runAbTest(exp, cfg.abTest !== false).catch((e: unknown) => {
             this.host?.log.warn(`[fish-sing] 选模对比失败：${e instanceof Error ? e.message : String(e)}`);
           });
         })
@@ -1155,6 +1158,13 @@ export class FishSingWorld implements World {
         removed: done.remove.length,
         freedMb: done.freedMb,
       };
+    }
+
+    if (method === 'trainAbTest') {
+      const exp = String(args[0]?.exp ?? '').trim() || this.trainJob?.exp || '';
+      if (!exp) throw new Error('没有实验名：先在「训练」页填实验名，或跑一次训练');
+      const text = await this.runAbTest(exp, true);
+      return { text: text || `没生成：${exp} 只找到一个可用存档（中间档可能已被清理）` };
     }
 
     if (method === 'trainStop') {

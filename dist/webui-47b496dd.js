@@ -1199,7 +1199,13 @@ function mountTrain(ctx) {
   const pruneAfterLbl = el('label', 'fs-meta', '训练完自动清理中间档');
   pruneAfterLbl.prepend(pruneAfterChk);
   pruneAfterLbl.title = '按下面「每 N 轮留一个」保留，其余删掉。不勾就只是提醒你手动清。';
-  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, el('span', 'fs-grow'), startT, stopT);
+  const abChk = el('input', 'fs-ck');
+  abChk.type = 'checkbox';
+  abChk.checked = true;
+  const abLbl = el('label', 'fs-meta', '训练完生成选模对比');
+  abLbl.prepend(abChk);
+  abLbl.title = '用同一句训练切片，final 和最后两个中间档各唱一遍，进作品库对比听';
+  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, el('span', 'fs-grow'), startT, stopT);
 
   const tProg = el('div', 'fs-prog');
   const tFill = el('i');
@@ -1219,8 +1225,10 @@ function mountTrain(ctx) {
   keepIn.style.width = '64px';
   const pruneBtn = el('button', 'fs-btn', '清理中间档');
   pruneBtn.title = '只删 assets/weights/<exp>_eN_sX.pth 这种导出的小模型；完整存档、索引、最终模型都不动';
+  const abBtn = el('button', 'fs-btn', '生成选模对比');
+  abBtn.title = '用当前实验的存档（final + 最后两个中间档）各唱同一句训练切片，生成对比试听进作品库';
   ckptBar.append(el('span', 'fs-meta', '中间档：'), ckptMeta, el('span', 'fs-meta', '每'),
-    keepIn, el('span', 'fs-meta', '轮留一个'), el('span', 'fs-grow'), pruneBtn);
+    keepIn, el('span', 'fs-meta', '轮留一个'), el('span', 'fs-grow'), abBtn, pruneBtn);
   trainBox.append(tTitle, tForm, chkRow, tProg, tMsg, losses, lossAxis, tModels, ckptBar);
 
   let trainExp = '';
@@ -1235,6 +1243,25 @@ function mountTrain(ctx) {
       pruneBtn.disabled = !ck.n;
     } catch { /* 忽略 */ }
   };
+
+  abBtn.addEventListener('click', async () => {
+    const exp = String(expIn.value || '').trim() || trainExp;
+    if (!exp) {
+      tMsg.textContent = '先填实验名（或跑一次训练）再生成选模对比';
+      return;
+    }
+    abBtn.disabled = true;
+    abBtn.textContent = '生成中…';
+    try {
+      const r = await ctx.invoke('trainAbTest', [{ exp }]);
+      tMsg.textContent = (r && r.text) || `选模对比已生成（${exp}）`;
+    } catch (e) {
+      tMsg.textContent = `选模对比失败：${(e && e.message) || e}`;
+    } finally {
+      abBtn.disabled = false;
+      abBtn.textContent = '生成选模对比';
+    }
+  });
 
   pruneBtn.addEventListener('click', async () => {
     if (!trainExp) return;
@@ -1408,6 +1435,7 @@ function mountTrain(ctx) {
         resume: resumeChk.checked,
         rebuild: rebuildChk.checked,
         pruneAfter: pruneAfterChk.checked,
+        abTest: abChk.checked,
         keepEvery: Math.max(1, Number(keepIn.value) || 50),
       }]);
       if (r && r.exp) {
