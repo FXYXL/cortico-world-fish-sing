@@ -1205,7 +1205,13 @@ function mountTrain(ctx) {
   const abLbl = el('label', 'fs-meta', '训练完生成选模对比');
   abLbl.prepend(abChk);
   abLbl.title = '用同一句训练切片，final 和最后两个中间档各唱一遍，进作品库对比听';
-  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, el('span', 'fs-grow'), startT, stopT);
+  const lowChk = el('input', 'fs-ck');
+  lowChk.type = 'checkbox';
+  lowChk.checked = true;
+  const lowLbl = el('label', 'fs-meta', '低音增强');
+  lowLbl.prepend(lowChk);
+  lowLbl.title = '把每个切片合成 -2/-4 半音的低音数据一起训练，治"低音不像"。F0/特征提取时间约 ×3';
+  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, lowLbl, el('span', 'fs-grow'), startT, stopT);
 
   const tProg = el('div', 'fs-prog');
   const tFill = el('i');
@@ -1436,6 +1442,7 @@ function mountTrain(ctx) {
         rebuild: rebuildChk.checked,
         pruneAfter: pruneAfterChk.checked,
         abTest: abChk.checked,
+        augment: lowChk.checked,
         keepEvery: Math.max(1, Number(keepIn.value) || 50),
       }]);
       if (r && r.exp) {
