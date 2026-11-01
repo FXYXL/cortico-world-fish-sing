@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 装轻量依赖（numpy/soundfile，引擎测试用）
+        run: pip install numpy soundfile
+      - name: 语法检查 worker
+        run: python -m py_compile worker/*.py
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: 语法检查面板与脚本
+        run: |
+          node --check dist/webui.js
+          node --check tools/publish.mjs
+      - name: 冒烟测试（入口加载 + 通知兜底）
+        run: node --experimental-strip-types tests/smoke.mjs

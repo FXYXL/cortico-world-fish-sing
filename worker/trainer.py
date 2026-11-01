@@ -270,6 +270,22 @@ def _loss_of(line: str):
     return out or None
 
 
+def expand_aug_weights(weights: dict, augment_shifts: list) -> dict:
+    """
+    增强副本继承源切片权重，但按「源 + 副本」的总份数摊薄：
+    低音 3x 的源片 + 2 个副本 → 各 1x，总重要度还是 3x，材料时长翻了 3 倍。
+    """
+    shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
+    if not shifts or not weights:
+        return weights or {}
+    div = len(shifts) + 1
+    expanded = dict(weights)
+    for s in shifts:
+        for k, v in weights.items():
+            expanded[f"aug{s}_{k}"] = float(v) / div
+    return expanded
+
+
 def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
     """
     完整流水线。params:
@@ -282,16 +298,9 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
                       augment_shifts=augment_shifts, weights=weights)
     total = count_files(exp_dir / "0_gt_wavs", ".wav")
 
-    # 增强副本继承源切片权重，但按「源 + 副本」的总份数摊薄：
-    # 低音 3x 的源片 + 2 个副本 → 各 1x，总重要度还是 3x，材料时长翻了 3 倍。
     if augment_shifts and weights:
-        div = len(augment_shifts) + 1
-        expanded = dict(weights)
-        for s in augment_shifts:
-            for k, v in weights.items():
-                expanded[f"aug{s}_{k}"] = float(v) / div
-        weights = expanded
-        log(f"权重已扩展到增强副本（÷{div}）")
+        weights = expand_aug_weights(weights, augment_shifts)
+        log(f"权重已扩展到增强副本（÷{len(augment_shifts) + 1}）")
 
     rebuild = bool(params.get("rebuild", False))
 
