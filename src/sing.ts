@@ -52,7 +52,8 @@ export interface SingRequest {
   song: string;
   to?: string;
   mode?: 'full' | 'vocals';
-  pitch?: number;
+  /** 半音数；'auto' = 分离后按模型音域自动推荐（推荐，能挡住"男歌女唱忘移调"的翻车） */
+  pitch?: number | 'auto';
   indexRate?: number;
   protect?: number;
   start?: number;
@@ -222,7 +223,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     index: deps.voice.index,
     indexRate: Number(req.indexRate ?? deps.voice.indexRate),
     protect: Number(req.protect ?? deps.voice.protect),
-    pitch: Number(req.pitch ?? deps.voice.pitch),
+    pitch: req.pitch === 'auto' ? 'auto' : Number(req.pitch ?? deps.voice.pitch),
     mode: req.mode ?? deps.voice.mode,
   };
 
@@ -273,6 +274,8 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         }
       });
       info = job.result ?? {};
+      const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
+      if (suggest?.reason) deps.log.info(`变调推荐：${suggest.reason}`);
       const raw = String(info.output ?? '');
       if (!raw) throw new Error('worker 没给出输出文件');
 
@@ -345,7 +348,11 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
-    const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}`;
+    const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
+    const autoNote = params.pitch === 'auto' && suggest
+      ? `；变调 ${suggest.pitch >= 0 ? '+' : ''}${suggest.pitch}（${suggest.reason}）`
+      : '';
+    const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}${autoNote}`;
     const tail = delivered.length ? `；${delivered.join('，')}` : '；没投递（文件进了作品库，可以用 fish_sing_library 回放）';
     const warn = problems.length ? `；但${problems.join('；')}` : '';
     return {
@@ -354,6 +361,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       detail: {
         title: src.title, bvid: src.bvid, duration: totalSec, segments: Math.ceil(totalSec / deps.maxSegmentSec),
         cached, elapsed, file: mp3, params, delivered, problems,
+        pitchSuggest: info.pitchSuggest,
       },
     };
   } catch (e) {

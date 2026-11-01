@@ -121,7 +121,7 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             src, work,
             separate=bool(params.get("separate", True)),
             mode=str(params.get("mode", "full")),
-            pitch=int(params.get("pitch", 0)),
+            pitch=params.get("pitch", 0),
             index_rate=float(params.get("index_rate", 0.75)),
             protect=float(params.get("protect", 0.33)),
             progress=progress,

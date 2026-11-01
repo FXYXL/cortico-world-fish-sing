@@ -50,6 +50,14 @@ export interface FishSingConfigSection {
     /** 多条之间的间隔（毫秒），防风控 */
     gapMs: number;
   };
+  notify?: {
+    /** 训练/长任务结束时主动说一声；默认开 */
+    enabled?: boolean;
+    /** auto=配了 QQ 目标就走 QQ（失败退桌宠），否则桌宠 */
+    channel?: 'auto' | 'pet' | 'qq';
+    /** QQ 通知发到哪：group:<群号> 或 private:<QQ号>；空 = 只用桌宠 */
+    qqTarget?: string;
+  };
   worker: {
     /** 自托管根目录；留空 = <数据目录>/runtime（推荐） */
     runtimeRoot: string;
@@ -114,6 +122,11 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     token: '',
     autoStart: true,
     startTimeoutMs: 240000,
+  },
+  notify: {
+    enabled: true,
+    channel: 'auto',
+    qqTarget: '',
   },
 };
 
@@ -293,6 +306,32 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             minimum: 0,
             maximum: 10000,
             'x-hot': true,
+          },
+        },
+      },
+    },
+    {
+      id: `world:${FISHSING_ID}.notify`,
+      owner: `world:${FISHSING_ID}`,
+      schema: {
+        type: 'object',
+        title: '完成通知（训练/长任务结束时主动说一声）',
+        properties: {
+          [at('notify.enabled')]: {
+            type: 'boolean',
+            title: '启用通知',
+            description: '训练完成或中断时主动告知。默认开。',
+          },
+          [at('notify.channel')]: {
+            type: 'string',
+            enum: ['auto', 'pet', 'qq'],
+            title: '渠道',
+            description: 'auto=配了 QQ 目标就走 QQ（失败退桌宠），否则桌宠；pet=只桌宠；qq=只 QQ（失败也退桌宠）。',
+          },
+          [at('notify.qqTarget')]: {
+            type: 'string',
+            title: 'QQ 通知目标',
+            description: 'group:<群号> 或 private:<QQ号>；留空 = 只用桌宠。',
           },
         },
       },

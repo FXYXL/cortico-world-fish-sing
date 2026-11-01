@@ -16,6 +16,7 @@ fish-sing worker 的核心：常驻 RVC + 切片换声 + 分离/混音。
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -522,18 +523,99 @@ class SingEngine:
 
     # -- 一键流程 --------------------------------------------------
 
+    # -- 音域与变调推荐 ---------------------------------------------
+
+    def _f0_stats(self, path: Path) -> Optional[dict]:
+        """一段人声的音域统计。分析失败或人声太少返回 None。"""
+        try:
+            import librosa
+            y, sr = librosa.load(str(path), sr=16000, mono=True)
+            f0, vflag, _ = librosa.pyin(y, fmin=80.0, fmax=800.0, sr=sr, frame_length=1024)
+            v = f0[vflag & ~np.isnan(f0)]
+            if v.size < 50:
+                return None
+            q = lambda p: float(np.percentile(v, p))
+            return {"p5": q(5), "p25": q(25), "median": q(50), "p95": q(95), "frames": int(v.size)}
+        except Exception as e:  # noqa: BLE001
+            log(f"音域分析失败（{path.name}）：{e}")
+            return None
+
+    def model_range(self, model: str) -> Optional[dict]:
+        """模型（训练数据）的音域。缓存在 logs/<exp>/range.json，训完第一次唱歌时现算一次。"""
+        exp = str(model).removesuffix(".pth")
+        log_dir = RVC_ROOT / "logs" / exp
+        cache = log_dir / "range.json"
+        try:
+            if cache.is_file():
+                d = json.loads(cache.read_text(encoding="utf-8"))
+                if d.get("frames", 0) > 0:
+                    return d
+        except Exception:  # noqa: BLE001
+            pass
+        gt = log_dir / "0_gt_wavs"
+        if not gt.is_dir():
+            return None
+        files = sorted(gt.glob("*.wav"))
+        if not files:
+            return None
+        # 隔段采样，覆盖整首歌而不是只听开头
+        step = max(1, len(files) // 8)
+        picked = files[::step][:8]
+        stats = [s for s in (self._f0_stats(f) for f in picked) if s]
+        if not stats:
+            return None
+        merged = {k: sum(s[k] for s in stats) / len(stats) for k in ("p5", "p25", "median", "p95")}
+        merged["frames"] = sum(s["frames"] for s in stats)
+        merged["files"] = len(stats)
+        merged["computedAt"] = time.time()
+        try:
+            cache.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        return merged
+
+    @staticmethod
+    def suggest_pitch(source: Optional[dict], model: Optional[dict]) -> dict:
+        """按低音端（P5）对齐：源曲比模型能唱的更低就往上抬，更高就往下压。"""
+        out = {"pitch": 0, "reason": "", "source": source, "model": model}
+        if not source or not model:
+            out["reason"] = "缺音域数据，保持 0"
+            return out
+        sp, mp = source.get("p5", 0), model.get("p5", 0)
+        if sp <= 0 or mp <= 0:
+            out["reason"] = "音域数据无效，保持 0"
+            return out
+        semi = 12 * math.log2(mp / sp)  # >0：源曲低音低于模型下限
+        if semi > 1.0:
+            pitch = min(6, math.ceil(semi))
+            out["reason"] = f"源曲低音 {sp:.0f}Hz 低于模型下限 {mp:.0f}Hz（差 {semi:.1f} 半音），建议 +{pitch}"
+        elif semi < -1.5:
+            pitch = max(-6, math.floor(semi))
+            out["reason"] = f"源曲低音 {sp:.0f}Hz 高于模型下限 {mp:.0f}Hz（差 {-semi:.1f} 半音），建议 {pitch}"
+        else:
+            pitch = 0
+            out["reason"] = f"音域匹配（差 {semi:.1f} 半音），保持 0"
+        out["pitch"] = pitch
+        return out
+
     def song(self, src: Path, work: Path, *, separate: bool = True, mode: str = "full",
-             pitch: int = 0, index_rate: float = 0.75, protect: float = 0.33,
+             pitch: "int | str" = 0, index_rate: float = 0.75, protect: float = 0.33,
              progress: Optional[Callable[[float, str], None]] = None,
              cancel: Optional[threading.Event] = None) -> dict:
         """
         整首歌：分离 → 换声 → 混音。
         mode: full=带伴奏 / vocals=只要人声（清唱）/ mixed 同 full 但保留中间文件
+        pitch: 半音数；'auto' = 分离后按源曲与模型音域自动推荐。
         """
         cancel = cancel or threading.Event()
         work.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         report = progress or (lambda p, m: None)
+
+        auto_pitch = isinstance(pitch, str) and pitch.strip().lower() == "auto"
+        suggestion: Optional[dict] = None
+        if auto_pitch:
+            pitch = 0
 
         vocal_src = src
         inst = None
@@ -543,6 +625,12 @@ class SingEngine:
                                             progress=lambda p, m: report(p, m))
         else:
             vocal_src = to_wav(src, work / "src.wav")
+
+        if auto_pitch:
+            report(0.15, "分析音域，推荐变调")
+            suggestion = self.suggest_pitch(self._f0_stats(vocal_src), self.model_range(self.model))
+            pitch = int(suggestion["pitch"])
+            log(f"变调推荐：{suggestion['reason']}")
 
         report(0.2, "加载模型" if not self.ready else "开始换声")
         conv = work / "vocals_converted.wav"
@@ -560,7 +648,7 @@ class SingEngine:
             mix_info = self.mix(conv, inst, out)
 
         report(1.0, "完成")
-        return {
+        result = {
             "output": str(out),
             "vocals": str(conv),
             "inst": str(inst) if inst else "",
@@ -569,6 +657,9 @@ class SingEngine:
             "samplerate": mix_info.get("sr", info["sr"]),
             "elapsedSec": round(time.time() - t0, 1),
         }
+        if suggestion is not None:
+            result["pitchSuggest"] = suggestion
+        return result
 
 
 # ---------------------------------------------------------------- 自检

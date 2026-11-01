@@ -68,6 +68,7 @@ import { duration, type FfmpegDeps } from './audio.ts';
 import { Player } from './deliver.ts';
 import { dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
 import { singSong, type SingDeps } from './sing.ts';
+import { notify } from './notify.ts';
 import { WorkerClient } from './worker.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('../ENV_PROMPT.md', import.meta.url));
@@ -291,6 +292,23 @@ export class FishSingWorld implements World {
     return String(this.opts.cfg.send?.token ?? '').trim();
   }
 
+  /** 长任务结果主动说一声：QQ 配了走 QQ（失败退桌宠），没配就桌宠。详见 notify.ts。 */
+  private notifyEvent(title: string, body = ''): Promise<unknown> {
+    return notify(
+      {
+        cfg: this.opts.cfg.notify ?? {},
+        pushEvent: (e) => this.host?.pushEvent(e as never),
+        onebot: { httpUrl: String(this.opts.cfg.send?.httpUrl ?? ''), token: this.onebotToken() },
+        log: this.host?.log ?? { info: () => undefined, warn: () => undefined },
+      },
+      title,
+      body,
+    ).then((r) => {
+      if (r.via !== 'off') this.host?.log.info(`[fish-sing] 通知（${r.via}）：${r.note}`);
+      return r;
+    });
+  }
+
   private deps(): SingDeps {
     const cfg = this.opts.cfg;
     return {
@@ -394,7 +412,7 @@ export class FishSingWorld implements World {
           song: { type: 'string', description: '歌名（可带歌手）、BV 号、B 站链接，或本机音频文件绝对路径' },
           to: { type: 'string', description: 'local / group:<群号> / private:<QQ号> / both；不填按配置默认' },
           mode: { type: 'string', enum: ['full', 'vocals'], description: 'full=带伴奏；vocals=清唱（更容易听出音色）' },
-          pitch: { type: 'number', description: '移调半音；男歌女唱常要 +2~+4，默认 0' },
+          pitch: { type: ['number', 'string'], description: "移调半音；'auto'=按模型音域自动推荐（推荐，默认选项）；男歌女唱常要 +2~+4" },
           indexRate: { type: 'number', description: '音色检索强度 0~1；越大越像本人，0.9 以上咬字可能歪' },
           protect: { type: 'number', description: '气声保护 0~0.5；齿音发毛就调高到 0.4~0.45' },
           start: { type: 'number', description: '从第几秒开始唱（只想唱副歌时用）' },
@@ -423,7 +441,8 @@ export class FishSingWorld implements World {
             song: String(args.song ?? ''),
             to: args.to === undefined ? undefined : String(args.to),
             mode: args.mode === 'vocals' ? 'vocals' : args.mode === 'full' ? 'full' : undefined,
-            pitch: args.pitch === undefined ? undefined : Number(args.pitch),
+            pitch: args.pitch === undefined ? undefined
+              : String(args.pitch).toLowerCase() === 'auto' ? 'auto' : Number(args.pitch),
             indexRate: args.indexRate === undefined ? undefined : Number(args.indexRate),
             protect: args.protect === undefined ? undefined : Number(args.protect),
             start: args.start === undefined ? undefined : Number(args.start),
@@ -963,12 +982,14 @@ export class FishSingWorld implements World {
               this.host?.log.info(`[fish-sing] 已清理中间档：${done.remove.length} 个 / ${done.freedMb} MB`);
             }
           }
+          void this.notifyEvent(`训练完成：${exp}`, `${epochs} 轮全部完成。${job.msg}`);
         })
         .catch((e: unknown) => {
           job.state = 'error';
           job.error = e instanceof Error ? e.message : String(e);
           job.msg = job.error;
           this.host?.log.warn(`[fish-sing] 训练中断：${job.error}`);
+          void this.notifyEvent(`训练中断：${exp}`, job.error);
         });
       return {
         text: `开始训练「${exp}」：${epochs} 轮 / batch ${batch} / ${m.stats.kept} 片${

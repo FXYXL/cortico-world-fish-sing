@@ -16,7 +16,8 @@ export interface SingParams {
   index: string;
   indexRate: number;
   protect: number;
-  pitch: number;
+  /** 半音数；'auto' = worker 分离后按模型音域自动推荐 */
+  pitch: number | 'auto';
   mode: string;
 }
 
