@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.3] - 2026-11-02
+
+### 修复
+- CI 环境缺 setuptools（pyworld 的 pkg_resources 依赖），单测挂。补装。
+
 ## [0.4.2] - 2026-11-02
 
 ### 修复
