@@ -29,8 +29,9 @@ import soundfile as sf
 
 try:
     import pyworld as pw
-except Exception:  # noqa: BLE001
+except Exception as _pw_err:  # noqa: BLE001
     pw = None
+    _PW_IMPORT_ERROR = f"{type(_pw_err).__name__}: {_pw_err}"
 
 AUDIO_EXT = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wma", ".opus"}
 
@@ -282,8 +283,7 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
     if pw is None:
         # 不能静默降级：F0 全填 0 会让音域分档全部变成 unknown，权重功能形同虚设，
         # 但界面上看起来"跑完了"，用户会以为数据正常。
-        raise RuntimeError("缺 pyworld（音域分析要用）。在「安装与运行时」页点「重装」补上，"
-                           "或手动 pip install pyworld")
+        raise RuntimeError(f"缺 pyworld（音域分析要用）：{_PW_IMPORT_ERROR}。手动 pip install pyworld")
 
     t_start = time.time()
     records, src_meta = [], []

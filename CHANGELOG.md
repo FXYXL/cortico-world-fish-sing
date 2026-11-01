@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.2] - 2026-11-02
+
+### 修复
+- CI 上 pyworld 装了但 import 失败导致单测挂：报错信息现在带出真实的 import 异常（之前被静默吞掉），CI 加可导入性诊断步骤。
+
 ## [0.4.1] - 2026-11-02
 
 ### 修复
