@@ -60,6 +60,8 @@ class DatasetSlicing(unittest.TestCase):
             # 音频内容验证：读回来时长要和 manifest 一致
             info = sf.info(str(out / slices[0]["file"]))
             self.assertAlmostEqual(info.duration, slices[0]["dur"], delta=0.05)
+            # 必须是 FLOAT：RVC 训练用 scipy.read 读，整型会被当成天文数字（mel 爆炸）
+            self.assertEqual(info.subtype, "FLOAT", "切片必须是 float wav")
 
     def test_self_check_rejects_empty(self):
         # 直接验证写盘自检：构造一个"声称 3.7s 但只有文件头"的切片 → build 必须报错

@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+import soundfile as sf
+
 RVC_ROOT = Path(os.environ.get("FISHSING_RVC_ROOT", r"D:\AI\rvc"))
 RVC_PY = Path(os.environ.get("FISHSING_RVC_PY", str(RVC_ROOT / "venv" / "Scripts" / "python.exe")))
 FFMPEG = Path(os.environ.get("FISHSING_FFMPEG", r"D:\ffmpeg\bin\ffmpeg.exe"))
@@ -119,6 +121,26 @@ def find_checkpoint(exp: str):
     }
 
 
+def _ensure_float_wav(path: Path) -> None:
+    """
+    把 0_gt_wavs 里的整型 wav 统一转成 float32。
+
+    为什么必须转：RVC 训练用 scipy.io.wavfile.read 读训练音频——PCM_16/24 整型
+    会被读成 ±3万/±838万 的整数（不做归一化），mel 直接炸到 1e11，判别器损失
+    到 1e18，fp16 下变 NaN（0.4.1 之后"新导入的 16 首歌 train 全 NaN"的真凶）。
+    转换顺带断开与数据集切片的硬链接，只影响本实验。
+    """
+    try:
+        info = sf.info(str(path))
+    except Exception:  # noqa: BLE001
+        return
+    if info.subtype == "FLOAT":
+        return
+    tmp = path.with_suffix(".f32tmp.wav")
+    run([FFMPEG, "-y", "-v", "error", "-i", str(path), "-c:a", "pcm_f32le", str(tmp)], "转 float wav")
+    os.replace(tmp, path)
+
+
 def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augment_shifts=None, weights=None):
     """
     建实验目录并把切片铺成 RVC 需要的三层结构。
@@ -170,13 +192,15 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augmen
             dst0 = gt / name
             dst1 = hi / name
             if dst0.exists() and dst1.exists():
+                _ensure_float_wav(dst0)  # 老版本生成的 s16 副本也顺手修
                 continue
             factor = 2 ** (s / 12)
             tempo = 2 ** (-s / 12)
-            # 40k 副本：降调 + 补速度（asetrate 降调会拖长，atempo 拉回来）
+            # 40k 副本：降调 + 补速度（asetrate 降调会拖长，atempo 拉回来）。
+            # 必须 pcm_f32le——训练侧用 scipy 读，整型会被当成天文数字（见 _ensure_float_wav）。
             run([FFMPEG, "-y", "-v", "error", "-i", str(src),
                  "-af", f"asetrate={sr_in}*{factor:.8f},aresample={sr_in},atempo={tempo:.8f}",
-                 "-c:a", "pcm_s16le", str(dst0)], f"低音增强 {s} 半音")
+                 "-c:a", "pcm_f32le", str(dst0)], f"低音增强 {s} 半音")
             # 16k 单声道副本：从 40k 副本重采样（跟原切片同一套流程）
             run([FFMPEG, "-y", "-v", "error", "-i", str(dst0),
                  "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst1)], "重采样 16k")
@@ -194,6 +218,7 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augmen
             except OSError:
                 shutil.copy2(src, dst0)
             added += 1
+        _ensure_float_wav(dst0)  # 整型 wav → float（训练侧 scipy 不归一化整型）
         if not dst1.exists():
             run([FFMPEG, "-y", "-v", "error", "-i", str(src), "-ac", "1", "-ar", "16000",
                  "-c:a", "pcm_s16le", str(dst1)], "重采样 16k")
@@ -283,6 +308,10 @@ def expand_aug_weights(weights: dict, augment_shifts: list) -> dict:
     shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
     if not shifts or not weights:
         return weights or {}
+    # 源权重全是 1x 时不该造副本权重：会得到一堆 0.333 的"全均匀"权重表，
+    # 白白激活加权采样路径（0.4.0 夜里的事故现场）。
+    if all(abs(float(v) - 1.0) <= 1e-9 for v in weights.values()):
+        return dict(weights)
     div = len(shifts) + 1
     expanded = dict(weights)
     for s in shifts:

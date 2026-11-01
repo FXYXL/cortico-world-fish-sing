@@ -378,7 +378,10 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             name = f"{i:02d}_{j:03d}.wav"
             rel = f"slices/{name}"
             if drop is None:
-                sf.write(str(out / rel), seg40, OUT_SR, subtype="PCM_24")
+                # 必须写 FLOAT：RVC 训练用 scipy.io.wavfile.read 读 0_gt_wavs，
+                # PCM_16/24 整型会被读成 ±3万/±838万 的整数（不归一化）→ mel 爆炸
+                # → 判别器损失 1e18 → fp16 训练 NaN（0.4.1 之后的真实事故）。
+                sf.write(str(out / rel), seg40, OUT_SR, subtype="FLOAT")
                 written.append((out / rel, dur))
 
             records.append({

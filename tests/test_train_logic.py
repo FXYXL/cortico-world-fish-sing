@@ -31,6 +31,11 @@ class ExpandAugWeights(unittest.TestCase):
         self.assertEqual(trainer.expand_aug_weights(None, [-2]), {})
         self.assertEqual(trainer.expand_aug_weights({"a.wav": 2.0}, []), {"a.wav": 2.0})
 
+    def test_all_unit_weights_not_expanded(self):
+        # 全 1x 源权重：不该造副本权重表（否则会写出全 0.333 的伪加权表）
+        e = trainer.expand_aug_weights({"a.wav": 1.0}, [-2, -4])
+        self.assertEqual(e, {"a.wav": 1.0})
+
     def test_zero_shift_ignored(self):
         # 0 半音不是有效副本：[-2] 只有 1 个副本 → 3x 源片摊薄为 3/2
         e = trainer.expand_aug_weights({"a.wav": 3.0}, [0, -2])
