@@ -27,7 +27,8 @@ export interface FishSingConfigSection {
     index: string;
     indexRate: number;
     protect: number;
-    pitch: number;
+    /** 半音数；'auto' = 每次按源曲与模型音域自动推荐 */
+    pitch: number | 'auto';
     /** full = 带伴奏；vocals = 只要人声 */
     mode: 'full' | 'vocals';
   };
@@ -95,7 +96,7 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     index: 'logs/dfy2/added_IVF2529_Flat_nprobe_1_dfy2_v2.index',
     indexRate: 0.75,
     protect: 0.33,
-    pitch: 0,
+    pitch: 'auto',
     mode: 'full',
   },
   play: {
@@ -176,11 +177,9 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             'x-hot': true,
           },
           [at('voice.pitch')]: {
-            type: 'number',
-            title: '默认移调（半音）',
-            description: '男歌女唱常要 +2 ~ +4。会连带改变音色（升调后更薄）。',
-            minimum: -12,
-            maximum: 12,
+            type: ['number', 'string'],
+            title: '默认移调（半音）或 auto',
+            description: "填 'auto' = 每首歌按源曲与模型音域自动推荐（默认，推荐）。填数字 = 固定移调；男歌女唱常要 +2 ~ +4。",
             'x-hot': true,
           },
           [at('voice.mode')]: {

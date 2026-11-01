@@ -337,7 +337,7 @@ export class FishSingWorld implements World {
         index: this.current.index,
         indexRate: Number(cfg.voice?.indexRate ?? 0.75),
         protect: Number(cfg.voice?.protect ?? 0.33),
-        pitch: Number(cfg.voice?.pitch ?? 0),
+        pitch: (cfg.voice?.pitch as number | 'auto' | undefined) ?? 'auto',
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
     };
@@ -412,7 +412,7 @@ export class FishSingWorld implements World {
           song: { type: 'string', description: '歌名（可带歌手）、BV 号、B 站链接，或本机音频文件绝对路径' },
           to: { type: 'string', description: 'local / group:<群号> / private:<QQ号> / both；不填按配置默认' },
           mode: { type: 'string', enum: ['full', 'vocals'], description: 'full=带伴奏；vocals=清唱（更容易听出音色）' },
-          pitch: { type: ['number', 'string'], description: "移调半音；'auto'=按模型音域自动推荐（推荐，默认选项）；男歌女唱常要 +2~+4" },
+          pitch: { type: ['number', 'string'], description: "移调半音；不填或 'auto' = 按模型音域自动推荐（默认）；男歌女唱常要 +2~+4" },
           indexRate: { type: 'number', description: '音色检索强度 0~1；越大越像本人，0.9 以上咬字可能歪' },
           protect: { type: 'number', description: '气声保护 0~0.5；齿音发毛就调高到 0.4~0.45' },
           start: { type: 'number', description: '从第几秒开始唱（只想唱副歌时用）' },

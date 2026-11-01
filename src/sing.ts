@@ -223,7 +223,10 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     index: deps.voice.index,
     indexRate: Number(req.indexRate ?? deps.voice.indexRate),
     protect: Number(req.protect ?? deps.voice.protect),
-    pitch: req.pitch === 'auto' ? 'auto' : Number(req.pitch ?? deps.voice.pitch),
+    // 不传 pitch = 按配置默认（配置默认 'auto' = 按音域自动推荐）
+    pitch: req.pitch === undefined || req.pitch === 'auto'
+      ? (deps.voice.pitch ?? 'auto')
+      : Number(req.pitch),
     mode: req.mode ?? deps.voice.mode,
   };
 
@@ -276,6 +279,8 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       info = job.result ?? {};
       const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
       if (suggest?.reason) deps.log.info(`变调推荐：${suggest.reason}`);
+      // 库里记实际用的半音数（'auto' 已在 worker 里落成具体值）
+      if (suggest && params.pitch === 'auto') params.pitch = suggest.pitch;
       const raw = String(info.output ?? '');
       if (!raw) throw new Error('worker 没给出输出文件');
 
