@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.5] - 2026-11-02
+
+### 修复
+- CI 的 ubuntu runner 不再预装 ffmpeg，load_mono 解码起不来。补 apt 安装步骤。
+
 ## [0.4.4] - 2026-11-02
 
 ### 修复

@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: 装 ffmpeg（load_mono 解码要用）
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: 装轻量依赖（numpy/soundfile，引擎测试用）
         run: pip install numpy soundfile pyworld "setuptools<81"
       - name: 语法检查 worker
