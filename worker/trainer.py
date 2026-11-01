@@ -144,9 +144,14 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augmen
     hi.mkdir(exist_ok=True)
 
     shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
-    slices = sorted((dataset_dir / "slices").glob("*.wav"))
+    # 防御：空壳切片（<1KB）是数据准备事故的残留，混进来会让特征提取全灭
+    all_slices = sorted((dataset_dir / "slices").glob("*.wav"))
+    slices = [s for s in all_slices if s.stat().st_size > 1000]
+    skipped_shells = len(all_slices) - len(slices)
+    if skipped_shells:
+        log(f"警告：跳过 {skipped_shells} 个空壳切片（<1KB，数据准备异常的残留）")
     if not slices:
-        raise RuntimeError(f"{dataset_dir / 'slices'} 里没有切片，先跑数据准备")
+        raise RuntimeError(f"{dataset_dir / 'slices'} 里没有可用的切片（全是空壳或目录不存在），重新跑一次数据准备")
     total = len(slices)
     log(f"切片 {total} 个 → {exp_dir}" + (f"，低音增强 {shifts}" if shifts else ""))
 

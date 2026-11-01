@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: 装轻量依赖（numpy/soundfile，引擎测试用）
-        run: pip install numpy soundfile
+        run: pip install numpy soundfile pyworld
       - name: 语法检查 worker
         run: python -m py_compile worker/*.py
       - name: 单元测试

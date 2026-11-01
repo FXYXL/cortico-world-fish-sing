@@ -287,6 +287,7 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
 
     t_start = time.time()
     records, src_meta = [], []
+    written: list = []  # (路径, 期望时长秒)——写完自检用
     n = len(usable)
 
     for i0, s in enumerate(usable):
@@ -339,9 +340,10 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             log(f"没找到有效人声段：{label}")
             continue
 
-        # 40k 版本用于写盘，按时间片取（与 16k 分析结果对齐）
+        # 40k 版本用于写盘，按时间片取（与 16k 分析结果对齐）。
+        # 段边界是「秒」，换算成 40k 域的样本必须乘 OUT_SR——
+        # 之前写成 ×(OUT_SR/16000)=2.5，2.87 秒的段只切出 7 帧（0.4.0 事故）。
         y40 = load_mono(vocal_wav, OUT_SR)
-        ratio = OUT_SR / 16000
 
         for j, (t0, t1) in enumerate(segs):
             if cancel.is_set():
@@ -354,8 +356,8 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             f0_med, f0_p90, vratio = f0_stats(seg16, 16000)
             dur = (p1 - p0) / 16000
 
-            q0 = max(0, int(t0 * ratio))
-            q1 = min(y40.size, int(t1 * ratio))
+            q0 = max(0, int(t0 * OUT_SR))
+            q1 = min(y40.size, int(t1 * OUT_SR))
             seg40 = y40[q0:q1]
             if seg40.size == 0:
                 continue
@@ -377,6 +379,7 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             rel = f"slices/{name}"
             if drop is None:
                 sf.write(str(out / rel), seg40, OUT_SR, subtype="PCM_24")
+                written.append((out / rel, dur))
 
             records.append({
                 "file": rel,
@@ -394,6 +397,25 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             })
 
         progress(0.02 + 0.5 * ((i0 + 1) / n), f"已处理 {i0 + 1}/{n}：{label[:28]}")
+
+    # ---- 写盘自检：PCM_24 单声道 40k ≈ 120 KB/秒，明显小于预期就是坏片。
+    # 没有这道闸，空壳切片会流进训练，到特征提取阶段以"没有可用的训练样本"
+    # 这种更隐晦的方式爆炸（0.4.0 夜里 ds-20261102-0035 的真实事故）。
+    bad = []
+    for path, dur in written:
+        expect = int(dur * OUT_SR * 3)  # PCM_24 单声道字节数
+        try:
+            actual = path.stat().st_size
+        except OSError:
+            actual = 0
+        if actual < expect * 0.5:
+            bad.append((path, actual, expect))
+    if bad:
+        p0, a0, e0 = bad[0]
+        raise RuntimeError(
+            f"切片自检失败：{len(bad)}/{len(written)} 片大小异常（如 {p0.name} 只有 {a0} 字节，"
+            f"预期约 {e0}）。可能是源文件损坏或磁盘写入异常，已中止，别拿这份数据训练。"
+        )
 
     progress(0.55, "统计音域分布")
     records = old_records + records
