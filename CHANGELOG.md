@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.4] - 2026-11-02
+
+### 修复
+- CI 的 setuptools 锁到 <81：setuptools 81 起移除了 pkg_resources，而 pyworld 还依赖它。
+
 ## [0.4.3] - 2026-11-02
 
 ### 修复
