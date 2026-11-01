@@ -14,7 +14,7 @@
  *  · 任何一步失败都返回 ok:false 并带上真实原因——她要能对用户说人话；
  *  · 进度通过 log 输出，工具调用本身是同步等待的（Coo 侧不需要知道细节）。
  */
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 
 import { audioUrlOf, download, extractBvid, isBvid, rankHits, searchBili, type SearchHit, type SearchOrder } from './bili.ts';
@@ -84,6 +84,43 @@ function stamp(): string {
   const d = new Date();
   const p = (n: number): string => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/**
+ * 调用端超时断开后，worker 里的任务可能还在往工作目录写——立刻删会报
+ * 「vocals.wav 打不开」并把任务搞死。改成：等任务落到终态（最多 10 分钟）再删。
+ */
+function scheduleTmpCleanup(worker: WorkerClient, jobId: string | null, root: string): void {
+  void (async () => {
+    for (let i = 0; i < 120; i += 1) {
+      const j = jobId ? await worker.jobState(jobId).catch(() => null) : null;
+      if (!j || !['queued', 'running'].includes(j.state)) break;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* 被占用就算了，24 小时的兜底清扫会收走 */
+    }
+  })();
+}
+
+/** 兜底清扫：删掉超过 24 小时的临时目录（覆盖「清理也失败」的漏网之鱼）。 */
+function sweepStaleTmp(base: string): void {
+  try {
+    if (!existsSync(base)) return;
+    const cutoff = Date.now() - 24 * 3600_000;
+    for (const name of readdirSync(base)) {
+      const p = join(base, name);
+      try {
+        if (statSync(p).mtimeMs < cutoff) rmSync(p, { recursive: true, force: true });
+      } catch {
+        /* 单个删不掉就留给下次 */
+      }
+    }
+  } catch {
+    /* 清扫是尽力而为 */
+  }
 }
 
 /** 来源解析结果。sourceId 用来算缓存键：BV 用 bvid，本地文件用路径+mtime+size。 */
@@ -234,6 +271,9 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
 
   const root = join(deps.data.dataDir, 'tmp', `${stamp()}-${Math.random().toString(36).slice(2, 6)}`);
   mkdirSync(root, { recursive: true });
+  sweepStaleTmp(join(deps.data.dataDir, 'tmp'));
+  let jobId: string | null = null;
+  let done = false;
 
   try {
     // ---- 1. 来源
@@ -260,7 +300,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       }
 
       // ---- 4. 换声
-      const jobId = await deps.worker.submit('song', {
+      jobId = await deps.worker.submit('song', {
         input: feed,
         work: join(root, 'work'),
         separate: !src.alreadyVocal,
@@ -353,6 +393,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
+    done = true;  // 走到这里任务已落终态，finally 里可以安全清理
     const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
     const autoNote = params.pitch === 'auto' && suggest
       ? `；变调 ${suggest.pitch >= 0 ? '+' : ''}${suggest.pitch}（${suggest.reason}）`
@@ -374,11 +415,16 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     deps.log.warn(`唱歌失败：${msg}`);
     return { ok: false, message: `没唱成：${msg}` };
   } finally {
-    // 中间产物清掉；成品在 cache/library 里各有一份
-    try {
-      rmSync(root, { recursive: true, force: true });
-    } catch {
-      /* 被占用就留着，下次启动可以清 */
+    if (done) {
+      // 正常结束：中间产物清掉；成品在 cache/library 里各有一份
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        /* 被占用就留给 24h 清扫 */
+      }
+    } else {
+      // 失败/超时：worker 里的任务可能还在写这个目录，等它落终态再删
+      scheduleTmpCleanup(deps.worker, jobId, root);
     }
   }
 }

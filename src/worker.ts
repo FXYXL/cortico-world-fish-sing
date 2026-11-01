@@ -63,6 +63,13 @@ export class WorkerClient {
   private starting: Promise<void> | null = null;
   /** 上次拉起的时间戳，防止「起不来 → 每次调用都重试 → 疯狂 spawn」。 */
   private lastSpawnAt = 0;
+  // -- 看门狗（0.1.9）：意外退出自动拉起 --------------------------------
+  /** Coo 退出时置位，看门狗不再拉起。 */
+  private stopRequested = false;
+  /** 连续崩溃计数；稳定跑满 5 分钟就清零。 */
+  private crashCount = 0;
+  private startedAt = 0;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: WorkerOptions, log: LoggerLike) {
     this.opts = opts;
@@ -102,13 +109,14 @@ export class WorkerClient {
     this.opts = { ...this.opts, ...patch };
   }
 
-  async ensure(): Promise<void> {
+  async ensure(opts?: { force?: boolean }): Promise<void> {
     if (await this.health()) return;
     if (!this.opts.autoStart) {
       throw new Error(`worker 没在跑（${this.baseUrl}），而「自动拉起」是关的。先手动起：${this.opts.pythonPath} worker\\server.py`);
     }
     if (this.starting) return this.starting;
-    if (Date.now() - this.lastSpawnAt < 8000) {
+    // 看门狗的重试绕过这个防抖（它自己已经做了指数退避）
+    if (!opts?.force && Date.now() - this.lastSpawnAt < 8000) {
       throw new Error('worker 刚启动还没就绪，稍等一两秒再试');
     }
     this.lastSpawnAt = Date.now();
@@ -161,6 +169,7 @@ export class WorkerClient {
     child.once('exit', (code) => {
       this.log.warn(`worker 退出（code=${code}）`);
       if (this.child === child) this.child = null;
+      this.maybeRestart();
     });
     this.child = child;
 
@@ -175,6 +184,7 @@ export class WorkerClient {
         // 只要服务在监听就算就绪：engine 可能是关预热（FISHSING_NO_WARMUP=1）的，
         // 那种情况下模型由 run_job 在真正要唱歌时再加载。
         if (h?.ok) {
+          this.startedAt = Date.now();
           const e = h.engine;
           this.log.info(e?.ready
             ? `worker 就绪：${e.model}（加载 ${e.loadMs} ms）`
@@ -190,6 +200,28 @@ export class WorkerClient {
       };
       setTimeout(() => void tick(), 1200);
     });
+  }
+
+  /**
+   * 看门狗：worker 意外退出时自动拉起，指数退避（5s → 60s 封顶）。
+   * 稳定跑满 5 分钟就清零崩溃计数；连崩 5 次放弃，避免「起不来 → 无限重启」刷日志。
+   * 只在 Coo 退出（shutdown）时静默，配置里「自动拉起」关掉也不插手。
+   */
+  private maybeRestart(): void {
+    if (this.stopRequested || !this.opts.autoStart) return;
+    const ranMs = this.startedAt ? Date.now() - this.startedAt : 0;
+    this.crashCount = ranMs >= 5 * 60_000 ? 1 : this.crashCount + 1;
+    if (this.crashCount > 5) {
+      this.log.error('worker 连续退出 5 次都没站稳，不再自动拉起（避免无限重启）。修好环境后重启 Coo。');
+      return;
+    }
+    const delay = Math.min(60_000, 5000 * 2 ** (this.crashCount - 1));
+    this.log.info(`看门狗：${Math.round(delay / 1000)} 秒后自动拉起 worker（第 ${this.crashCount} 次）`);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (this.stopRequested) return;
+      this.ensure({ force: true }).catch((e) => this.log.warn(`看门狗拉起失败：${e instanceof Error ? e.message : String(e)}`));
+    }, delay);
   }
 
   /** worker 里正在跑的任务（重启后靠它重新接管训练）。没有返回 null。 */
@@ -270,6 +302,17 @@ export class WorkerClient {
     }
   }
 
+  /** 查单个任务的状态（失败清理要用：调用端超时了，worker 里的任务可能还在跑）。 */
+  async jobState(id: string): Promise<JobState | null> {
+    try {
+      const res = await fetch(`${this.baseUrl}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
+      return body.job ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async cancel(): Promise<void> {
     try {
       await fetch(`${this.baseUrl}/stop`, {
@@ -285,6 +328,11 @@ export class WorkerClient {
 
   /** Coo 退出时把常驻进程收掉，不留孤儿占显存。 */
   shutdown(): void {
+    this.stopRequested = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     if (!this.child) return;
     try {
       this.child.kill();
