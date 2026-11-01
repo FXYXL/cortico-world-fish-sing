@@ -335,7 +335,8 @@ function mountSetup(ctx) {
   if (!document.getElementById(SETUP_STYLE_ID)) {
     const style = document.createElement('style');
     style.id = SETUP_STYLE_ID;
-    style.textContent = SETUP_CSS;
+    // 前置共享底座（fs-bar/fs-btn/fs-meta…原本只在作品库样式里，导致别的页首进无样式）
+    style.textContent = CSS + SETUP_CSS;
     document.head.append(style);
   }
 
@@ -509,7 +510,7 @@ function mountModels(ctx) {
   if (!document.getElementById(MODELS_STYLE_ID)) {
     const style = document.createElement('style');
     style.id = MODELS_STYLE_ID;
-    style.textContent = MODELS_CSS;
+    style.textContent = CSS + MODELS_CSS;
     document.head.append(style);
   }
 
@@ -710,7 +711,7 @@ function mountTrain(ctx) {
   if (!document.getElementById(TRAIN_STYLE_ID)) {
     const style = document.createElement('style');
     style.id = TRAIN_STYLE_ID;
-    style.textContent = TRAIN_CSS;
+    style.textContent = CSS + TRAIN_CSS;
     document.head.append(style);
   }
 
