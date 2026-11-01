@@ -525,11 +525,17 @@ class SingEngine:
 
     # -- 音域与变调推荐 ---------------------------------------------
 
-    def _f0_stats(self, path: Path) -> Optional[dict]:
-        """一段人声的音域统计。分析失败或人声太少返回 None。"""
+    def _f0_stats(self, path: "Path | str", *, max_sec: float = 90.0) -> Optional[dict]:
+        """一段人声的音域统计。只分析中段 90 秒——整首跑 pyin 要 40 秒，会把唱歌调用顶超时。"""
+        path = Path(path)
         try:
             import librosa
-            y, sr = librosa.load(str(path), sr=16000, mono=True)
+            dur = librosa.get_duration(path=str(path))
+            if dur > max_sec:
+                offset = (dur - max_sec) / 2
+                y, sr = librosa.load(str(path), sr=16000, mono=True, offset=offset, duration=max_sec)
+            else:
+                y, sr = librosa.load(str(path), sr=16000, mono=True)
             f0, vflag, _ = librosa.pyin(y, fmin=80.0, fmax=800.0, sr=sr, frame_length=1024)
             v = f0[vflag & ~np.isnan(f0)]
             if v.size < 50:
@@ -576,7 +582,11 @@ class SingEngine:
 
     @staticmethod
     def suggest_pitch(source: Optional[dict], model: Optional[dict]) -> dict:
-        """按低音端（P5）对齐：源曲比模型能唱的更低就往上抬，更高就往下压。"""
+        """保守策略：只对明显出音域的源（男声原调）移调，女声源一律 0。
+
+        实测教训（0.1.5）：按 P5 精确对齐会给女声源推 +6，移调带来的音色损失
+        比低音区稍微出格更伤——模型对数据下限以下有泛化能力，8 个半音以内都兜得住。
+        """
         out = {"pitch": 0, "reason": "", "source": source, "model": model}
         if not source or not model:
             out["reason"] = "缺音域数据，保持 0"
@@ -585,16 +595,16 @@ class SingEngine:
         if sp <= 0 or mp <= 0:
             out["reason"] = "音域数据无效，保持 0"
             return out
-        semi = 12 * math.log2(mp / sp)  # >0：源曲低音低于模型下限
-        if semi > 1.0:
-            pitch = min(6, math.ceil(semi))
-            out["reason"] = f"源曲低音 {sp:.0f}Hz 低于模型下限 {mp:.0f}Hz（差 {semi:.1f} 半音），建议 +{pitch}"
-        elif semi < -1.5:
-            pitch = max(-6, math.floor(semi))
-            out["reason"] = f"源曲低音 {sp:.0f}Hz 高于模型下限 {mp:.0f}Hz（差 {-semi:.1f} 半音），建议 {pitch}"
+        semi = 12 * math.log2(mp / sp)  # >0：源曲低音比模型数据下限低
+        if semi > 8:
+            pitch = min(6, math.ceil(semi - 8))
+            out["reason"] = f"源曲低音 {sp:.0f}Hz 比模型数据下限低 {semi:.1f} 半音（男声原调区间），建议 +{pitch}"
+        elif semi < -8:
+            pitch = max(-3, math.floor(semi + 8))
+            out["reason"] = f"源曲比模型数据高 {(-semi):.1f} 半音，建议 {pitch}"
         else:
             pitch = 0
-            out["reason"] = f"音域匹配（差 {semi:.1f} 半音），保持 0"
+            out["reason"] = f"源曲低音 {sp:.0f}Hz 比模型数据下限低 {max(0.0, semi):.1f} 半音，在模型可覆盖范围内（8 半音才移调），保持 0"
         out["pitch"] = pitch
         return out
 
