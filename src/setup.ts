@@ -5,7 +5,7 @@
  * 面板要的是结构化的进度（百分比 + 一句话）。所以这里重新实现一遍，只共用清单文件。
  */
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   cpSync,
   createWriteStream,
@@ -73,6 +73,73 @@ export function findSystemPython(): string {
     : ['python3', 'python'];
   // 只做存在性检查：真正能不能用要跑一次才知道，交给装的时候验证
   return cands[0];
+}
+
+/** 一个可用的系统解释器：exe + 附加参数（py 启动器要带 -3）。 */
+export interface SystemPython { exe: string; args: string[] }
+
+function pyVersion(exe: string, args: string[]): string | null {
+  // 真跑一次：PATH 上的 python 可能是 WindowsApps 的商店假alias（退出码 9009），
+  // 也可能版本太老装不了 torch 的 wheel。光看存在性会把它放过去。
+  try {
+    const r = spawnSync(exe, [...args, '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'], {
+      timeout: 20_000, encoding: 'utf8', windowsHide: true,
+    });
+    const out = (r.stdout || '').trim();
+    if (r.status !== 0 || !out) return null;
+    const m = /^(\d+)\.(\d+)/.exec(out);
+    if (!m) return null;
+    const minor = Number(m[2]);
+    // torch 2.7.1 的 wheel 覆盖 3.9~3.13；太老太新都装不上
+    if (Number(m[1]) !== 3 || minor < 9 || minor > 13) return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 真正可用的系统 Python：逐个候选跑 `-c` 验证版本，找不到就给人话。
+ *
+ * 实战教训（0.1.7 反馈）：之前恒返回裸 'python'，对方 PATH 上没有 python，
+ * 重装运行时直接 9009——而 venv 是「先删旧的再建新的」，删完建失败，
+ * 运行时就处于半卸载状态，之后所有子进程 spawn 全是 WinError 2。
+ */
+export function resolveSystemPython(report: Progress): SystemPython {
+  const cands: SystemPython[] = [];
+  if (process.platform === 'win32') {
+    cands.push({ exe: 'python', args: [] }, { exe: 'python3', args: [] }, { exe: 'py', args: ['-3'] });
+    // PATH 上没有的机器很多，扫常见安装位置
+    const localApp = process.env.LOCALAPPDATA ?? '';
+    for (const base of [join(localApp, 'Programs', 'Python'), 'C:\\']) {
+      try {
+        if (!base || !existsSync(base)) continue;
+        for (const name of readdirSync(base)) {
+          if (/^Python3(9|1[0-3])/.test(name)) {
+            const exe = join(base, name, 'python.exe');
+            if (existsSync(exe)) cands.push({ exe, args: [] });
+          }
+        }
+      } catch { /* 没权限就跳过 */ }
+    }
+  } else {
+    cands.push({ exe: 'python3', args: [] }, { exe: 'python', args: [] });
+  }
+  const seen = new Set<string>();
+  for (const c of cands) {
+    const key = `${c.exe}|${c.args.join(' ')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ver = pyVersion(c.exe, c.args);
+    if (ver) {
+      report(0, `找到可用的 Python ${ver}：${c.exe}`);
+      return c;
+    }
+  }
+  throw new Error(
+    '没找到可用的 Python（需要 3.9 ~ 3.13）。请先安装 Python（python.org 下载，安装时勾选 '
+    + '"Add python.exe to PATH"），装完回到控制台再点一次「安装运行时」。',
+  );
 }
 
 export function inspect(paths: WorkerPaths): SetupStatus {
@@ -304,7 +371,7 @@ export type RuntimeMode = 'gpu' | 'cpu';
 export async function installRuntime(
   paths: WorkerPaths,
   mode: RuntimeMode,
-  systemPython: string,
+  systemPython: SystemPython,
   report: Progress,
   signal: AbortSignal,
 ): Promise<void> {
@@ -312,10 +379,29 @@ export async function installRuntime(
   const py = join(venvDir, 'Scripts', 'python.exe');
 
   if (!existsSync(py)) {
-    report(1, `创建 venv（${systemPython}）`);
-    if (existsSync(venvDir)) rmSync(venvDir, { recursive: true, force: true });
-    await run(systemPython, ['-m', 'venv', venvDir], () => {}, signal);
-    if (!existsSync(py)) throw new Error('venv 建好了但找不到 python.exe，检查系统 python 是否可用');
+    report(1, `创建 venv（${systemPython.exe}）`);
+    // 原子替换：建到 venv.new，成功了才让旧的让位。
+    // 之前是「先删旧再建新」，建失败（比如系统没有 python）就只剩半卸载的运行时，
+    // 之后所有子进程 spawn 全是 WinError 2（0.1.7 用户反馈的真实事故）。
+    const venvNew = `${venvDir}.new`;
+    const venvOld = `${venvDir}.old`;
+    rmSync(venvNew, { recursive: true, force: true });
+    try {
+      await run(systemPython.exe, [...systemPython.args, '-m', 'venv', venvNew], () => {}, signal);
+      const newPy = join(venvNew, 'Scripts', process.platform === 'win32' ? 'python.exe' : 'python');
+      if (!existsSync(newPy)) throw new Error('venv 建好了但找不到 python.exe，检查系统 python 是否可用');
+      rmSync(venvOld, { recursive: true, force: true });
+      if (existsSync(venvDir)) renameSync(venvDir, venvOld);
+      try {
+        renameSync(venvNew, venvDir);
+      } catch (e) {
+        if (existsSync(venvOld)) renameSync(venvOld, venvDir);  // 换失败就把旧的还回去
+        throw e;
+      }
+    } finally {
+      rmSync(venvNew, { recursive: true, force: true });
+      rmSync(venvOld, { recursive: true, force: true });
+    }
   }
 
   const pipIndex = 'https://mirrors.pku.edu.cn/pypi/simple';

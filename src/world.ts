@@ -56,7 +56,7 @@ import { BUNDLED_SEPARATE, LEGACY_RVC_ROOTS, MODELS_MANIFEST, PKG_ROOT, resolveP
 import {
   copyRvcCode,
   downloadModels,
-  findSystemPython,
+  resolveSystemPython,
   inspect,
   installRuntime,
   loadManifest,
@@ -1183,8 +1183,8 @@ export class FishSingWorld implements World {
 
       if (what === 'runtime-gpu' || what === 'runtime-cpu') {
         const mode: RuntimeMode = what === 'runtime-gpu' ? 'gpu' : 'cpu';
-        const sysPy = findSystemPython();
         this.startSetupJob('runtime', async (signal, report) => {
+          const sysPy = resolveSystemPython(report);
           if (!existsSync(join(this.routes.rvcRoot, 'infer', 'cli.py'))) copyRvcCode(this.routes, VENDORED_RVC);
           await installRuntime(this.routes, mode, sysPy, report, signal);
         });
