@@ -119,12 +119,16 @@ def find_checkpoint(exp: str):
     }
 
 
-def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True):
+def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augment_shifts=None, weights=None):
     """
     建实验目录并把切片铺成 RVC 需要的三层结构。
 
     - 0_gt_wavs：40k 原样（训练时读它算 mel）
     - 1_16k_wavs：16k 单声道（F0 和 ContentVec 都只认这个）
+
+    augment_shifts：低音增强。给每个切片用 ffmpeg asetrate+atempo 合成降调副本
+    （如 [-2, -4] = 各降 2/4 个半音），一起铺进两层——模型由此学到低音区的音色映射。
+    副本命名 aug<shift>_<原名>.wav；weights 里的同名权重会按副本数摊薄（见 train_run）。
     """
     exp_dir = exp_dir_of(exp)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -139,11 +143,39 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True):
     gt.mkdir(exist_ok=True)
     hi.mkdir(exist_ok=True)
 
+    shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
     slices = sorted((dataset_dir / "slices").glob("*.wav"))
     if not slices:
         raise RuntimeError(f"{dataset_dir / 'slices'} 里没有切片，先跑数据准备")
     total = len(slices)
-    log(f"切片 {total} 个 → {exp_dir}")
+    log(f"切片 {total} 个 → {exp_dir}" + (f"，低音增强 {shifts}" if shifts else ""))
+
+    aug_made = 0
+
+    def lay_augmented(src: Path) -> None:
+        """合成 src 的降调副本，铺进 0_gt/1_16k 两层。ffmpeg 子进程，不占 GIL。"""
+        nonlocal aug_made
+        try:
+            import soundfile as sf
+            sr_in = sf.info(str(src)).samplerate
+        except Exception:  # noqa: BLE001
+            sr_in = 40000
+        for s in shifts:
+            name = f"aug{s}_{src.name}"
+            dst0 = gt / name
+            dst1 = hi / name
+            if dst0.exists() and dst1.exists():
+                continue
+            factor = 2 ** (s / 12)
+            tempo = 2 ** (-s / 12)
+            # 40k 副本：降调 + 补速度（asetrate 降调会拖长，atempo 拉回来）
+            run([FFMPEG, "-y", "-v", "error", "-i", str(src),
+                 "-af", f"asetrate={sr_in}*{factor:.8f},aresample={sr_in},atempo={tempo:.8f}",
+                 "-c:a", "pcm_s16le", str(dst0)], f"低音增强 {s} 半音")
+            # 16k 单声道副本：从 40k 副本重采样（跟原切片同一套流程）
+            run([FFMPEG, "-y", "-v", "error", "-i", str(dst0),
+                 "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst1)], "重采样 16k")
+            aug_made += 1
 
     added = 0
     for i, src in enumerate(slices):
@@ -160,9 +192,17 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True):
         if not dst1.exists():
             run([FFMPEG, "-y", "-v", "error", "-i", str(src), "-ac", "1", "-ar", "16000",
                  "-c:a", "pcm_s16le", str(dst1)], "重采样 16k")
+        if shifts:
+            lay_augmented(src)
         if i % 50 == 0 or i == total - 1:
-            progress(0.02 + 0.06 * ((i + 1) / total), f"铺切片 {i + 1}/{total}")
-    log(f"新增 {added} 个（已存在的跳过）")
+            progress(0.02 + 0.06 * ((i + 1) / total), f"铺切片 {i + 1}/{total}" + (f"（增强 {aug_made}）" if shifts else ""))
+    log(f"新增 {added} 个（已存在的跳过）" + (f"，低音增强副本 {aug_made} 个" if shifts else ""))
+
+    if shifts:
+        (exp_dir / "aug_manifest.json").write_text(
+            json.dumps({"shifts": shifts, "created": aug_made, "slices": total}, ensure_ascii=False),
+            encoding="utf8",
+        )
     return exp_dir
 
 
@@ -234,10 +274,24 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
     """
     完整流水线。params:
       epochs / batch / saveEvery / resume(bool) / fromG / fromD / rebuild(bool)
+      augmentShifts([int])：低音增强，如 [-2, -4]（合成降调副本，见 prepare）
     """
     t0 = time.time()
-    exp_dir = prepare(exp, Path(dataset_dir), progress, cancel)
+    augment_shifts = [int(s) for s in (params.get("augmentShifts") or [])]
+    exp_dir = prepare(exp, Path(dataset_dir), progress, cancel,
+                      augment_shifts=augment_shifts, weights=weights)
     total = count_files(exp_dir / "0_gt_wavs", ".wav")
+
+    # 增强副本继承源切片权重，但按「源 + 副本」的总份数摊薄：
+    # 低音 3x 的源片 + 2 个副本 → 各 1x，总重要度还是 3x，材料时长翻了 3 倍。
+    if augment_shifts and weights:
+        div = len(augment_shifts) + 1
+        expanded = dict(weights)
+        for s in augment_shifts:
+            for k, v in weights.items():
+                expanded[f"aug{s}_{k}"] = float(v) / div
+        weights = expanded
+        log(f"权重已扩展到增强副本（÷{div}）")
 
     rebuild = bool(params.get("rebuild", False))
 

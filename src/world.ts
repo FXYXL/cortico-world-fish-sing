@@ -990,6 +990,8 @@ export class FishSingWorld implements World {
         pruneAfter?: boolean;
         /** 训练完生成选模对比试听（默认开） */
         abTest?: boolean;
+        /** 低音增强：合成 -2/-4 半音低音数据（默认开） */
+        augment?: boolean;
         keepEvery?: number;
       };
       const dir = this.datasetJob?.dir;
@@ -1040,6 +1042,8 @@ export class FishSingWorld implements World {
           saveEvery,
           resume: cfg.resume === true,
           rebuild: cfg.rebuild === true,
+          // 低音增强：-2/-4 半音各合成一份低音数据，副本权重按份数摊薄（见 trainer.prepare）
+          augmentShifts: cfg.augment === false ? [] : [-2, -4],
           weightMap,
         });
         job.id = id;
