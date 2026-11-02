@@ -1461,7 +1461,9 @@ function mountTrain(ctx) {
   stopT.addEventListener('click', async () => {
     stopT.disabled = true;
     try {
-      await call('trainStop', []);
+      const r = await call('trainStop', []);
+      // 把 world 的实话显示出来：真停了 / 没停住 都要看得见
+      if (r && r.text) say(r.text, !/^已停止/.test(String(r.text)));
     } catch {
       /* 已显示 */
     }

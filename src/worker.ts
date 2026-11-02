@@ -313,16 +313,28 @@ export class WorkerClient {
     }
   }
 
-  async cancel(): Promise<void> {
+  async cancel(): Promise<{ ok: boolean; message: string }> {
+    // 返回值要带出去：以前这里吞掉一切，面板点「停止训练」失败也显示"已停止"，
+    // 结果训练继续跑（0.4.7 那次真实事故），排查时完全看不到线索。
     try {
-      await fetch(`${this.baseUrl}/stop`, {
+      const res = await fetch(`${this.baseUrl}/stop`, {
         method: 'POST',
         headers: this.authHeaders(),
         body: '{}',
         signal: AbortSignal.timeout(5000),
       });
-    } catch {
-      /* 没在跑就算了 */
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+      const message = String(body.message ?? `HTTP ${res.status}`);
+      if (!res.ok || body.ok === false) {
+        this.log.warn(`取消请求没被接受：HTTP ${res.status} ${message}`);
+        return { ok: false, message };
+      }
+      this.log.info(`取消请求已送达：${message}`);
+      return { ok: true, message };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.log.warn(`取消请求发不出去（worker 没响应）：${message}`);
+      return { ok: false, message: `连不上 worker：${message}` };
     }
   }
 

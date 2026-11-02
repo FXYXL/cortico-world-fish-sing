@@ -1181,14 +1181,30 @@ export class FishSingWorld implements World {
     }
 
     if (method === 'trainStop') {
-      await this.worker.cancel();
+      const cres = await this.worker.cancel();
+      // 送达 ≠ 停住：取消请求成功，也可能因为训练是"重启前留下的孤儿"而落空
+      // （worker 当前任务为 null，它只会回"当前没有任务"）。所以实测 worker 还在不在跑。
+      let left: { kind?: string } | null = null;
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((r) => setTimeout(r, 2500));
+        left = await this.worker.currentJob().catch(() => null);
+        if (!left) break;
+      }
+      if (left) {
+        this.host?.log.warn(
+          `[fish-sing] 停止训练：取消请求已发（${cres.message}），但 worker 还有任务在跑（${left.kind ?? '?'}）`,
+        );
+        return {
+          text: `取消请求发出去了（${cres.message}），但 worker 那边还有任务在跑——这个训练可能是重启前启动的、worker 管不到它。重启 Coo 后再试。`,
+        };
+      }
       if (this.trainJob?.state === 'running') {
         // 立刻落状态：子进程可能还在收尾，面板会一直显示"训练中"，用户以为没停
         this.trainJob.state = 'error';
         this.trainJob.error = '已手动停止';
         this.trainJob.msg = '已手动停止';
       }
-      return { text: '已停止训练。最近的存档还在 logs 里，可以勾「从上次存档继续」接着练。' };
+      return { text: `已停止训练（${cres.message}）。最近的存档还在 logs 里，可以勾「从上次存档继续」接着练。` };
     }
 
     if (method === 'cancel') {
