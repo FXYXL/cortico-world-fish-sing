@@ -99,7 +99,12 @@ export function parseTarget(to: string): OneBotTarget | null {
     : { action: 'send_private_msg', params: { user_id: id }, label: `私聊 ${id}` };
 }
 
-async function callOneBot(opts: OneBotOptions, action: string, params: Record<string, unknown>): Promise<void> {
+async function callOneBot(
+  opts: OneBotOptions,
+  action: string,
+  params: Record<string, unknown>,
+  timeoutMs = 120_000,
+): Promise<void> {
   const res = await fetch(`${opts.httpUrl.replace(/\/+$/, '')}/${action}`, {
     method: 'POST',
     headers: {
@@ -107,7 +112,7 @@ async function callOneBot(opts: OneBotOptions, action: string, params: Record<st
       ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
     },
     body: JSON.stringify(params),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) throw new Error(`OneBot HTTP ${res.status}`);
@@ -126,8 +131,12 @@ export async function sendRecord(opts: OneBotOptions, target: OneBotTarget, file
 }
 
 export async function sendText(opts: OneBotOptions, target: OneBotTarget, text: string): Promise<void> {
-  await callOneBot(opts, target.action, {
-    ...target.params,
-    message: [{ type: 'text', data: { text } }],
-  });
+  // 文本通知给短超时：SnowLuma 端口开着但不响应时，别让"训练完成"等两分钟才退桌宠。
+  // 语音条（sendRecord）仍用 120 秒——大文件 + mp3→SILK 转换本来就慢。
+  await callOneBot(
+    opts,
+    target.action,
+    { ...target.params, message: [{ type: 'text', data: { text } }] },
+    15_000,
+  );
 }

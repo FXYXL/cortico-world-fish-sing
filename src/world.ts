@@ -1171,6 +1171,15 @@ export class FishSingWorld implements World {
       return { text: text || `没生成：${exp} 只找到一个可用存档（中间档可能已被清理）` };
     }
 
+    if (method === 'trainNotifyTest') {
+      // 「QQ 通不通」不用等下一次训练结束才知道：手动发一条，看落在哪个渠道。
+      const out = (await this.notifyEvent(
+        '测试通知（唱歌插件）',
+        '这是一条测试消息：收到就说明通知渠道通了。',
+      )) as { via?: string; note?: string };
+      return { via: out?.via ?? '', note: out?.note ?? '' };
+    }
+
     if (method === 'trainStop') {
       await this.worker.cancel();
       if (this.trainJob?.state === 'running') {

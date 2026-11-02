@@ -722,7 +722,9 @@ function mountTrain(ctx) {
   const pathIn = el('input', 'fs-tpath');
   pathIn.placeholder = '粘贴素材文件夹或单个文件路径，可多个用 ; 分隔';
   const scanBtn = el('button', 'fs-btn', '扫描');
-  bar.append(pathIn, scanBtn);
+  const notifyTest = el('button', 'fs-btn', '测试通知');
+  notifyTest.title = '立刻发一条测试通知：QQ 通就发 QQ，不通就退桌宠——点了就知道渠道状态';
+  bar.append(pathIn, scanBtn, notifyTest);
 
   const dsBar = el('div', 'fs-bar');
   const dsSel = el('select', 'fs-btn');
@@ -1510,6 +1512,20 @@ function mountTrain(ctx) {
 
   appendChk.addEventListener('change', () => {
     appendLabel.textContent = appendChk.checked ? '追加到当前数据集' : '新建数据集';
+  });
+
+  notifyTest.addEventListener('click', async () => {
+    notifyTest.disabled = true;
+    notifyTest.textContent = '发送中…';
+    try {
+      const r = await ctx.invoke('trainNotifyTest');
+      say((r && r.note) ? `通知：${r.note}${r.via ? `（${r.via}）` : ''}` : '通知已发');
+    } catch (e) {
+      say(`测试通知失败：${(e && e.message) || e}`, true);
+    } finally {
+      notifyTest.disabled = false;
+      notifyTest.textContent = '测试通知';
+    }
   });
 
   scanBtn.addEventListener('click', async () => {
