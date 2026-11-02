@@ -329,15 +329,38 @@ export class FishSingWorld implements World {
     };
     const variants: { ckpt: string; label: string; index: string }[] = [];
     const finalPth = join(weights, `${exp}.pth`);
-    if (existsSync(finalPth)) variants.push({ ckpt: finalPth, label: 'final', index: indexOf(logDir) });
+    const hasFinal = existsSync(finalPth);
+    if (hasFinal) variants.push({ ckpt: finalPth, label: 'final', index: indexOf(logDir) });
     try {
-      // 中间档从新到旧取 2 个（G_2333333 是完整存档，跟 final 重复，不算）
-      const gs = readdirSync(logDir)
-        .map((f) => /^G_(\d+)\.pth$/.exec(f))
-        .filter((m): m is RegExpExecArray => Boolean(m) && m[1] !== '2333333')
-        .sort((a, b) => Number(b[1]) - Number(a[1]))
-        .slice(0, 2);
-      for (const m of gs) variants.push({ ckpt: join(logDir, m[0]), label: `e${m[1]}`, index: indexOf(logDir) });
+      // 中间档从新到旧取 2 个。
+      // 注意：save_every_weights=1 时 RVC 把每个存档点导出成 weights/<exp>_e<N>_s<X>.pth，
+      // logs 里只剩滚动的 G_2333333（跟 final 重复）——所以必须优先看 weights 目录。
+      // （0.4.8 之前只查 logs 里的 G_<步数>.pth，结果永远"只有一个存档"，选模对比被静默跳过。）
+      const esc = exp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`^${esc}_e(\\d+)_s\\d+\\.pth$`);
+      const exported = readdirSync(weights)
+        .map((f) => re.exec(f))
+        .filter((m): m is RegExpExecArray => Boolean(m))
+        .map((m) => ({ epoch: Number(m[1]), file: m[0] }))
+        .sort((a, b) => b.epoch - a.epoch);
+      // 最新一个导出的存档通常就等于 final，跳过它（否则同一份权重会比两次）
+      const pool = hasFinal ? exported.slice(1) : exported;
+      for (const it of pool.slice(0, 2)) {
+        variants.push({
+          ckpt: join(weights, it.file),
+          label: `e${it.epoch}`,
+          index: indexOf(logDir),
+        });
+      }
+      if (variants.length < 2) {
+        // 老实验没有导出文件时退回 logs 里的 G_<步数>.pth
+        const gs = readdirSync(logDir)
+          .map((f) => /^G_(\d+)\.pth$/.exec(f))
+          .filter((m): m is RegExpExecArray => Boolean(m) && m[1] !== '2333333')
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .slice(0, 2);
+        for (const m of gs) variants.push({ ckpt: join(logDir, m[0]), label: `e${m[1]}`, index: indexOf(logDir) });
+      }
     } catch {
       /* 没有中间档就只用 final */
     }

@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.9] - 2026-11-02
+
+### 修复
+- **训练完成后选模对比静默跳过**（"只有一个可用存档（中间档可能被清理了）"）：`save_every_weights=1` 时 RVC 把存档点导出成 `assets/weights/<实验>_e<N>_s<X>.pth`，logs 里只留滚动的 `G_2333333`（与 final 重复）。原实现只查 logs 里的 `G_<步数>.pth`，所以永远凑不齐两档。现在优先从 weights 目录取最近两个导出档（自动跳过与 final 重复的那个），老实验才退回查 logs。
+
 ## [0.4.8] - 2026-11-02
 
 ### 修复
