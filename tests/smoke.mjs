@@ -45,6 +45,13 @@ const r4 = await notify(
 );
 check('enabled=false 不发', r4.via === 'off' && pushed.length === 0);
 
+
+// ---- 5. 裸号码当私聊（0.4.10 的坑：填了号码没前缀就静默不发） ----
+const { parseTarget } = await import('../src/deliver.ts');
+const t1 = parseTarget('2587509374');
+check('裸号码 → 私聊', Boolean(t1) && t1.action === 'send_private_msg' && t1.params.user_id === 2587509374);
+check('乱码 → null', parseTarget('2587509374abc') === null);
+
 if (failed) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

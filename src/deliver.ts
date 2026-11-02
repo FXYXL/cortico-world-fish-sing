@@ -87,9 +87,15 @@ export interface OneBotTarget {
   label: string;
 }
 
-/** `group:123` / `private:456`；也接受 `群:123` / `私聊:456`（她有时候会这么写）。 */
+/** `group:123` / `private:456`；也接受 `群:123` / `私聊:456`（她有时候会这么写）。
+ *  裸数字当成私聊 QQ 号——用户第一反应就是直接填号码，不能因为少个前缀就静默不发。 */
 export function parseTarget(to: string): OneBotTarget | null {
   const text = String(to || '').trim();
+  const bare = /^(\d{5,12})$/.exec(text);
+  if (bare) {
+    const id = Number(bare[1]);
+    return { action: 'send_private_msg', params: { user_id: id }, label: `私聊 ${id}` };
+  }
   const m = /^(group|群|private|私聊)\s*[:：]\s*(\d+)$/.exec(text);
   if (!m) return null;
   const isGroup = m[1] === 'group' || m[1] === '群';

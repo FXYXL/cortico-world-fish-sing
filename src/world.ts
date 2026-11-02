@@ -417,6 +417,11 @@ export class FishSingWorld implements World {
         } catch (e) {
           this.host?.log.warn(`[fish-sing] 选模片段发 QQ 失败：${e instanceof Error ? e.message : String(e)}`);
         }
+      } else {
+        // 别静默：用户会以为"QQ 渠道坏了"，实际是配置缺一半
+        this.host?.log.warn(
+          `[fish-sing] 选模片段没发 QQ：${!obTarget ? 'qqTarget 没配或格式不对（要 group:/private: 前缀）' : 'OneBot HTTP 地址没配'}`,
+        );
       }
     }
     this.host?.log.info(`[fish-sing] 选模对比已生成：${labels.join(' / ')}（${outDir}）`);

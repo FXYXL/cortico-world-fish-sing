@@ -36,7 +36,13 @@ export async function notify(deps: NotifyDeps, title: string, body = ''): Promis
   const text = body ? `${title}\n${body}` : title;
 
   const channel = deps.cfg.channel ?? 'auto';
-  const target = parseTarget(String(deps.cfg.qqTarget ?? ''));
+  const rawTarget = String(deps.cfg.qqTarget ?? '').trim();
+  const target = parseTarget(rawTarget);
+  if (channel === 'auto' && rawTarget && !target) {
+    // 这里以前是完全静默的：qqTarget 写了但格式不对 → 直接走桌宠，日志一条没有，
+    // 用户以为"QQ 渠道坏了"（0.4.9 的真实事故：填了裸号码没写 private:）。
+    deps.log.warn(`QQ 通知目标「${rawTarget}」解析不了（要 group:<群号> 或 private:<QQ号>），走桌宠`);
+  }
   const wantQQ = channel === 'qq' || (channel === 'auto' && Boolean(target) && Boolean(deps.onebot.httpUrl));
   if (wantQQ) {
     if (target && deps.onebot.httpUrl) {

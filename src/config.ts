@@ -337,7 +337,8 @@ export function fishsingConfigGroups(): ConfigGroup[] {
           [at('notify.qqTarget')]: {
             type: 'string',
             title: 'QQ 通知目标',
-            description: 'group:<群号> 或 private:<QQ号>；留空 = 只用桌宠。',
+            description: 'group:<群号> 或 private:<QQ号>（只填号码也行）；留空 = 只用桌宠。',
+            'x-hot': true,
           },
         },
       },

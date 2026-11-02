@@ -2,6 +2,13 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.10] - 2026-11-02
+
+### 修复
+- **QQ 通知目标只填号码时静默失效**：`qqTarget` 写 `2587509374`（没有 `private:` 前缀）会被 `parseTarget` 判死，然后什么都不发、日志一条没有，看起来像"QQ 渠道坏了"。现在裸数字直接当私聊号处理；格式真的不对时也会 warn 一条「解析不了（要 group:/private:）」。
+- 选模对比没发 QQ 时同样会 warn 说明原因（缺目标 / 缺 OneBot 地址），不再静默。
+- `notify.qqTarget` 改为热更新字段（改完不用重启 Coo）。
+
 ## [0.4.9] - 2026-11-02
 
 ### 修复
