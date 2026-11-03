@@ -557,26 +557,28 @@ class SingEngine:
             shutil.rmtree(tmp, ignore_errors=True)
 
     @staticmethod
-    def _smooth_seams(pieces: list, out_sr: int, *, fade_ms: int = 50) -> list:
+    def _smooth_seams(pieces: list, out_sr: int, *, fade_ms: int = 8) -> list:
         """
         分片接缝处理：各片独立推理，片边容易有响度跳变和相位不连续（听感是
         "接缝处咯噔一下"）。
 
-        只做边界 50ms 线性交叉淡化——相邻片是连续时间轴上切开的，把跳变摊到
-        50ms 里就听不出来了。**不做**片间响度归一：55 秒一片的歌，安静主歌和
-        炸副歌的响度差是音乐本身的动态，拉平会毁掉听感（本地实测教训）。
+        **绝不改时长**：只做边界等长的淡出/淡入（各 fade_ms），一个样本都不删。
+        0.4.0 第一版用的是"重叠交叉淡化"，每条缝吃掉 50ms——4 分半的歌 4 条缝
+        就少 200ms，人声比伴奏越唱越快（用户实测"越到后面越不合拍"）。改成等长
+        淡化后，既压住爆音，时长又精确对齐伴奏。
+        **也不做**片间响度归一：主歌/副歌的响度差是音乐动态，拉平会毁听感。
         """
         if len(pieces) < 2:
             return pieces
         n = int(out_sr * fade_ms / 1000)
-        if n > 0:
-            w = np.linspace(0.0, 1.0, n).reshape(-1, 1)
-            for i in range(1, len(pieces)):
-                a, b = pieces[i - 1], pieces[i]
-                if a.shape[0] > n and b.shape[0] > n:
-                    seam = a[-n:] * (1 - w) + b[:n] * w
-                    pieces[i - 1] = np.concatenate([a[:-n], seam], axis=0)
-                    pieces[i] = b[n:]
+        if n <= 0:
+            return pieces
+        ramp = np.linspace(0.0, 1.0, n).reshape(-1, 1)
+        for i in range(1, len(pieces)):
+            a, b = pieces[i - 1], pieces[i]
+            if a.shape[0] > n and b.shape[0] > n:
+                pieces[i - 1] = np.concatenate([a[:-n], a[-n:] * (1.0 - ramp)], axis=0)  # 尾巴淡出
+                pieces[i] = np.concatenate([b[:n] * ramp, b[n:]], axis=0)                # 开头淡入
         return pieces
 
     # -- 混音 ------------------------------------------------------

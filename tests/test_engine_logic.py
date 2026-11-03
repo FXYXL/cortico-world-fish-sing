@@ -97,16 +97,16 @@ class SmoothSeams(unittest.TestCase):
         r = [float(np.sqrt(np.mean(p.astype(np.float64) ** 2))) for p in out]
         self.assertGreater(r[1] / max(r[0], 1e-9), 5.0)  # 响度差还在（完全拉平会是 ~1）
 
-    def test_lengths(self):
+    def test_lengths_preserved(self):
+        # 接缝处理**必须不改时长**：0.4.0 的重叠交叉淡化每条缝吃掉 50ms，
+        # 4 分半的歌人声就比伴奏快 200ms（用户实测越唱越不合拍）。
         a = self.sine(440, 2.0)
         b = self.sine(440, 2.0)
         c = self.sine(440, 2.0)
         out = engine.SingEngine._smooth_seams([a, b, c], SR)
-        n = int(SR * 0.05)
-        # 每条缝损失 50ms：首片丢右侧，中片左右各丢一次，尾片丢左侧
-        self.assertEqual(out[0].shape[0], 2 * SR)
-        self.assertEqual(out[1].shape[0], 2 * SR - n)
-        self.assertEqual(out[2].shape[0], 2 * SR - n)
+        for i in range(3):
+            self.assertEqual(out[i].shape[0], 2 * SR, f'第 {i} 片长度被改了')
+        self.assertEqual(sum(p.shape[0] for p in out), 6 * SR)
 
     def test_single_piece_untouched(self):
         a = self.sine(440, 1.0)
