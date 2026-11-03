@@ -746,9 +746,22 @@ class SingEngine:
             shutil.copyfile(conv, out)
             mix_info = {"sr": info["sr"], "seconds": info["seconds"]}
         else:
+            inst_for_mix = inst
+            if pitch and inst is not None:
+                # 整体变调：伴奏必须跟着一起移，否则人声和伴奏差 N 个半音。
+                # （0.4.12 之前的真实问题：pitch≠0 时"听着怪但说不出哪不对"，
+                #   唱男声歌几乎必中——自动变调会给 +6，伴奏却一直在原调。）
+                report(0.82, f"伴奏同步变调 {pitch:+d} 半音")
+                inst_for_mix = work / "inst_shifted.wav"
+                try:
+                    sr_i = int(sf.info(str(inst)).samplerate)
+                except Exception:  # noqa: BLE001
+                    sr_i = 44100
+                run_ff([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", str(inst),
+                        "-af", self.pitch_shift_filter(sr_i, pitch), str(inst_for_mix)])
             report(0.85, "混音")
             out = work / "result.wav"
-            mix_info = self.mix(conv, inst, out)
+            mix_info = self.mix(conv, inst_for_mix, out)
 
         report(1.0, "完成")
         result = {
@@ -763,6 +776,17 @@ class SingEngine:
         if suggestion is not None:
             result["pitchSuggest"] = suggestion
         return result
+
+    @staticmethod
+    def pitch_shift_filter(sr: int, semitones: float) -> str:
+        """
+        变调但**保持时长**的 ffmpeg 滤镜串。
+
+        asetrate 改采样率等价于"升调+加速"，所以后面必须用 atempo 把时长拉回来
+        （atempo=1/factor）。这样人声/伴奏都能整段移调而不改变节奏。
+        """
+        f = 2.0 ** (float(semitones) / 12.0)
+        return f"asetrate={int(round(sr * f))},aresample={sr},atempo={1.0 / f:.6f}"
 
     # -- 选模对比试听 -----------------------------------------------
 

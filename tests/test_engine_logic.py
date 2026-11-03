@@ -126,5 +126,17 @@ class AugmentWeightExpansion(unittest.TestCase):
             self.assertIn(f"aug{shift}_slice001.wav", e)
 
 
+    def test_pitch_shift_filter_keeps_ratio(self):
+        # 变调滤镜：asetrate 的倍率必须等于 2^(n/12)，atempo 必须是它的倒数（保时长）
+        import re as _re
+        for semi in (6, -5, 3):
+            flt = engine.SingEngine.pitch_shift_filter(44100, semi)
+            m = _re.search(r'asetrate=(\d+)', flt)
+            t = _re.search(r'atempo=([\d.]+)', flt)
+            self.assertIsNotNone(m, flt)
+            ratio = int(m.group(1)) / 44100
+            self.assertAlmostEqual(ratio, 2 ** (semi / 12), places=3)
+            self.assertAlmostEqual(float(t.group(1)), 1 / ratio, places=3)
+
 if __name__ == "__main__":
     unittest.main()
