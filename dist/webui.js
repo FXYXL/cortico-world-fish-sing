@@ -664,6 +664,17 @@ function mountModels(ctx) {
 
 const TRAIN_STYLE_ID = 'fish-sing-train-style';
 const TRAIN_CSS = `
+/* 分步折叠：新用户只看得到当前该做什么，老手展开就有全部东西 */
+.fs-sec{margin:10px 0;border:1px solid rgba(127,127,127,.22);border-radius:10px;
+  background:rgba(127,127,127,.035);overflow:hidden}
+.fs-sec>summary{cursor:pointer;padding:9px 12px;font-size:13px;font-weight:600;
+  display:flex;align-items:center;gap:8px;list-style:none;user-select:none}
+.fs-sec>summary::-webkit-details-marker{display:none}
+.fs-sec>summary::before{content:"▸";opacity:.55;font-size:11px;transition:transform .12s}
+.fs-sec[open]>summary::before{transform:rotate(90deg)}
+.fs-sec>summary:hover{background:rgba(127,127,127,.07)}
+.fs-sec-hint{font-weight:400;font-size:11.5px;opacity:.55}
+.fs-sec-body{padding:2px 12px 12px}
 .fs-tpath{flex:1;min-width:280px;padding:5px 8px;border-radius:6px;
   border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12.5px}
 .fs-tsum{font-size:12.5px;line-height:1.7}
@@ -777,7 +788,30 @@ function mountTrain(ctx) {
   const weightBox = el('div', '');
 
   const trainBox = el('div', '');
-  root.append(bar, dsBar, importBar, bar2, prog, msg, listBox, resultBox, weightBox, trainBox);
+
+  // ---- 分步折叠布局：①素材 ②训练 ③高级 ------------------------------
+  // 之前这里是把 10 个 bar/box 平铺，新用户第一眼看到素材路径、数据集、实验、
+  // 参数、5 个勾选、低音滑块、进度、曲线、清理——完全不知道从哪下手。
+  const mkSec = (title, hint, open) => {
+    const d = el('details', 'fs-sec');
+    if (open) d.open = true;
+    const sum = el('summary', '');
+    sum.append(el('span', '', title), el('span', 'fs-sec-hint', hint));
+    const body = el('div', 'fs-sec-body');
+    d.append(sum, body);
+    return { d, body };
+  };
+
+  const secA = mkSec('① 素材 → 数据集', '把歌放进来、扫描、切成训练用的片', true);
+  secA.body.append(bar, bar2, listBox, resultBox, dsBar, importBar);
+
+  const secB = mkSec('② 训练', '一般只需要改「轮次」，其余都在展开项里', true);
+  secB.body.append(trainBox);
+
+  const secC = mkSec('③ 高级：低音增强 / 音域加权', '给数据加降调副本、按音域调采样权重（有效但有限）', false);
+  secC.body.append(weightBox);
+
+  root.append(prog, msg, secA.d, secB.d, secC.d);
 
   let items = [];
   let checked = new Set();
@@ -1153,6 +1187,13 @@ function mountTrain(ctx) {
   const tForm = el('div', 'fs-tform');
   const expIn = el('input', 'fs-tin');
   expIn.placeholder = '实验名（英文，如 fish1029）';
+  // 给个默认名，别让新用户卡在"实验名填什么"这一步（同名会复用目录，所以带日期）
+  {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    expIn.value = `fish${mm}${dd}`;
+  }
   const epIn = el('input', 'fs-tin');
   epIn.type = 'number';
   epIn.min = '10';
@@ -1361,7 +1402,9 @@ function mountTrain(ctx) {
 
     if (running && !job) {
       const per = log.secPerEpoch ? ` · ${log.secPerEpoch.toFixed(0)} 秒/轮` : '';
-      tMsg.textContent = `训练中（日志 ${st.logAgeSec} 秒前更新，进程不由面板接管）：${log.done}/${total || '?'} 轮${per}`;
+      const left = log.secPerEpoch && total ? Math.max(0, total - log.done) * log.secPerEpoch : 0;
+      const eta = left ? ` · 预计还要 ${fmtDur(left)}` : '';
+      tMsg.textContent = `训练中（日志 ${st.logAgeSec} 秒前更新，进程不由面板接管）：${log.done}/${total || '?'} 轮${per}${eta}`;
       tMsg.classList.remove('bad');
     } else if (running) {
       const eta = st.etaSec ? ` · 预计还要 ${fmtDur(st.etaSec)}` : '';
