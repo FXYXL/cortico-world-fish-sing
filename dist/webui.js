@@ -10,13 +10,14 @@
  */
 
 const CSS = `
-.fs-wrap{display:flex;flex-direction:column;gap:10px;font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+.fs-wrap{display:flex;flex-direction:column;gap:10px;width:100%;max-width:980px;margin:0 auto;font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
 .fs-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .fs-bar .fs-grow{flex:1}
 .fs-btn{appearance:none;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;
   border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 .fs-btn:hover{background:rgba(127,127,127,.12)}
 .fs-btn:disabled{opacity:.4;cursor:default}
+select.fs-btn{appearance:auto;-webkit-appearance:menulist;padding:4px 8px;max-width:560px}
 .fs-btn.danger{border-color:rgba(220,80,80,.5);color:#d05555}
 .fs-input{flex:0 0 200px;padding:4px 8px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
   background:transparent;color:inherit;font-size:12px}
@@ -364,7 +365,23 @@ function mountSetup(ctx) {
     + '运行时是 Python 环境：GPU 版下载约 2.5 GB、装完约 6 GB（55 秒的歌约 8 秒换完）；'
     + 'CPU 版只要约 200 MB，但慢 6~8 倍。已经装好 torch 的不会被覆盖。';
 
-  root.append(cards, bar, prog, msg, list, hint);
+  // ---- 通知渠道测试（配置页的「完成通知」里填目标，这里一键验证）
+  const nbar = el('div', 'fs-bar');
+  const nbtn = el('button', 'fs-btn', '测试通知');
+  nbtn.title = '立刻发一条测试通知：QQ 通就发 QQ，不通就退桌宠';
+  nbtn.addEventListener('click', async () => {
+    nbtn.disabled = true;
+    try {
+      const r = await ctx.invoke('trainNotifyTest', []);
+      say(`通知：${(r && r.note) || '已发'}${r && r.via ? `（${r.via}）` : ''}`);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    nbtn.disabled = false;
+  });
+  nbar.append(nbtn, el('span', 'fs-meta',
+    'QQ 目标在 Coo 设置 → 插件配置 → 完成通知 里填（group:群号 / private:QQ号，直接填号码也行）'));
+  root.append(cards, bar, prog, msg, list, nbar, hint);
 
   let timer = null;
   let lastJob = '';
@@ -733,9 +750,7 @@ function mountTrain(ctx) {
   const pathIn = el('input', 'fs-tpath');
   pathIn.placeholder = '粘贴素材文件夹或单个文件路径，可多个用 ; 分隔';
   const scanBtn = el('button', 'fs-btn', '扫描');
-  const notifyTest = el('button', 'fs-btn', '测试通知');
-  notifyTest.title = '立刻发一条测试通知：QQ 通就发 QQ，不通就退桌宠——点了就知道渠道状态';
-  bar.append(pathIn, scanBtn, notifyTest);
+  bar.append(pathIn, scanBtn);
 
   const dsBar = el('div', 'fs-bar');
   const dsSel = el('select', 'fs-btn');
@@ -769,15 +784,14 @@ function mountTrain(ctx) {
   startBtn.disabled = true;
   const stopBtn = el('button', 'fs-btn danger', '停止');
   stopBtn.disabled = true;
-  const revealBtn = el('button', 'fs-btn', '打开目录');
   const appendChk = el('input', 'fs-ck');
   appendChk.type = 'checkbox';
-  appendChk.checked = true;
+  appendChk.checked = false; // 用户要求：不默认追加，切片时自己勾
   appendChk.disabled = true;
   const appendLabel = el('label', 'fs-meta', '追加到当前数据集');
   appendLabel.style.display = 'none';
 
-  bar2.append(modeSel, lenIn, startBtn, stopBtn, appendChk, appendLabel, el('span', 'fs-grow'), revealBtn);
+  bar2.append(modeSel, lenIn, startBtn, stopBtn, appendChk, appendLabel, el('span', 'fs-grow'));
 
   const msg = el('div', 'fs-msg');
   const prog = el('div', 'fs-prog');
@@ -802,10 +816,10 @@ function mountTrain(ctx) {
     return { d, body };
   };
 
-  const secA = mkSec('① 素材 → 数据集', '把歌放进来、扫描、切成训练用的片', true);
-  secA.body.append(bar, bar2, listBox, resultBox, dsBar, importBar);
+  const secA = mkSec('① 素材 → 数据集', '把歌放进来、扫描、切成训练用的片', false);
+  secA.body.append(bar, bar2, importBar, listBox, resultBox, dsBar);
 
-  const secB = mkSec('② 训练', '一般只需要改「轮次」，其余都在展开项里', true);
+  const secB = mkSec('② 训练', '一般只需要改「轮次」，其余都在展开项里', false);
   secB.body.append(trainBox);
 
   const secC = mkSec('③ 高级：低音增强 / 音域加权', '给数据加降调副本、按音域调采样权重（有效但有限）', false);
@@ -817,6 +831,8 @@ function mountTrain(ctx) {
   let checked = new Set();
   let timer = null;
   let lastDir = '';
+  let lastSecState = '';
+  let lastResumeAuto = '';
 
   const say = (t, bad) => {
     msg.textContent = t || '';
@@ -1245,16 +1261,16 @@ function mountTrain(ctx) {
   pruneAfterLbl.title = '按下面「每 N 轮留一个」保留，其余删掉。不勾就只是提醒你手动清。';
   const abChk = el('input', 'fs-ck');
   abChk.type = 'checkbox';
-  abChk.checked = true;
+  abChk.checked = false; // 用户要求：不默认勾，想要就自己点
   const abLbl = el('label', 'fs-meta', '训练完生成选模对比');
   abLbl.prepend(abChk);
   abLbl.title = '用同一句训练切片，final 和最后两个中间档各唱一遍，进作品库对比听';
   const lowChk = el('input', 'fs-ck');
   lowChk.type = 'checkbox';
-  lowChk.checked = true;
+  lowChk.checked = false; // 用户要求：不默认勾（实测只是有限改善）
   const lowLbl = el('label', 'fs-meta', '低音增强');
   lowLbl.prepend(lowChk);
-  lowLbl.title = '把每个切片合成 -2/-4 半音的低音数据一起训练，治"低音不像"。F0/特征提取时间约 ×3';
+  lowLbl.title = '有限改善：把每个切片合成 -2/-4 半音的副本一起训练。实测只能缓解、不能根治"低音不像"（模型在低音区本来就没有音色记忆），且 F0/特征提取时间约 ×3';
   chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, lowLbl, el('span', 'fs-grow'), startT, stopT);
 
   const tProg = el('div', 'fs-prog');
@@ -1386,6 +1402,19 @@ function mountTrain(ctx) {
     const log = st.log || { done: 0, losses: [], latest: null, secPerEpoch: null, error: '' };
     const total = st.total || 0;
 
+    // 分区自动展开：谁在跑就展开谁；都空闲就全收起（用户手动展开的不动）
+    const secState = running ? 'train' : (st.datasetBusy ? 'ds' : 'idle');
+    if (secState !== lastSecState) {
+      lastSecState = secState;
+      secB.d.open = secState === 'train';
+      secA.d.open = secState === 'ds';
+    }
+    // 有没训完的记录、当前又没在训练 → 自动勾「从上次存档继续」（每个实验只代勾一次）
+    if (!running && log.done > 0 && st.exp && lastResumeAuto !== st.exp) {
+      resumeChk.checked = true;
+      lastResumeAuto = st.exp;
+    }
+
     startT.disabled = running || st.datasetBusy;
     // 即使不是本次启动的也能停：/stop 取消的是 worker 当前任务，跟谁提交的无关
     stopT.disabled = !running;
@@ -1427,6 +1456,17 @@ function mountTrain(ctx) {
     if (log.error && running) {
       tMsg.textContent += ` · 日志里有报错：${log.error}`;
       tMsg.classList.add('bad');
+    }
+
+    // 顶栏状态始终反映正在进行的任务；空闲时不动（保留上一次操作的反馈）
+    if (running) {
+      msg.textContent = tMsg.textContent;
+      msg.classList.toggle('bad', tMsg.classList.contains('bad'));
+      fill.style.width = tFill.style.width;
+    } else if (st.datasetBusy) {
+      fill.style.width = '96%';
+      msg.textContent = '数据集任务进行中…（切片中，取决于素材时长）';
+      msg.classList.remove('bad');
     }
 
     paintLoss(log);
@@ -1559,19 +1599,6 @@ function mountTrain(ctx) {
     appendLabel.textContent = appendChk.checked ? '追加到当前数据集' : '新建数据集';
   });
 
-  notifyTest.addEventListener('click', async () => {
-    notifyTest.disabled = true;
-    notifyTest.textContent = '发送中…';
-    try {
-      const r = await ctx.invoke('trainNotifyTest');
-      say((r && r.note) ? `通知：${r.note}${r.via ? `（${r.via}）` : ''}` : '通知已发');
-    } catch (e) {
-      say(`测试通知失败：${(e && e.message) || e}`, true);
-    } finally {
-      notifyTest.disabled = false;
-      notifyTest.textContent = '测试通知';
-    }
-  });
 
   scanBtn.addEventListener('click', async () => {
     const raw = String(pathIn.value || '').trim();
@@ -1618,7 +1645,6 @@ function mountTrain(ctx) {
   });
 
   stopBtn.addEventListener('click', () => void call('cancel', []).then(() => poll()));
-  revealBtn.addEventListener('click', () => void call('reveal', []).catch(() => {}));
 
   void poll();
   void loadDatasets();
