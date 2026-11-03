@@ -1036,16 +1036,30 @@ export class FishSingWorld implements World {
       const saveEvery = Math.max(1, Math.min(100, Number(cfg.saveEvery) || 10));
       const exp = String(cfg.exp ?? '').trim().replace(/[^\w.-]/g, '') || `fish${stamp()}`;
 
-      // 同名实验的日志刚刚还在写 → 十有八九另一个训练在跑（包括重启 Coo 后留下的孤儿进程，
+      // 同名实验的日志刚刚还在写 → 可能有训练在跑（包括重启 Coo 后留下的孤儿进程，
       // 那种情况 worker 已经不认识它了，光靠状态拦不住）。撞上去就是两个训练抢一张卡。
+      // 但"日志新"不等于"在跑"：刚点停止的训练日志也会热 3 分钟（0.4.15：停止后立刻
+      // 重训被误拦）。所以看两件事：日志 3 秒内还长不长、worker 里有没有训练任务。
       const logFile = join(this.expDirFor(exp), 'train.log');
       if (existsSync(logFile)) {
         const ageSec = Math.round((Date.now() - statSync(logFile).mtimeMs) / 1000);
         if (ageSec < 180) {
-          throw new Error(
-            `「${exp}」的日志 ${ageSec} 秒前还在更新，可能有训练正在跑（重启 Coo 留下的孤儿进程也算）。`
-            + '换个实验名，或者等它跑完再开始。',
-          );
+          const s1 = statSync(logFile).size;
+          const cur = await this.worker.currentJob().catch(() => null);
+          const workerBusy = Boolean(cur && cur.kind === 'train');
+          await new Promise((r) => setTimeout(r, 3000));
+          const s2 = existsSync(logFile) ? statSync(logFile).size : 0;
+          if (workerBusy) {
+            throw new Error(
+              `worker 里还有「${cur?.exp || exp}」的训练任务在跑，先停止它或等它结束再开始。`,
+            );
+          }
+          if (s2 > s1) {
+            throw new Error(
+              `「${exp}」的训练日志 3 秒内还在增长（${s1} → ${s2} 字节），可能有训练正在跑`
+                + `（重启 Coo 留下的孤儿进程也算）。换个实验名，或者等它跑完再开始。`,
+            );
+          }
         }
       }
 

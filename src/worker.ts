@@ -45,6 +45,8 @@ export interface JobState {
   error?: string;
   /** 任务类型（/current 返回，重启后靠它判断是否要重新接管训练） */
   kind?: string;
+  /** 训练任务的实验名（/current 快照里额外带上） */
+  exp?: string;
   /** 训练任务额外带的信息（/current 返回） */
   exp?: string;
   epochs?: number;
