@@ -272,12 +272,38 @@ export class WorkerClient {
     let lastChange = Date.now();
     let lastMsg = '';
     let lastPct = -1;
+    let badSince = 0;
 
     for (;;) {
-      const res = await fetch(`${this.baseUrl}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
-      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
-      const job = body.job;
-      if (!job) throw new Error(`查不到任务 ${id}`);
+      let job: JobState | undefined;
+      try {
+        const res = await fetch(`${this.baseUrl}/job/${id}`, { signal: AbortSignal.timeout(10_000) });
+        if (res.status === 404) {
+          // 只有 worker 明确说"没有这个任务"才算真没了（比如 worker 重启过、内存记录清空）。
+          // 网络抖动/响应残缺不能算——0.4.14 实测：停止训练的那一瞬间机器卡了一下，
+          // 拿到残缺响应就报"训练中断：查不到任务"，其实任务好好地在。
+          throw new Error(`查不到任务 ${id}`);
+        }
+        const body = (await res.json().catch(() => null)) as { ok?: boolean; job?: JobState } | null;
+        job = body?.job;
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith('查不到任务')) throw e; // worker 明确说没有，才是真没有
+        if (!badSince) badSince = Date.now();
+        if (Date.now() - badSince > 30_000) {
+          throw new Error(`worker 连不上/响应异常已持续 30 秒：${e instanceof Error ? e.message : String(e)}`);
+        }
+        await new Promise((r) => setTimeout(r, 700));
+        continue;
+      }
+      badSince = 0;
+      if (!job) {
+        if (!badSince) badSince = Date.now();
+        if (Date.now() - badSince > 30_000) {
+          throw new Error('worker 响应异常（任务字段缺失）已持续 30 秒');
+        }
+        await new Promise((r) => setTimeout(r, 700));
+        continue;
+      }
 
       const pct = job.progress ?? 0;
       if ((job.message && job.message !== lastMsg) || Math.abs(pct - lastPct) > 1e-6) {

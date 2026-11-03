@@ -1120,6 +1120,12 @@ export class FishSingWorld implements World {
           job.state = 'error';
           job.error = e instanceof Error ? e.message : String(e);
           job.msg = job.error;
+          if (job.error === '已取消' || job.error === '已手动停止') {
+            // 用户自己点的停止不算"中断"，也用不着通知（0.4.14 之前点停止也会收到
+            // 一条"训练中断"推送，纯属噪音）
+            this.host?.log.info(`[fish-sing] 训练已停止（${job.error}）`);
+            return;
+          }
           this.host?.log.warn(`[fish-sing] 训练中断：${job.error}`);
           void this.notifyEvent(`训练中断：${exp}`, job.error);
         });
