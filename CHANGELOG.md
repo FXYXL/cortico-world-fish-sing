@@ -2,6 +2,18 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.17] - 2026-11-03
+
+### 修复（来自 issue #1 与市场反馈）
+- **外部 RVC 路径填错会让 Coo 直接启动不了（issue #1）**：把 python 路径填成 `…\rvc\venv`（目录）时，`existsSync` 判定为"存在"，于是照样 spawn，Node 抛 `ENOENT` 的**未捕获 'error' 事件**，把 Coo 一起带走。现在：
+  - spawn 前校验必须是**文件**（不是目录），错误信息直接给出正确示例 `…\venv\Scripts\python.exe`；
+  - 给子进程挂了 `error` 处理，任何 spawn 失败都转成"这次启动失败 + warn 日志"，不再崩进程。
+- **人声分离在被墙环境里卡好几分钟（市场反馈：25 秒素材等了 6 分半，`HF_HUB_OFFLINE=1` 后降到 19 秒）**：demucs 的权重下载（`torch.hub`）**没有超时**，缓存一丢（重装运行时、换机器）就会去 `dl.fbaipublicfiles.com` 拉 84 MB，被墙时无限重试。现在分离前做预检：
+  - `socket` 默认超时压到 20 秒，联网调用不会无限挂；
+  - 本地已有权重 → 设 `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`（部分 demucs 版本会走 huggingface_hub）；
+  - 进度日志里明写"权重已缓存 / 首次需下载 84MB"，以后有人报慢能一眼定位；
+  - 模型加载耗时也打进日志。
+
 ## [0.4.16] - 2026-11-03
 
 ### 修复

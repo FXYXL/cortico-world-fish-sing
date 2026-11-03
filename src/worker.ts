@@ -7,7 +7,7 @@
  *  · 它崩了不该拖垮 Coo（契约：worker 挂了只影响唱歌，不影响聊天）。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -62,6 +62,8 @@ export class WorkerClient {
   private opts: WorkerOptions;
   private readonly log: LoggerLike;
   private child: ChildProcess | null = null;
+  /** spawn 失败的原因（路径是目录、权限不足…），报错时带上它 */
+  private spawnError: Error | null = null;
   private starting: Promise<void> | null = null;
   /** 上次拉起的时间戳，防止「起不来 → 每次调用都重试 → 疯狂 spawn」。 */
   private lastSpawnAt = 0;
@@ -135,6 +137,18 @@ export class WorkerClient {
     if (!existsSync(this.opts.pythonPath)) {
       return Promise.reject(new Error(`找不到 python：${this.opts.pythonPath}（配置 → 运行时）`));
     }
+    try {
+      // 只判断存在不够：填成 venv 目录时 existsSync 也是 true，spawn 才报 ENOENT，
+      // 而 ENOENT 是未捕获的 'error' 事件——会把 Coo 一起带走（issue #1）。
+      if (!statSync(this.opts.pythonPath).isFile()) {
+        return Promise.reject(new Error(
+          `python 路径不是一个文件：${this.opts.pythonPath}\n`
+          + '应该指向 venv 里的解释器，例如 …\\venv\\Scripts\\python.exe',
+        ));
+      }
+    } catch {
+      /* stat 失败就交给 spawn 的 error 处理 */
+    }
     const env: Record<string, string> = {
       ...(process.env as Record<string, string>),
       FISHSING_PORT: String(this.opts.port),
@@ -174,12 +188,25 @@ export class WorkerClient {
       this.maybeRestart();
     });
     this.child = child;
+    // spawn 的 'error'（二进制损坏、权限不足、路径是目录）不处理就是未捕获事件，
+    // Node 会直接抛出去把 Coo 干掉（issue #1）。这里接住，转成一次失败的重试。
+    child.on('error', (e: Error) => {
+      this.spawnError = e;
+      this.log.warn(
+        `worker 起不来：${e.message}` + '（配置 → 运行时：python 应指向 …\\venv\\Scripts\\python.exe，不是 venv 目录）',
+      );
+      if (this.child === child) this.child = null;
+    });
 
     const deadline = Date.now() + this.opts.startTimeoutMs;
     return new Promise<void>((resolve, reject) => {
       const tick = async (): Promise<void> => {
         if (this.child === null) {
-          reject(new Error('worker 启动后立刻退出了，看日志里的 [worker:err]'));
+          reject(new Error(
+            this.spawnError
+              ? `worker 起不来：${this.spawnError.message}`
+              : 'worker 启动后立刻退出了，看日志里的 [worker:err]',
+          ));
           return;
         }
         const h = await this.health(1500);

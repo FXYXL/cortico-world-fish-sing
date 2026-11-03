@@ -23,6 +23,43 @@ import torchaudio
 from demucs.apply import apply_model
 from demucs.pretrained import get_model
 
+# htdemucs 的权重文件名（torch.hub 缓存目录下的名字）
+_DEMUCS_CKPT = "955717e8-8726e21a.th"
+
+
+def _ckpt_dir():
+    base = os.environ.get("TORCH_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "torch")
+    return os.path.join(base, "hub", "checkpoints")
+
+
+def _preflight_weights(model_name, say=None):
+    """分离权重预检：本地有就直接用，没有才下载，而且**限时**。
+
+    为什么要有这一步：torch.hub 的下载函数没有超时。缓存丢了的机器（重装运行时、
+    HOME/用户变了、换机器）会去 dl.fbaipublicfiles.com 拉 84 MB，被墙时一挂就是
+    几分钟——用户实测 25 秒素材等了 6 分半，还以为分离坏了。
+
+    这里做三件事：
+      1. socket 默认超时压到 20 秒，任何联网调用不会无限挂；
+      2. 本地有缓存就把 HF 相关联网开关关掉（部分 demucs 版本会走 huggingface_hub）；
+      3. 把"权重在不在本地"打进进度日志，下次再有人报慢，一眼能看出是不是没缓存。
+    """
+    import socket
+    socket.setdefaulttimeout(20)
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    if model_name != "htdemucs":
+        return
+    ck = os.path.join(_ckpt_dir(), _DEMUCS_CKPT)
+    if os.path.isfile(ck):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        if say:
+            say(f"weights cached {os.path.basename(ck)} {os.path.getsize(ck) // (1 << 20)}MB")
+    else:
+        # 没有就别设离线，让它去下；但下载有 20 秒超时兜着
+        if say:
+            say("weights MISSING 首次需下载 84MB（网络差会慢，最多等 20 秒/次）")
+
 
 def _decode_44100(path):
     """解码成 (2, n) float32 的 44.1 kHz 立体声。
@@ -61,8 +98,11 @@ def separate_file(src, out_dir, device="auto", model_name="htdemucs", overlap=0.
     say(f"loaded {data.shape} {sr} dur {data.shape[1] / sr:.1f}s")
     x = torch.from_numpy(data)
 
+    _preflight_weights(model_name, say)
+    t_model = time.time()
     model = get_model(model_name)
     model.eval()
+    say(f"model loaded {time.time() - t_model:.1f}s")
     say(f"model {model.sources} sr {model.samplerate}")
 
     # 按整段参考信号做均值/方差归一，输出时再还原（demucs 官方做法）
