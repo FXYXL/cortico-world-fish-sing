@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.20] - 2026-11-05
+
+### 修复
+- **训练页三个折叠块贴左（进度条却居中）**：`.fs-sec` 上写了 `margin:10px 0`，把宿主 `.panelslot > :where(...)` 里的 `margin-right/left:auto` 覆盖成 0，块就不再居中了——而 `.fs-prog` / `.fs-msg` 没有 margin，所以照常居中。改成 `margin-block:10px`，水平方向留给宿主的 auto。这是 .fs-wrap 这些"宽度"改动一直没解决的真凶：问题不在 width，在水平 margin。
+
 ## [0.4.19] - 2026-11-05
 
 ### 修复

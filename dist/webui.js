@@ -685,8 +685,11 @@ function mountModels(ctx) {
 
 const TRAIN_STYLE_ID = 'fish-sing-train-style';
 const TRAIN_CSS = `
-/* 分步折叠：新用户只看得到当前该做什么，老手展开就有全部东西 */
-.fs-sec{margin:10px 0;border:1px solid rgba(127,127,127,.22);border-radius:10px;
+/* 分步折叠：新用户只看得到当前该做什么，老手展开就有全部东西。
+   注意：这三块是 .panelslot 的直接子元素，宿主靠 margin-right/left:auto 把它们居中；
+   这里只能写 margin-block，写 margin:10px 0 会把左右 auto 覆盖成 0，整块就贴左了
+   （0.4.19 之前的真实症状：进度条居中、三块贴左）。 */
+.fs-sec{margin-block:10px;border:1px solid rgba(127,127,127,.22);border-radius:10px;
   background:rgba(127,127,127,.035);overflow:hidden}
 .fs-sec>summary{cursor:pointer;padding:9px 12px;font-size:13px;font-weight:600;
   display:flex;align-items:center;gap:8px;list-style:none;user-select:none}
