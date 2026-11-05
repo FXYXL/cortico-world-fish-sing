@@ -10,7 +10,7 @@
  */
 
 const CSS = `
-.fs-wrap{display:flex;flex-direction:column;gap:10px;width:100%;min-width:0;box-sizing:border-box;font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+.fs-wrap{display:flex;flex-direction:column;gap:10px;width:100%;min-width:0;box-sizing:border-box;flex:1 1 auto;align-self:stretch;font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
 /* 宽度交给宿主：.panelslot > :where(...) 已经给了 width:100% + max-width:var(--content-width)=1120px。
    自己再写 max-width（比如 980px）会把宿主规则覆盖掉，看起来"没占满"；写 none 又会被 overflow 裁掉。
    这里只补 box-sizing——根元素带 padding 时不加它会把盒子撑出容器，内容往左溢出（dev-guide 里点名的坑）。 */

@@ -2,6 +2,12 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.19] - 2026-11-05
+
+### 修复
+- 面板满宽再补一层兜底：`.fs-wrap` 加上 `flex:1 1 auto; align-self:stretch`。之前只有 `width:100%`，如果宿主把面板塞进一个**收缩成内容宽**的 flex/grid 容器里，百分比会解析成 auto，结果就是"内容按最宽的子元素缩起来、靠左"。现在块 / flex / grid 三种父容器都能撑满。
+- （0.4.18 的 `max-width` 移除保留：宽度上限仍交给宿主的 `--content-width`。）
+
 ## [0.4.18] - 2026-11-05
 
 ### 修复
