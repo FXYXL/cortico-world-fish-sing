@@ -2,6 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化。
 
+## [0.4.18] - 2026-11-05
+
+### 修复
+- **插件页面不满宽**：`.fs-wrap` 上写了 `max-width:980px; margin:0 auto`，把宿主的 `.panelslot > :where(...)`（`width:100%` + `max-width:var(--content-width)`=1120px）覆盖掉了，看起来内容缩在中间。现在宽度完全交给宿主，只补 `min-width:0` 和 `box-sizing:border-box`（含 `.fs-wrap *`，避免根元素 padding 撑出容器、内容向左溢出——见 coopanion-plugin-dev-guide 的「自定义面板的宽度」）。
+
 ## [0.4.17] - 2026-11-03
 
 ### 修复（来自 issue #1 与市场反馈）
