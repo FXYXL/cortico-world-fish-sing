@@ -29,6 +29,11 @@ export interface FishSingConfigSection {
     protect: number;
     /** 半音数；'auto' = 每次按源曲与模型音域自动推荐 */
     pitch: number | 'auto';
+    /**
+     * 音量包络跟随原唱的程度（RVC 的 rms_mix_rate）：
+     * 0 = 完全跟随原唱（轻唱就是轻唱）；1 = 完全用模型自己的音量（轻唱会被唱满）。
+     */
+    rmsMixRate: number;
     /** full = 带伴奏；vocals = 只要人声 */
     mode: 'full' | 'vocals';
   };
@@ -101,6 +106,9 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     indexRate: 0.75,
     protect: 0.33,
     pitch: 'auto',
+    // 0 = 严格跟随原唱的音量起伏。用户实测：温柔的原唱用 0 最好听；
+    // 老版本这里是 1.0（等于放弃跟随），轻唱段落会被唱满。
+    rmsMixRate: 0,
     mode: 'full',
   },
   play: {
@@ -187,6 +195,17 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             type: ['number', 'string'],
             title: '默认移调（半音）或 auto',
             description: "填 'auto' = 每首歌按源曲与模型音域自动推荐（默认，推荐）。填数字 = 固定移调；男歌女唱常要 +2 ~ +4。",
+            'x-hot': true,
+          },
+          [at('voice.rmsMixRate')]: {
+            type: 'number',
+            title: '音量跟随 rms-mix-rate',
+            description:
+              '轻唱/渐弱能不能还原，全看这个。0 = 完全跟随原唱的音量起伏（推荐，温柔的歌用它最好听）；'
+              + '0.25 = 保留一点模型自己的动态（RVC 官方默认）；'
+              + '0.5 以上轻唱会被"唱满"，渐弱基本消失；1 = 完全不跟随（老版本的行为，已废弃）。',
+            minimum: 0,
+            maximum: 1,
             'x-hot': true,
           },
           [at('voice.mode')]: {

@@ -52,6 +52,14 @@ const t1 = parseTarget('2587509374');
 check('裸号码 → 私聊', Boolean(t1) && t1.action === 'send_private_msg' && t1.params.user_id === 2587509374);
 check('乱码 → null', parseTarget('2587509374abc') === null);
 
+// ---- 6. 音量跟随：默认 0（跟随原唱），且配置里有这一项 ----
+const { FISHSING_DEFAULTS, fishsingConfigGroups } = await import('../src/config.ts');
+check('默认 rmsMixRate = 0', FISHSING_DEFAULTS.voice.rmsMixRate === 0);
+const voiceGroup = fishsingConfigGroups().find((g) => g.id.endsWith('.voice'));
+const key = Object.keys(voiceGroup.schema.properties).find((k) => k.endsWith('voice.rmsMixRate'));
+check('配置项 voice.rmsMixRate 存在', Boolean(key));
+check('配置项有说明文案', String(voiceGroup.schema.properties[key].description || '').length > 20);
+
 if (failed) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

@@ -138,5 +138,14 @@ class AugmentWeightExpansion(unittest.TestCase):
             self.assertAlmostEqual(ratio, 2 ** (semi / 12), places=3)
             self.assertAlmostEqual(float(t.group(1)), 1 / ratio, places=3)
 
+    def test_rms_mix_default_follows_source(self):
+        # rms_mix_rate=0 才等于"音量跟随原唱"；1 在 RVC 里是"不做对齐"（轻唱会被唱满）。
+        # 老版本默认 1.0 导致所有翻唱的渐弱消失，这里钉住默认值，别再改回去。
+        import inspect
+        for fn in (engine.SingEngine.convert, engine.SingEngine.song):
+            sig = inspect.signature(fn)
+            self.assertIn('rms_mix_rate', sig.parameters, f'{fn.__name__} 少了 rms_mix_rate')
+            self.assertEqual(sig.parameters['rms_mix_rate'].default, 0.0, f'{fn.__name__} 默认值应为 0.0')
+
 if __name__ == "__main__":
     unittest.main()

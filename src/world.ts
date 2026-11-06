@@ -461,6 +461,7 @@ export class FishSingWorld implements World {
         indexRate: Number(cfg.voice?.indexRate ?? 0.75),
         protect: Number(cfg.voice?.protect ?? 0.33),
         pitch: (cfg.voice?.pitch as number | 'auto' | undefined) ?? 'auto',
+        rmsMixRate: cfg.voice?.rmsMixRate === undefined ? 0 : Number(cfg.voice.rmsMixRate),
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
     };
@@ -542,6 +543,11 @@ export class FishSingWorld implements World {
           duration: { type: 'number', description: '唱多长（秒）；配合 start 可只发一段' },
           refresh: { type: 'boolean', description: '忽略缓存重唱一遍' },
           search: { type: 'boolean', description: '只搜索不下载，返回候选列表（标题/时长/UP主/播放/BV）让你自己挑' },
+          rmsMixRate: {
+            type: 'number',
+            description: '音量跟随原唱的程度 0~1：0 = 完全跟随（轻唱/渐弱能还原，默认）；'
+              + '0.25 = 保留一点模型自己的动态；1 = 不跟随（轻唱会被唱满）。不确定就别传。',
+          },
           pick: { type: 'string', description: '选定第几条：序号（从 1 开始）或 BV 号；配合 search 使用' },
           order: {
             type: 'string',
@@ -568,6 +574,7 @@ export class FishSingWorld implements World {
               : String(args.pitch).toLowerCase() === 'auto' ? 'auto' : Number(args.pitch),
             indexRate: args.indexRate === undefined ? undefined : Number(args.indexRate),
             protect: args.protect === undefined ? undefined : Number(args.protect),
+            rmsMixRate: args.rmsMixRate === undefined ? undefined : Number(args.rmsMixRate),
             start: args.start === undefined ? undefined : Number(args.start),
             duration: args.duration === undefined ? undefined : Number(args.duration),
             refresh: args.refresh === true,

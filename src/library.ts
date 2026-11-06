@@ -18,6 +18,8 @@ export interface SingParams {
   protect: number;
   /** 半音数；'auto' = worker 分离后按模型音域自动推荐 */
   pitch: number | 'auto';
+  /** 音量跟随原唱的程度 0~1（0 = 完全跟随，轻唱不会被唱满） */
+  rmsMixRate?: number;
   mode: string;
 }
 

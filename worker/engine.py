@@ -512,7 +512,7 @@ class SingEngine:
         return out_sr, self._fit_length(audio, int(round(seg.shape[0] * out_sr / sr)))
 
     def convert(self, src: Path, dst: Path, *, pitch: int = 0, index_rate: float = 0.75,
-                protect: float = 0.33, rms_mix_rate: float = 1.0,
+                protect: float = 0.33, rms_mix_rate: float = 0.0,
                 progress: Optional[Callable[[float, str], None]] = None,
                 cancel: Optional[threading.Event] = None) -> dict:
         """把整段音频切片换声，返回 {sr, chunks, seconds}。"""
@@ -703,6 +703,7 @@ class SingEngine:
 
     def song(self, src: Path, work: Path, *, separate: bool = True, mode: str = "full",
              pitch: "int | str" = 0, index_rate: float = 0.75, protect: float = 0.33,
+             rms_mix_rate: float = 0.0,
              progress: Optional[Callable[[float, str], None]] = None,
              cancel: Optional[threading.Event] = None) -> dict:
         """
@@ -738,7 +739,7 @@ class SingEngine:
         report(0.2, "加载模型" if not self.ready else "开始换声")
         conv = work / "vocals_converted.wav"
         info = self.convert(vocal_src, conv, pitch=pitch, index_rate=index_rate,
-                            protect=protect,
+                            protect=protect, rms_mix_rate=rms_mix_rate,
                             progress=lambda p, m: report(0.2 + 0.6 * p, m), cancel=cancel)
 
         if mode == "vocals":
@@ -791,7 +792,7 @@ class SingEngine:
     # -- 选模对比试听 -----------------------------------------------
 
     def ab_test(self, test: Path, out_dir: Path, variants: list, *, pitch: int = 0,
-                index_rate: float = 0.75, protect: float = 0.33,
+                index_rate: float = 0.75, protect: float = 0.33, rms_mix_rate: float = 0.0,
                 progress: Optional[Callable[[float, str], None]] = None,
                 cancel: Optional[threading.Event] = None) -> dict:
         """
@@ -818,6 +819,7 @@ class SingEngine:
                 report((i + 0.25) / n, f"换声：{label}")
                 self.convert(
                     test, dst, pitch=pitch, index_rate=index_rate, protect=protect,
+                    rms_mix_rate=rms_mix_rate,
                     progress=lambda p, m, _i=i, _n=n: report((_i + 0.25 + 0.7 * p) / _n, m),
                     cancel=cancel,
                 )
