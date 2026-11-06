@@ -427,7 +427,10 @@ function mountSetup(ctx) {
     const need = m.filter((x) => !isOptional(x));
     const needReady = need.filter((x) => x.ready).length;
     const weightsOk = needReady === need.length;
-    const optMissing = Number(st.optionalMissing ?? m.filter((x) => isOptional(x) && !x.ready).length);
+    const optList = m.filter((x) => isOptional(x) && !x.ready);
+    const optMissing = Number(st.optionalMissing ?? optList.length);
+    // 大小也要有兜底：world 重启前不带 optionalMissingBytes，之前会显示「补下默认模型（0.0 MB）」
+    const optMissingBytes = Number(st.optionalMissingBytes ?? optList.reduce((n, x) => n + (Number(x.size) || 0), 0));
     const weightsText = weightsOk
       ? (optMissing ? '就绪 · 默认模型未装' : `就绪 · ${needReady}/${need.length}`)
       : `缺 ${need.length - needReady} 项 · ${needReady}/${need.length}`;
@@ -466,7 +469,7 @@ function mountSetup(ctx) {
 
     // 按钮文案跟着状态走，避免"已经装好了还写着安装"
     dl.textContent = weightsOk
-      ? (optMissing ? `补下默认模型（${mb(st.optionalMissingBytes || 0)}）` : '校验权重')
+      ? (optMissing ? `补下默认模型（${mb(optMissingBytes)}）` : '校验权重')
       : `下载必需组件（${mb(st.totalBytes - st.doneBytes)}）`;
     if (st.python && st.python.ok) {
       gpu.textContent = '重装 GPU 运行时';
