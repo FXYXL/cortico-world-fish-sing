@@ -151,6 +151,12 @@ export function inspect(paths: WorkerPaths): SetupStatus {
     return { ...f, ready: actual === f.size, actual };
   });
   const doneBytes = models.reduce((n, m) => n + (m.ready ? m.size : 0), 0);
+  // 分「必需」和「可选」：hubert/rmvpe/底模缺了就没法换声；出厂默认模型（dfy2）只是示例，
+  // 用户换过模型后删掉它很正常——不能因此报"4/6 未就绪"，那是误导（0.4.22 之前就是这样）。
+  const required = models.filter((m) => m.required !== false);
+  const optional = models.filter((m) => m.required === false);
+  const requiredReady = required.filter((m) => m.ready).length;
+  const optionalMissing = optional.filter((m) => !m.ready).length;
   return {
     runtimeRoot: paths.runtimeRoot,
     rvc: { ready: dirCount(paths.rvcRoot) > 0, root: paths.rvcRoot, files: dirCount(paths.rvcRoot) },
@@ -162,6 +168,13 @@ export function inspect(paths: WorkerPaths): SetupStatus {
     models,
     doneBytes,
     totalBytes: models.reduce((n, m) => n + m.size, 0),
+    /** 必需组件是否齐（决定"能不能唱/训"） */
+    weightsOk: requiredReady === required.length,
+    requiredReady,
+    requiredTotal: required.length,
+    /** 可选（出厂默认模型）缺了几个，只做提示不做告警 */
+    optionalMissing,
+    optionalMissingBytes: optional.reduce((n, m) => n + (m.ready ? 0 : m.size), 0),
     systemPython: findSystemPython(),
     ffmpeg: {
       dir: paths.ffmpegDir,

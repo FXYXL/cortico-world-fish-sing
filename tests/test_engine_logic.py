@@ -147,5 +147,19 @@ class AugmentWeightExpansion(unittest.TestCase):
             self.assertIn('rms_mix_rate', sig.parameters, f'{fn.__name__} 少了 rms_mix_rate')
             self.assertEqual(sig.parameters['rms_mix_rate'].default, 0.0, f'{fn.__name__} 默认值应为 0.0')
 
+    def test_manifest_marks_optional_default_model(self):
+        # 出厂默认模型（dfy2 + 它的索引）是可选示例：用户换模型后删掉很常见，
+        # 不能因为缺它就把自检显示成"未就绪"。必需组件只有 hubert/rmvpe/两个底模。
+        import json, pathlib
+        m = json.loads(pathlib.Path('assets/models.manifest.json').read_text(encoding='utf-8'))
+        req = [f['target'] for f in m['files'] if f.get('required') is not False]
+        opt = [f['target'] for f in m['files'] if f.get('required') is False]
+        self.assertEqual(len(req), 4, f'必需组件应为 4 个，实际 {req}')
+        self.assertTrue(any('hubert' in t for t in req))
+        self.assertTrue(any('rmvpe' in t for t in req))
+        self.assertTrue(any('f0G40k' in t for t in req))
+        self.assertTrue(any('f0D40k' in t for t in req))
+        self.assertEqual(len(opt), 2, f'可选应为 dfy2 模型+索引两项，实际 {opt}')
+
 if __name__ == "__main__":
     unittest.main()

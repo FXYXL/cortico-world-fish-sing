@@ -365,7 +365,9 @@ function mountSetup(ctx) {
   const list = el('div', 'fs-list');
   const hint = el('div', 'fs-hint');
   hint.textContent =
-    '权重约 909 MB（模型 + 检索索引 + ContentVec + RMVPE + 底模），下载后会自动校验 sha256。\n'
+    '必需组件约 557 MB：ContentVec + RMVPE + 两个训练底模——这几个缺了才真的用不了，下载后自动校验 sha256。\n'
+    + '出厂默认模型（dfy2 + 检索索引，约 349 MB）是可选的示例；换过模型之后删掉它完全没问题，'
+    + '自检只会显示「默认模型未装」，点按钮可补。\n'
     + '运行时是 Python 环境：GPU 版下载约 2.5 GB、装完约 6 GB（55 秒的歌约 8 秒换完）；'
     + 'CPU 版只要约 200 MB，但慢 6~8 倍。已经装好 torch 的不会被覆盖。';
 
@@ -415,9 +417,23 @@ function mountSetup(ctx) {
   const paint = (st) => {
     const m = st.models || [];
     const ready = m.filter((x) => x.ready).length;
+    // 必需（hubert/rmvpe/底模）才算"能不能用"；出厂默认模型 dfy2 是可选的示例，
+    // 换过模型后删掉它很常见，不能因此把整块显示成"4/6 未就绪"（用户会以为装坏了）。
+    // world 侧重启后会给 required 字段；没给时按文件名兜底认出厂默认模型（dfy2 的 .pth 和它的索引），
+    // 这样不重启也能立刻显示正确结果。
+    const isOptional = (x) => (x.required === false)
+      || (x.required === undefined
+        && (/assets[\\/]weights[\\/]dfy2\.pth$/.test(x.target || '') || /logs[\\/]dfy2[\\/]/.test(x.target || '')));
+    const need = m.filter((x) => !isOptional(x));
+    const needReady = need.filter((x) => x.ready).length;
+    const weightsOk = needReady === need.length;
+    const optMissing = Number(st.optionalMissing ?? m.filter((x) => isOptional(x) && !x.ready).length);
+    const weightsText = weightsOk
+      ? (optMissing ? '就绪 · 默认模型未装' : `就绪 · ${needReady}/${need.length}`)
+      : `缺 ${need.length - needReady} 项 · ${needReady}/${need.length}`;
     cards.replaceChildren(
       card('RVC 代码', st.rvc && st.rvc.ready ? '已就绪' : '缺失', st.rvc && st.rvc.ready ? 'ok' : 'bad'),
-      card('模型权重', `${ready}/${m.length} · ${mb(st.doneBytes)}`, ready === m.length ? 'ok' : ready ? 'warn' : 'bad'),
+      card('模型权重', weightsText, weightsOk ? 'ok' : needReady ? 'warn' : 'bad'),
       card('Python 运行时', st.python && st.python.ok ? '已就绪' : '未安装', st.python && st.python.ok ? 'ok' : 'bad'),
       card('ffmpeg', st.ffmpeg && st.ffmpeg.ok ? '已就绪' : '没找到', st.ffmpeg && st.ffmpeg.ok ? 'ok' : 'bad'),
     );
@@ -449,7 +465,9 @@ function mountSetup(ctx) {
     }
 
     // 按钮文案跟着状态走，避免"已经装好了还写着安装"
-    dl.textContent = ready === m.length ? '校验 / 补下权重' : `下载模型权重（${mb(st.totalBytes - st.doneBytes)}）`;
+    dl.textContent = weightsOk
+      ? (optMissing ? `补下默认模型（${mb(st.optionalMissingBytes || 0)}）` : '校验权重')
+      : `下载必需组件（${mb(st.totalBytes - st.doneBytes)}）`;
     if (st.python && st.python.ok) {
       gpu.textContent = '重装 GPU 运行时';
       cpu.textContent = '重装 CPU 运行时';
