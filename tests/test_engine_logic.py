@@ -174,5 +174,16 @@ class AugmentWeightExpansion(unittest.TestCase):
         self.assertFalse(looks_dry(r'D://music//普通歌曲.mp3'))
         self.assertTrue(looks_dry(r'D://music//vocal_take.wav'))
 
+    def test_dry_check_switchable(self):
+        # 干声实测校验（切 8 秒做快分离）可以用环境变量关掉，避免慢机器上扫描太慢
+        import os, sys, pathlib
+        sys.path.insert(0, str(pathlib.Path('worker').resolve()))
+        from dataset import _quick_vocal_ratio
+        os.environ['FISHSING_SKIP_DRY_CHECK'] = '1'
+        try:
+            self.assertIsNone(_quick_vocal_ratio('whatever.wav'))
+        finally:
+            os.environ.pop('FISHSING_SKIP_DRY_CHECK', None)
+
 if __name__ == "__main__":
     unittest.main()

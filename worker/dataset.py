@@ -92,6 +92,59 @@ def looks_dry(path) -> bool:
     return any(k in stem for k in DRY_HINTS)
 
 
+def _quick_vocal_ratio(path, seconds: float = 8.0):
+    r"""切中段几秒做一次快分离，返回 伴奏/人声 的能量比（>0.5 基本就是混音）。
+
+    只在「文件名说是干声」时才调用，用来兜住文件名骗人的情况——
+    比如素材放在 `…\大肥鱼伴奏+人声-某某\` 目录里，文件名却叫 `团子大家族.aac`。
+    失败（没装 demucs / 没显卡 / 文件太短）返回 None，调用方按文件名判断走。
+    """
+    import os
+    import shutil
+    import tempfile
+
+    if os.environ.get("FISHSING_SKIP_DRY_CHECK"):  # 想跳过校验就设这个
+        return None
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        # 用 ffprobe 而不是 soundfile：aac/m4a 这类容器 soundfile 读不了（会直接跳过校验）
+        dur = float(ffprobe(Path(str(path)))["duration"] or 0)
+        if dur < max(6.0, seconds):
+            return None
+        start = max(0.0, dur / 2 - seconds / 2)  # 取中段，避开片头静音
+
+        tmp = Path(tempfile.mkdtemp(prefix="dryck-"))
+        try:
+            clip = tmp / "clip.wav"
+            ff = os.environ.get("FISHSING_FFMPEG", "ffmpeg")
+            subprocess.run(
+                [ff, "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{seconds:.2f}",
+                 "-i", str(path), "-ac", "1", "-ar", "44100", str(clip)],
+                capture_output=True, check=True,
+            )
+            # 懒加载：避免扫描时无谓地拉 torch；兼容"包导入"和"脚本运行"两种方式
+            try:
+                from .separate import separate_file
+            except ImportError:
+                from separate import separate_file
+            vocals, inst, _sr = separate_file(clip, tmp / "sep", device="auto", quiet=True)
+
+            def _rms(fp):
+                y, _ = sf.read(str(fp), dtype="float32")
+                if y.ndim > 1:
+                    y = y.mean(axis=1)
+                return float(np.sqrt(np.mean(y ** 2)))
+
+            v, i = _rms(vocals), _rms(inst)
+            return i / (v + 1e-9)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def scan(paths) -> list:
     """把路径展开成源列表（文件夹递归，只收音频后缀）。"""
     found = []
@@ -114,15 +167,26 @@ def scan(paths) -> list:
         except Exception as e:  # noqa: BLE001
             out.append({"path": str(f), "name": f.name, "error": str(e)})
             continue
-        out.append({
+        dry = looks_dry(f)
+        note = ""
+        if dry:
+            # 文件名说干声，就再实测一次：混音被当干声会直接污染训练集，宁可多花几秒
+            ratio = _quick_vocal_ratio(f)
+            if ratio is not None and ratio > 0.5:
+                dry = False
+                note = f"文件名像干声，但实测伴奏/人声={ratio:.2f}，按混音处理"
+        row = {
             "path": str(f),
             "name": f.name,
             "duration": round(meta["duration"], 2),
             "sr": meta["sr"],
             "channels": meta["channels"],
             "codec": meta["codec"],
-            "dry": looks_dry(f),
-        })
+            "dry": dry,
+        }
+        if note:
+            row["note"] = note
+        out.append(row)
     return out
 
 
