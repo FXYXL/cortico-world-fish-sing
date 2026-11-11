@@ -161,5 +161,18 @@ class AugmentWeightExpansion(unittest.TestCase):
         self.assertTrue(any('f0D40k' in t for t in req))
         self.assertEqual(len(opt), 2, f'可选应为 dfy2 模型+索引两项，实际 {opt}')
 
+    def test_looks_dry_ignores_directory_names(self):
+        # 用户把素材放在「大肥鱼伴奏+人声-某某」这种目录下时，目录名带「人声」，
+        # 老实现用 str(path) 整串匹配，会把整个文件夹都判成干声——实测误判过：
+        # …\带伴奏\团子大家族.aac 其实是完整混音（伴奏比人声响 1.2 倍），却跳过分离。
+        import sys, pathlib
+        sys.path.insert(0, str(pathlib.Path('worker').resolve()))
+        from dataset import looks_dry
+        self.assertFalse(looks_dry(r'D://AI//大肥鱼伴奏+人声-某某//带伴奏//团子大家族.aac'))
+        self.assertTrue(looks_dry(r'D://AI//大肥鱼伴奏+人声-某某//干声//大肥鱼-暖暖-人声.wav'))
+        self.assertFalse(looks_dry(r'D://music//song-伴奏.wav'))
+        self.assertFalse(looks_dry(r'D://music//普通歌曲.mp3'))
+        self.assertTrue(looks_dry(r'D://music//vocal_take.wav'))
+
 if __name__ == "__main__":
     unittest.main()

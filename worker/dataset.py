@@ -73,10 +73,23 @@ def ffprobe(path) -> dict:
     }
 
 
+DRY_HINTS = ("vocal", "干声", "人声", "dry_", "clean_")
+WET_HINTS = ("伴奏", "instrumental", "karaoke", "accompaniment", "off_vocal", "offvocal", "inst_")
+
+
 def looks_dry(path) -> bool:
-    """文件名/目录名像不像已经分离好的人声。"""
-    s = str(path).lower()
-    return any(k in s for k in ("vocal", "干声", "人声", "dry_"))
+    """文件名像不像已经分离好的人声。
+
+    只看**文件名**，不看目录：用户把素材放在「大肥鱼伴奏+人声-某某」这种目录里时，
+    目录名带「人声」会把整个文件夹都判成干声——实测过：`…\大肥鱼伴奏+人声…\带伴奏\团子大家族.aac`
+    其实是完整混音（伴奏比人声还响 1.2 倍），却被跳过分离，等于拿混音去训练。
+
+    文件名里出现「伴奏 / instrumental / karaoke」等词时一律判为混音，优先级高于干声关键词。
+    """
+    stem = Path(str(path)).stem.lower()
+    if any(k in stem for k in WET_HINTS):
+        return False
+    return any(k in stem for k in DRY_HINTS)
 
 
 def scan(paths) -> list:
