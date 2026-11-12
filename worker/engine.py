@@ -704,10 +704,11 @@ class SingEngine:
     def song(self, src: Path, work: Path, *, separate: bool = True, mode: str = "full",
              pitch: "int | str" = 0, index_rate: float = 0.75, protect: float = 0.33,
              rms_mix_rate: float = 0.0,
+             harmony: "dict | None" = None,
              progress: Optional[Callable[[float, str], None]] = None,
              cancel: Optional[threading.Event] = None) -> dict:
         """
-        整首歌：分离 → 换声 → 混音。
+        整首歌：分离 → 换声（+可选和声） → 混音。
         mode: full=带伴奏 / vocals=只要人声（清唱）/ mixed 同 full 但保留中间文件
         pitch: 半音数；'auto' = 分离后按源曲与模型音域自动推荐。
         """
@@ -741,6 +742,21 @@ class SingEngine:
         info = self.convert(vocal_src, conv, pitch=pitch, index_rate=index_rate,
                             protect=protect, rms_mix_rate=rms_mix_rate,
                             progress=lambda p, m: report(0.2 + 0.6 * p, m), cancel=cancel)
+
+        # 和声堆叠：同一音色再唱几条（三度/五度），按响度门限只叠在"唱得响"的段落。
+        # 单轨再干净也薄，叠 1~2 条立刻有"后面有人在唱"的厚度（唱片里的主唱都这么做）。
+        harm_semis = [int(x) for x in ((harmony or {}).get("semis") or []) if int(x) != 0]
+        if harm_semis:
+            report(0.82, f"叠和声（{len(harm_semis)} 轨）")
+            stacked = self._stack_harmony(
+                conv, vocal_src, harm_semis, pitch=pitch, index_rate=index_rate,
+                protect=protect, rms_mix_rate=rms_mix_rate,
+                gain=float((harmony or {}).get("gain", 0.22)),
+                scope=str((harmony or {}).get("scope", "chorus")),
+                work=work, report=report, cancel=cancel, base_report=0.82,
+            )
+            if stacked is not None:
+                conv = stacked
 
         if mode == "vocals":
             out = work / "result.wav"
@@ -777,6 +793,69 @@ class SingEngine:
         if suggestion is not None:
             result["pitchSuggest"] = suggestion
         return result
+
+    def _stack_harmony(self, main_wav: Path, vocal_src: Path, semis: list,
+                       *, pitch: int, index_rate: float, protect: float,
+                       rms_mix_rate: float, gain: float, scope: str,
+                       work: Path, report, cancel, base_report: float = 0.82) -> "Path | None":
+        """把主轨和若干条同音色和声轨叠成一个立体声人声文件。
+
+        三条轨的音量比默认是 主:三度:五度 = 1 : gain : gain*0.45；
+        和声按响度门限只出现在"唱得响"的段落（scope=chorus），免得整段都在叠显得电子味重。
+        和声轨做 110Hz 高通，左右分开（三度偏左、五度偏右）。
+        """
+        from scipy.signal import butter, sosfilt   # 懒加载，避免无 scipy 时影响其它功能
+
+        def read(p: Path):
+            y, sr = sf.read(str(p), dtype="float32")
+            if y.ndim == 1:
+                y = np.stack([y, y], axis=1)
+            return y, sr
+
+        base, sr = read(main_wav)
+        # 响度门限：以主轨 RMS 的中位数为界，只给响亮段落叠和声
+        mono = base.mean(axis=1)
+        fl, hl = 2048, 512
+        n_fr = max(1, (len(mono) - fl) // hl)
+        env = np.array([float(np.sqrt(np.mean(mono[i * hl:i * hl + fl] ** 2) + 1e-12)) for i in range(n_fr)])
+        if scope == "all" or len(env) < 4:
+            gate = np.ones(len(mono), dtype="float32")
+        else:
+            thr = float(np.percentile(20 * np.log10(env + 1e-9), 55))
+            g = (20 * np.log10(env + 1e-9) > thr).astype("float32")
+            k = max(1, int(0.1 * sr / hl))            # 约 100ms 平滑
+            g = np.convolve(g, np.ones(k) / k, mode="same")
+            gate = np.interp(np.arange(len(mono)), np.arange(len(g)) * hl, g).astype("float32")
+
+        total = base.copy()
+        left = np.zeros(len(mono), dtype="float32")
+        right = np.zeros(len(mono), dtype="float32")
+        for i, semi in enumerate(semis):
+            if cancel.is_set():
+                raise RuntimeError("已取消")
+            report(base_report + (0.12 * (i + 1) / max(1, len(semis))), f"叠和声 {semi:+d} 半音")
+            tmp = work / f"harmony_{semi:+d}.wav"
+            self.convert(vocal_src, tmp, pitch=int(pitch) + int(semi), index_rate=index_rate,
+                         protect=protect, rms_mix_rate=rms_mix_rate,
+                         progress=lambda p, m: None, cancel=cancel)
+            h, _ = read(tmp)
+            n = min(len(h), len(mono))
+            m = h[:n].mean(axis=1) * gate[:n] * gain * (0.45 if abs(semi) >= 7 else 1.0)
+            # 110Hz 高通去浑
+            sos = butter(2, 110.0 / (sr / 2), btype="high", output="sos")
+            m = sosfilt(sos, m).astype("float32")
+            side = -0.3 if i % 2 == 0 else 0.3          # 一左一右
+            left[:n] += m * np.sqrt((1 - side) / 2) * 1.41
+            right[:n] += m * np.sqrt((1 + side) / 2) * 1.41
+
+        total[:, 0] += left[:len(total)]
+        total[:, 1] += right[:len(total)]
+        peak = float(np.abs(total).max())
+        if peak > 0.99:                                  # 叠完可能过载，保点余量
+            total *= 0.99 / peak
+        out = work / "vocals_stacked.wav"
+        write_audio(out, total, sr)
+        return out
 
     @staticmethod
     def pitch_shift_filter(sr: int, semitones: float) -> str:

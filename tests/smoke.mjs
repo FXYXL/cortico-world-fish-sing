@@ -60,6 +60,14 @@ const key = Object.keys(voiceGroup.schema.properties).find((k) => k.endsWith('vo
 check('配置项 voice.rmsMixRate 存在', Boolean(key));
 check('配置项有说明文案', String(voiceGroup.schema.properties[key].description || '').length > 20);
 
+// ---- 7. 和声堆叠：默认关，配置项齐全 ----
+check('默认和声 = off', FISHSING_DEFAULTS.voice.harmony === 'off');
+check('默认和声音量 0.22', FISHSING_DEFAULTS.voice.harmonyGain === 0.22);
+const hKeys = ['voice.harmony', 'voice.harmonyGain', 'voice.harmonyScope']
+  .map((k) => Object.keys(voiceGroup.schema.properties).find((x) => x.endsWith(k)));
+check('三个和声配置项都在', hKeys.every(Boolean));
+check('和声配置项都有说明', hKeys.every((k) => String(voiceGroup.schema.properties[k].description || '').length > 20));
+
 if (failed) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

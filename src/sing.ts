@@ -64,6 +64,8 @@ export interface SingRequest {
   protect?: number;
   /** 音量跟随原唱的程度 0~1（0 = 完全跟随，轻唱不会被唱满） */
   rmsMixRate?: number;
+  /** 和声堆叠：off / third / third+fifth */
+  harmony?: 'off' | 'third' | 'third+fifth';
   start?: number;
   duration?: number;
   /** 跳过缓存（想重唱一遍时用） */
@@ -270,6 +272,10 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     protect: Number(req.protect ?? deps.voice.protect),
     // 0 = 完全跟随原唱音量；1 = 完全用模型自己的（轻唱被唱满）。越界/NaN 一律退回配置值。
     rmsMixRate: clamp01(req.rmsMixRate ?? deps.voice.rmsMixRate),
+    harmony: (req.harmony ?? deps.voice.harmony) === 'third+fifth' ? 'third+fifth'
+      : (req.harmony ?? deps.voice.harmony) === 'third' ? 'third' : 'off',
+    harmonyGain: Math.min(0.6, Math.max(0, Number(deps.voice.harmonyGain ?? 0.22))),
+    harmonyScope: deps.voice.harmonyScope === 'all' ? 'all' : 'chorus',
     // 不传 pitch = 按配置默认（配置默认 'auto' = 按音域自动推荐）
     pitch: req.pitch === undefined || req.pitch === 'auto'
       ? (deps.voice.pitch ?? 'auto')
@@ -319,6 +325,11 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         index_rate: params.indexRate,
         protect: params.protect,
         rms_mix_rate: params.rmsMixRate,
+        harmony: params.harmony === 'off' ? null : {
+          semis: params.harmony === 'third+fifth' ? [3, 7] : [3],
+          gain: params.harmonyGain,
+          scope: params.harmonyScope,
+        },
       });
       let lastLog = 0;
       const job = await deps.worker.wait(jobId, (p, msg) => {

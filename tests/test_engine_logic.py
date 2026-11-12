@@ -185,5 +185,12 @@ class AugmentWeightExpansion(unittest.TestCase):
         finally:
             os.environ.pop('FISHSING_SKIP_DRY_CHECK', None)
 
+    def test_song_accepts_harmony(self):
+        # 和声堆叠：默认关（harmony=None），开了才多渲和声轨，别让不用的用户白白多等
+        import inspect
+        sig = inspect.signature(engine.SingEngine.song)
+        self.assertIn('harmony', sig.parameters, 'song() 少了 harmony 参数')
+        self.assertIsNone(sig.parameters['harmony'].default, 'harmony 默认应为 None（关闭）')
+
 if __name__ == "__main__":
     unittest.main()

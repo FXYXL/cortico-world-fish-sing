@@ -20,6 +20,10 @@ export interface SingParams {
   pitch: number | 'auto';
   /** 音量跟随原唱的程度 0~1（0 = 完全跟随，轻唱不会被唱满） */
   rmsMixRate?: number;
+  /** 和声堆叠档位 */
+  harmony?: 'off' | 'third' | 'third+fifth';
+  harmonyGain?: number;
+  harmonyScope?: 'chorus' | 'all';
   mode: string;
 }
 

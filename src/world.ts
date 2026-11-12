@@ -462,6 +462,10 @@ export class FishSingWorld implements World {
         protect: Number(cfg.voice?.protect ?? 0.33),
         pitch: (cfg.voice?.pitch as number | 'auto' | undefined) ?? 'auto',
         rmsMixRate: cfg.voice?.rmsMixRate === undefined ? 0 : Number(cfg.voice.rmsMixRate),
+        harmony: (cfg.voice?.harmony === 'third' || cfg.voice?.harmony === 'third+fifth'
+          ? cfg.voice.harmony : 'off') as 'off' | 'third' | 'third+fifth',
+        harmonyGain: cfg.voice?.harmonyGain === undefined ? 0.22 : Number(cfg.voice.harmonyGain),
+        harmonyScope: cfg.voice?.harmonyScope === 'all' ? 'all' : 'chorus',
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
     };

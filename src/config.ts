@@ -34,6 +34,12 @@ export interface FishSingConfigSection {
      * 0 = 完全跟随原唱（轻唱就是轻唱）；1 = 完全用模型自己的音量（轻唱会被唱满）。
      */
     rmsMixRate: number;
+    /** 和声堆叠：同一音色再唱几条叠上去（单轨再干净也薄） */
+    harmony: 'off' | 'third' | 'third+fifth';
+    /** 和声音量（主轨=1.0 的倍数），0.15~0.30 比较自然 */
+    harmonyGain: number;
+    /** 和声只叠在唱得响的段落（副歌），免得整段都在叠显得电子味 */
+    harmonyScope: 'chorus' | 'all';
     /** full = 带伴奏；vocals = 只要人声 */
     mode: 'full' | 'vocals';
   };
@@ -109,6 +115,9 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     // 0 = 严格跟随原唱的音量起伏。用户实测：温柔的原唱用 0 最好听；
     // 老版本这里是 1.0（等于放弃跟随），轻唱段落会被唱满。
     rmsMixRate: 0,
+    harmony: 'off',
+    harmonyGain: 0.22,
+    harmonyScope: 'chorus',
     mode: 'full',
   },
   play: {
@@ -206,6 +215,32 @@ export function fishsingConfigGroups(): ConfigGroup[] {
               + '0.5 以上轻唱会被"唱满"，渐弱基本消失；1 = 完全不跟随（老版本的行为，已废弃）。',
             minimum: 0,
             maximum: 1,
+            'x-hot': true,
+          },
+          [at('voice.harmony')]: {
+            type: 'string',
+            title: '和声堆叠',
+            description:
+              '同一音色再唱几条叠在一起，副歌立刻有"后面有人在唱"的厚度（唱片里的主唱都这么做）。'
+              + 'off = 关；third = 叠一条三度；third+fifth = 三度 + 五度（更满，也更容易显电子味）。'
+              + '注意：每多一条，转换时间就多一倍左右。',
+            enum: ['off', 'third', 'third+fifth'],
+            'x-hot': true,
+          },
+          [at('voice.harmonyGain')]: {
+            type: 'number',
+            title: '和声音量',
+            description: '主轨为 1.0 的相对音量。0.15 很含蓄；0.22 自然（推荐）；0.35 以上容易显"合成味"。',
+            minimum: 0,
+            maximum: 0.6,
+            'x-hot': true,
+          },
+          [at('voice.harmonyScope')]: {
+            type: 'string',
+            title: '和声范围',
+            description:
+              'chorus = 只叠在唱得响的段落（按响度自动判断，推荐）；all = 整首都在叠（容易电子味重）。',
+            enum: ['chorus', 'all'],
             'x-hot': true,
           },
           [at('voice.mode')]: {

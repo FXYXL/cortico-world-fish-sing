@@ -126,6 +126,7 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             protect=float(params.get("protect", 0.33)),
             # 0 = 音量完全跟随原唱（轻唱不会被唱满）；老版本传 1.0 = 不跟随
             rms_mix_rate=float(params.get("rms_mix_rate", 0.0)),
+            harmony=params.get("harmony") or None,
             progress=progress,
             cancel=cancel,
         )
