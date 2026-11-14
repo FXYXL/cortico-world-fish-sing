@@ -63,6 +63,7 @@ import {
   probeRuntime,
   type RuntimeMode,
   type SetupStatus,
+  missingRequiredCount,
 } from './setup.ts';
 import { duration, toMp3, type FfmpegDeps } from './audio.ts';
 import { parseTarget, Player, sendRecord } from './deliver.ts';
@@ -493,7 +494,10 @@ export class FishSingWorld implements World {
       : '还没唱过';
     // 装机状态：让她一眼知道现在能不能唱，而不是调了工具才发现缺权重
     const st = inspect(this.routes);
-    const missModels = st.models.filter((m) => !m.ready).length;
+    // 只算「必需」组件（hubert / rmvpe / 两个底模）。出厂默认模型 dfy2 是可选的示例：
+    // 用户换过模型后删掉它很正常。以前这里把所有文件都算上，结果她被告知"还缺 2 个权重、
+    // 现在唱不了"——明明能用 dfy7 唱，却按这句话拒绝唱歌。（面板 0.4.22 修过，这里是第三处）
+    const missModels = missingRequiredCount(st.models);
     const ready = st.rvc.ready && st.python.ok && missModels === 0;
     // 值写成**人话**而不是枚举：模板只做占位符替换、没有条件语法，
     // 所以这句话本身就是"缺什么 + 去哪补"的行动指引。
@@ -503,7 +507,7 @@ export class FishSingWorld implements World {
         ? '还缺插件代码，现在唱不了 —— 让她在控制台「大肥鱼唱歌 → 安装与运行时」页点「刷新」，或重装插件。'
         : !st.python.ok
           ? '还缺 Python 运行时，现在唱不了 —— 让她在「安装与运行时」页点「安装 GPU 运行时」。'
-          : `还缺 ${missModels} 个模型权重，现在唱不了 —— 让她在「安装与运行时」页点「下载模型权重」。`;
+          : `还缺 ${missModels} 个必需组件，现在唱不了 —— 让她在「安装与运行时」页点「下载必需组件」。`;
     return {
       singModel: model || '未配置',
       singTarget: where,

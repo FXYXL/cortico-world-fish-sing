@@ -68,6 +68,18 @@ const hKeys = ['voice.harmony', 'voice.harmonyGain', 'voice.harmonyScope']
 check('三个和声配置项都在', hKeys.every(Boolean));
 check('和声配置项都有说明', hKeys.every((k) => String(voiceGroup.schema.properties[k].description || '').length > 20));
 
+// ---- 8. 「必需组件」计数是唯一来源（面板/环境提示词共用，别再各写一遍） ----
+const { missingRequiredCount } = await import('../src/setup.ts');
+const fake = [
+  { ready: false, required: false },   // 可选（dfy2）
+  { ready: false, required: false },   // 可选（dfy2 索引）
+  { ready: true, required: true },
+  { ready: true, required: true },
+];
+check('可选模型缺失不算缺', missingRequiredCount(fake) === 0);
+check('必需缺失才算缺', missingRequiredCount([...fake, { ready: false, required: true }]) === 1);
+check('没写 required 的按必需算', missingRequiredCount([{ ready: false }]) === 1);
+
 if (failed) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

@@ -57,6 +57,13 @@ export function loadManifest(): Manifest {
   return JSON.parse(readFileSync(MODELS_MANIFEST, 'utf8')) as Manifest;
 }
 
+/** 还缺几个「必需」组件（hubert / rmvpe / 两个底模）。
+ *  出厂默认模型 dfy2 是可选的示例，用户换过模型后删掉很正常——不能算进"缺"里。
+ *  面板、环境提示词、自检三处都该用这一个函数，别再各写一遍（之前就漏过两处）。 */
+export function missingRequiredCount(models: ReadonlyArray<{ ready?: boolean; required?: boolean }>): number {
+  return models.filter((m) => !m.ready && m.required !== false).length;
+}
+
 function dirCount(p: string): number {
   if (!existsSync(p)) return 0;
   try {
