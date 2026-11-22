@@ -7,16 +7,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import torch
+try:
+    import torch
+except ImportError:  # CI 只装 numpy/soundfile/pyworld，没有 torch → 整个模块跳过
+    torch = None
 
 ROOT = Path(__file__).resolve().parent.parent
-tree = ast.parse((ROOT / 'vendor/rvc/train/data_utils.py').read_text(encoding='utf8'))
-node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'DistributedBucketSampler')
-scope = {'torch': torch, 'os': os}
-exec(compile(ast.Module(body=[node], type_ignores=[]), 'data_utils.py', 'exec'), scope)
-Sampler = scope['DistributedBucketSampler']
+Sampler = None
+if torch is not None:
+    tree = ast.parse((ROOT / 'vendor/rvc/train/data_utils.py').read_text(encoding='utf8'))
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'DistributedBucketSampler')
+    scope = {'torch': torch, 'os': os}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), 'data_utils.py', 'exec'), scope)
+    Sampler = scope['DistributedBucketSampler']
 
 
+@unittest.skipIf(Sampler is None, '没装 torch（CI 环境），跳过采样器测试')
 class SamplingReport(unittest.TestCase):
     def test_buckets_weights_and_report(self):
         class Dataset:
