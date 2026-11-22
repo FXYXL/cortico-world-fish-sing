@@ -986,8 +986,17 @@ function mountTrain(ctx) {
   let wRefs = [];
 
   const afterShares = () => {
-    const total = wrows.reduce((n, r) => n + r.seconds * (wcfg.bands[r.id] ?? 1), 0) || 1;
-    return wrows.map((r) => (r.seconds * (wcfg.bands[r.id] ?? 1)) / total);
+    const counts = wrows.map(() => 0);
+    let total = 0;
+    for (let bucket = 0; bucket < 8; bucket++) {
+      const n = wrows.reduce((sum, r) => sum + (r.buckets?.[bucket] || 0), 0);
+      if (!n) continue;
+      const draws = Math.ceil(n / 4) * 4;
+      const denominator = wrows.reduce((sum, r) => sum + (r.buckets?.[bucket] || 0) * (wcfg.bands[r.id] ?? 1), 0);
+      wrows.forEach((r, i) => { counts[i] += draws * (r.buckets?.[bucket] || 0) * (wcfg.bands[r.id] ?? 1) / denominator; });
+      total += draws;
+    }
+    return counts.map(n => n / (total || 1));
   };
 
   const paintWeightNumbers = () => {
@@ -1090,7 +1099,7 @@ function mountTrain(ctx) {
         /* 错误已显示 */
       }
     });
-    foot.append(saveBtn, el('span', 'fs-meta', '保存后训练会用这套权重：同一档的片段被抽到的概率按倍数放大，每轮步数不变'));
+    foot.append(saveBtn, el('span', 'fs-meta', '预览为桶内抽样片数占比（非增强 / batch4），不是时长占比；以训练采样报告为准，增强副本按原片音域归组'));
     weightBox.append(foot);
 
     paintWeightNumbers();
@@ -1242,7 +1251,7 @@ function mountTrain(ctx) {
   epIn.type = 'number';
   epIn.min = '10';
   epIn.max = '600';
-  epIn.value = '200';
+  epIn.value = '70';
   const bsSel = el('select', 'fs-tin');
   for (const v of [2, 4, 6, 8]) {
     const o = el('option', '', `batch ${v}`);
@@ -1271,8 +1280,8 @@ function mountTrain(ctx) {
   };
 
   tForm.append(
-    mkField('实验名', expIn, '产物会落在 logs/<实验名>，同名会复用目录'),
-    mkField('轮次', epIn, '200 轮 / 33 分钟数据约 3 小时'),
+    mkField('实验名', expIn, '从头训练使用新实验名；同名仅允许数据一致的断点续训'),
+    mkField('轮次', epIn, '先训练 40～70 轮，使用独立试听选模，增加轮次不保证更好'),
     mkField('批大小', bsSel, '8G 显存用 4，爆显存就降到 2'),
     mkField('每 N 轮存档', seIn, '每 N 轮导出一个小模型到「模型」页'),
   );
@@ -1292,7 +1301,7 @@ function mountTrain(ctx) {
   abChk.checked = false; // 用户要求：不默认勾，想要就自己点
   const abLbl = el('label', 'fs-meta', '训练完生成选模对比');
   abLbl.prepend(abChk);
-  abLbl.title = '用同一句训练切片，final 和最后两个中间档各唱一遍，进作品库对比听';
+  abLbl.title = '用下面独立的低、中、高音干声对比 final 和最后两个中间档，关闭检索';
   const lowChk = el('input', 'fs-ck');
   lowChk.type = 'checkbox';
   lowChk.checked = false; // 用户要求：不默认勾（实测只是有限改善）
@@ -1301,6 +1310,14 @@ function mountTrain(ctx) {
   lowLbl.title = '有限改善：把每个切片合成 -2/-4 半音的副本一起训练。实测只能缓解、不能根治"低音不像"（模型在低音区本来就没有音色记忆），且 F0/特征提取时间约 ×3';
   chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, lowLbl, el('span', 'fs-grow'), startT, stopT);
 
+  const evaluationInputs = ['低音', '中音', '高音'].map(band => {
+    const input = el('input', 'fs-tin');
+    input.placeholder = `${band}独立干声路径（未参与训练，含长音，建议10～30秒）`;
+    return input;
+  });
+  const evaluationBox = el('div', 'fs-list');
+  evaluationBox.append(el('div', 'fs-meta', '选模素材：固定低、中、高音三段独立干声。请确认没有同一首歌的片段进入训练集。'), ...evaluationInputs);
+  const samplingText = el('div', 'fs-meta');
   const tProg = el('div', 'fs-prog');
   const tFill = el('i');
   tProg.append(tFill);
@@ -1320,10 +1337,10 @@ function mountTrain(ctx) {
   const pruneBtn = el('button', 'fs-btn', '清理中间档');
   pruneBtn.title = '只删 assets/weights/<exp>_eN_sX.pth 这种导出的小模型；完整存档、索引、最终模型都不动';
   const abBtn = el('button', 'fs-btn', '生成选模对比');
-  abBtn.title = '用当前实验的存档（final + 最后两个中间档）各唱同一句训练切片，生成对比试听进作品库';
+  abBtn.title = '用独立低、中、高音干声对比 final 和最后两个中间档，关闭检索';
   ckptBar.append(el('span', 'fs-meta', '中间档：'), ckptMeta, el('span', 'fs-meta', '每'),
     keepIn, el('span', 'fs-meta', '轮留一个'), el('span', 'fs-grow'), abBtn, pruneBtn);
-  trainBox.append(tTitle, tForm, chkRow, tProg, tMsg, losses, lossAxis, tModels, ckptBar);
+  trainBox.append(tTitle, tForm, chkRow, evaluationBox, tProg, tMsg, samplingText, losses, lossAxis, tModels, ckptBar);
 
   let trainExp = '';
   let trainTimer = null;
@@ -1347,7 +1364,7 @@ function mountTrain(ctx) {
     abBtn.disabled = true;
     abBtn.textContent = '生成中…';
     try {
-      const r = await ctx.invoke('trainAbTest', [{ exp }]);
+      const r = await ctx.invoke('trainAbTest', [{ exp, evaluationPaths: evaluationInputs.map(input => input.value.trim()) }]);
       tMsg.textContent = (r && r.text) || `选模对比已生成（${exp}）`;
     } catch (e) {
       tMsg.textContent = `选模对比失败：${(e && e.message) || e}`;
@@ -1422,6 +1439,11 @@ function mountTrain(ctx) {
   };
 
   const paintTrain = (st) => {
+    const report = st.sampling;
+    const sampleTotal = Object.values(report?.counts || {}).reduce((sum, n) => sum + Number(n), 0);
+    samplingText.textContent = report ? `第 ${report.epoch} 轮采样计划：${sampleTotal} 次 / ${Object.keys(report.counts || {}).length} 个不同切片；` +
+      Object.entries(report.bands || {}).map(([band, n]) => `${({low:'低', mid:'中', high:'偏高', top:'高', unknown:'未知'})[band] || band} ${(Number(n) / (sampleTotal || 1) * 100).toFixed(1)}%`).join(' · ') +
+      (report.replicas > 1 ? '（仅 rank0）' : '') : '实际采样报告：训练启动后显示';
     const job = st.job;
     // 有 job 就看 job；没有但日志还在写 = 重启前留下的训练还在跑，一样要当成「进行中」
     const owned = Boolean(job && job.id);
@@ -1549,13 +1571,14 @@ function mountTrain(ctx) {
     try {
       const r = await call('trainStart', [{
         exp: String(expIn.value || '').trim(),
-        epochs: Number(epIn.value) || 200,
+        epochs: Number(epIn.value) || 70,
         batch: Number(bsSel.value) || 4,
         saveEvery: Number(seIn.value) || 10,
         resume: resumeChk.checked,
         rebuild: rebuildChk.checked,
         pruneAfter: pruneAfterChk.checked,
         abTest: abChk.checked,
+        evaluationPaths: evaluationInputs.map(input => input.value.trim()),
         augment: lowChk.checked,
         keepEvery: Math.max(1, Number(keepIn.value) || 50),
       }]);

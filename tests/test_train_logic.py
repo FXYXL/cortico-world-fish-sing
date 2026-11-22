@@ -3,6 +3,9 @@ import json
 import sys
 import tempfile
 import unittest
+import threading
+import time
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,9 +20,10 @@ class ExpandAugWeights(unittest.TestCase):
     def test_inherit_and_divide(self):
         w = {"a.wav": 3.0, "b.wav": 1.0}
         e = trainer.expand_aug_weights(w, [-2, -4])
-        # 源片权重不变
-        self.assertEqual(e["a.wav"], 3.0)
-        self.assertEqual(e["b.wav"], 1.0)
+        self.assertEqual(e["a.wav"], 1.0)
+        self.assertAlmostEqual(e["b.wav"], 1 / 3)
+        for name, weight in w.items():
+            self.assertAlmostEqual(sum(v for k, v in e.items() if k.endswith(name)), weight)
         # 副本继承 ÷ (副本数 + 1)：3x 源 + 2 副本 → 各 1x
         self.assertAlmostEqual(e["aug-2_a.wav"], 1.0)
         self.assertAlmostEqual(e["aug-4_a.wav"], 1.0)
@@ -31,10 +35,12 @@ class ExpandAugWeights(unittest.TestCase):
         self.assertEqual(trainer.expand_aug_weights(None, [-2]), {})
         self.assertEqual(trainer.expand_aug_weights({"a.wav": 2.0}, []), {"a.wav": 2.0})
 
-    def test_all_unit_weights_not_expanded(self):
-        # 全 1x 源权重：不该造副本权重表（否则会写出全 0.333 的伪加权表）
+    def test_all_unit_weights_preserve_group_total(self):
+        # 原片和副本都为相同常数，合计保持 1，采样器仍走均匀路径。
         e = trainer.expand_aug_weights({"a.wav": 1.0}, [-2, -4])
-        self.assertEqual(e, {"a.wav": 1.0})
+        self.assertEqual(len(e), 3)
+        self.assertAlmostEqual(sum(e.values()), 1.0)
+        self.assertEqual(len(set(e.values())), 1)
 
     def test_zero_shift_ignored(self):
         # 0 半音不是有效副本：[-2] 只有 1 个副本 → 3x 源片摊薄为 3/2
@@ -83,6 +89,46 @@ class LogParsing(unittest.TestCase):
         self.assertEqual(d["loss_disc"], 1.5)
         self.assertEqual(d["loss_gen"], 2.5)
         self.assertIsNone(trainer._loss_of("无关日志"))
+
+
+class ExperimentSafety(unittest.TestCase):
+    def test_binding_detects_content_and_augmentation_changes(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(trainer, 'RVC_ROOT', Path(td)):
+            dataset = Path(td) / 'ds'
+            (dataset / 'slices').mkdir(parents=True)
+            wav = dataset / 'slices' / 'a.wav'
+            wav.write_bytes(b'a' * 2000)
+            (dataset / 'manifest.json').write_text(json.dumps({'slices': [
+                {'file': 'slices/a.wav', 'kept': True},
+                {'file': 'slices/stale.wav', 'kept': False}]}))
+            files, snap = trainer.validate_experiment('demo', dataset, {})
+            self.assertEqual(files, [wav])
+            exp = trainer.exp_dir_of('demo')
+            exp.mkdir(parents=True)
+            (exp / 'dataset_binding.json').write_text(json.dumps(snap))
+            for name in ('G_10.pth', 'D_10.pth'):
+                (exp / name).touch()
+            with self.assertRaises(RuntimeError):
+                trainer.validate_experiment('demo', dataset, {})
+            trainer.validate_experiment('demo', dataset, {'resume': True})
+            with self.assertRaises(RuntimeError):
+                trainer.validate_experiment('demo', dataset, {'resume': True, 'augmentShifts': [-2]})
+            wav.write_bytes(b'b' * 2000)
+            with self.assertRaises(RuntimeError):
+                trainer.validate_experiment('demo', dataset, {'resume': True})
+
+    def test_silent_child_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(trainer, 'RVC_ROOT', Path(td)):
+            cancel = threading.Event()
+            timer = threading.Timer(0.4, cancel.set)
+            timer.start()
+            start = time.monotonic()
+            try:
+                with self.assertRaisesRegex(RuntimeError, '已取消'):
+                    trainer.run([sys.executable, '-c', 'import time; time.sleep(30)'], 'silent', cancel=cancel)
+                self.assertLess(time.monotonic() - start, 8)
+            finally:
+                timer.cancel()
 
 
 if __name__ == "__main__":

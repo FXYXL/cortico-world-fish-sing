@@ -21,6 +21,30 @@ import engine  # noqa: E402
 SR = 40000
 
 
+class IndependentEvaluation(unittest.TestCase):
+    def test_three_inputs_use_identical_parameters_and_restore_model(self):
+        class FakeEngine:
+            model_path = 'original.pth'
+            model = 'original.pth'
+            index = 'original.index'
+            def set_model(self, model, index):
+                self.model_path, self.index = str(model), index
+            def convert(self, src, dst, **kwargs):
+                calls.append((str(src), kwargs['index_rate'], kwargs['pitch']))
+        calls = []
+        fake = FakeEngine()
+        with tempfile.TemporaryDirectory() as td:
+            inputs = [Path(td) / f'{band}.wav' for band in ('low', 'mid', 'high')]
+            result = engine.SingEngine.ab_test(fake, inputs[0], Path(td),
+                [{'ckpt': 'final.pth', 'label': 'final'}, {'ckpt': 'e60.pth', 'label': 'e60'}],
+                tests=inputs, index_rate=0, pitch=0)
+            self.assertEqual(len(result['outputs']), 6)
+            self.assertEqual([c[0] for c in calls], [str(p) for p in inputs] * 2)
+            self.assertTrue(all(c[1:] == (0, 0) for c in calls))
+            self.assertEqual(fake.model_path, 'original.pth')
+            self.assertEqual(fake.index, 'original.index')
+
+
 class SuggestPitch(unittest.TestCase):
     def setUp(self):
         self.model = {"p5": 313.0, "median": 356.0, "p95": 477.0}

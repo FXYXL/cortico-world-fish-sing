@@ -22,3 +22,7 @@
    `logs/*.index` 由用户在「模型」页按 `assets/models.manifest.json` 下载（sha256 校验）。
 
 License: MIT，全文见仓库根目录 `LICENSE`（本插件亦为 MIT）。
+# 本地训练修正（0.4.25）
+
+- train/train.py：显式续训开关、配对 G/D 路径，续训失败中止；从已完成轮次的下一轮开始。
+- train/data_utils.py：按实际音频帧数分桶；常量权重退回均匀路径；按轮原子写出采样计划报告。

@@ -6,6 +6,24 @@
  */
 import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { createHash } from 'node:crypto';
+
+export function validateEvaluation(paths: string[], trainingFiles: string[]): string[] {
+  if (paths.length !== 3 || paths.some(p => !p || !existsSync(p) || !statSync(p).isFile())) {
+    throw new Error('请分别提供低、中、高音三段独立干声文件（不要使用训练素材）');
+  }
+  const digest = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
+  const hashes = paths.map(digest);
+  if (new Set(hashes).size !== 3) throw new Error('三段试听素材不能重复');
+  const training = new Set(trainingFiles.filter(p => existsSync(p) && statSync(p).isFile()).map(digest));
+  if (hashes.some(h => training.has(h))) throw new Error('试听素材与训练素材内容重复，请换用未参与训练的干声');
+  return paths;
+}
+
+export function readSamplingReport(expDir: string): unknown {
+  try { return JSON.parse(readFileSync(join(expDir, 'sampling_report.json'), 'utf8')); }
+  catch { return null; }
+}
 
 import type { WorkerClient } from './worker.ts';
 
@@ -63,6 +81,7 @@ export const DROP_LABEL: Record<string, string> = {
   too_quiet: '几乎没声音',
   clipped: '削波',
   f0_outlier: '音高异常（可能不是人声）',
+  f0_analysis_failed: '音高分析失败（需复查）',
 };
 
 export const BAND_LABEL: Record<string, string> = {
@@ -173,6 +192,8 @@ export interface BandRow {
   /** 加权后的占比 */
   after: number;
   weight: number;
+  /** 40k / hop400 长度桶的样本数，供前端按桶重算估计值。 */
+  buckets: number[];
 }
 
 export const BAND_ORDER: BandId[] = ['low', 'mid', 'high', 'top'];
@@ -282,18 +303,39 @@ function bandOfSlice(s: SliceRecord, mode: BandMode): BandId | 'unknown' {
   return f0Band(s.f0_median);
 }
 
-/** 加权后的四档占比（只算时长 × 权重的相对比例）。 */
+/** 按长度桶估计抽样片数占比；非增强、batch4 的预览，实际值见训练采样报告。 */
 export function weightedRows(m: Manifest, cfg: WeightConfig): BandRow[] {
   const st = bandStats(m, cfg.mode);
-  const totalWeighted = BAND_ORDER.reduce((n, id) => n + st[id].seconds * (cfg.bands[id] ?? 1), 0) || 1;
+  const buckets = Object.fromEntries(BAND_ORDER.map(id => [id, Array(8).fill(0)])) as Record<BandId, number[]>;
+  for (const s of m.slices.filter(s => s.kept)) {
+    const band = bandOfSlice(s, cfg.mode);
+    const length = Math.floor(s.dur * 100);
+    const bucket = Math.ceil(length / 100) - 2;
+    if (band !== 'unknown' && bucket >= 0 && bucket < 8) buckets[band][bucket]++;
+  }
+  const expected = (weighted: boolean) => {
+    const counts = Object.fromEntries(BAND_ORDER.map(id => [id, 0])) as Record<BandId, number>;
+    let total = 0;
+    for (let b = 0; b < 8; b++) {
+      const n = BAND_ORDER.reduce((v, id) => v + buckets[id][b], 0);
+      if (!n) continue;
+      const draws = Math.ceil(n / 4) * 4;
+      const denom = BAND_ORDER.reduce((v, id) => v + buckets[id][b] * (weighted ? cfg.bands[id] : 1), 0);
+      for (const id of BAND_ORDER) counts[id] += draws * buckets[id][b] * (weighted ? cfg.bands[id] : 1) / denom;
+      total += draws;
+    }
+    return Object.fromEntries(BAND_ORDER.map(id => [id, counts[id] / (total || 1)])) as Record<BandId, number>;
+  };
+  const before = expected(false), after = expected(true);
   return BAND_ORDER.map((id) => ({
     id,
     label: BAND_LABEL[id] ?? id,
     n: st[id].n,
     seconds: Math.round(st[id].seconds),
-    share: st[id].share,
-    after: (st[id].seconds * (cfg.bands[id] ?? 1)) / totalWeighted,
+    share: before[id],
+    after: after[id],
     weight: cfg.bands[id] ?? 1,
+    buckets: buckets[id],
   }));
 }
 
@@ -338,12 +380,12 @@ function clampWeight(v: unknown): number {
 }
 
 /** 供训练阶段用：每片的采样权重数组（顺序与 manifest.slices 中 kept 的一致）。 */
-export function sliceWeights(m: Manifest, cfg: WeightConfig): Array<{ file: string; weight: number }> {
+export function sliceWeights(m: Manifest, cfg: WeightConfig): Array<{ file: string; weight: number; band: string }> {
   return m.slices
     .filter((s) => s.kept)
     .map((s) => {
       const id = bandOfSlice(s, cfg.mode);
-      return { file: s.file, weight: id === 'unknown' ? 1 : (cfg.bands[id] ?? 1) };
+      return { file: s.file, weight: id === 'unknown' ? 1 : (cfg.bands[id] ?? 1), band: id };
     });
 }
 
@@ -548,7 +590,7 @@ export function readTrainLog(expDir: string, maxLines = 400): TrainLog {
   for (const line of lines) {
     const m = /====>\s*轮次：(\d+).*?\((\d+):(\d+):([\d.]+)\)/.exec(line);
     if (m) {
-      done = Number(m[1]) + 1;
+      done = Number(m[1]);
       secs.push(Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4]));
       continue;
     }
@@ -592,10 +634,8 @@ export function readTrainLog(expDir: string, maxLines = 400): TrainLog {
 /** 训练建议参数：批大小按显存给，轮次按数据量给。 */
 export function suggestTrainParams(seconds: number): { epochs: number; batch: number; note: string } {
   const minutes = seconds / 60;
-  if (minutes < 10) return { epochs: 300, batch: 4, note: '数据不到 10 分钟，轮次要更多才学得动' };
-  if (minutes < 20) return { epochs: 250, batch: 4, note: '数据偏少，250 轮左右' };
-  if (minutes < 45) return { epochs: 200, batch: 4, note: '33 分钟左右用 200 轮，之前 dfy2 就是这个配置' };
-  return { epochs: 160, batch: 4, note: '数据超过 45 分钟，每轮变慢，160 轮通常够了' };
+  if (minutes < 10) return { epochs: 40, batch: 4, note: '数据不足 10 分钟，先补素材；40 轮仅作基线试听，增加轮次不能替代数据' };
+  return { epochs: 70, batch: 4, note: '先跑 40～70 轮，每 10 轮存档，用独立试听素材选模；loss 下降不代表泛化一定变好' };
 }
 
 // ---------------------------------------------------------------- 中间档清理

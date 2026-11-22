@@ -281,15 +281,15 @@ def adaptive_segments(y: np.ndarray, sr: int, min_len=MIN_LEN, max_len=MAX_LEN):
 
 
 def f0_stats(y: np.ndarray, sr=16000):
-    """返回 (中位 Hz, p90 Hz, 发声帧占比)。没装 pyworld 时返回 (0,0,0)，质检会放过。"""
+    """返回 (中位 Hz, p90 Hz, 发声帧占比)；负占比表示分析失败，零表示无声。"""
     if pw is None or y.size < sr * 0.2:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, -1.0
     y64 = np.ascontiguousarray(y.astype(np.float64))
     try:
         f0, t = pw.dio(y64, sr, frame_period=10.0)
         f0 = pw.stonemask(y64, f0, t, sr)
     except Exception:  # noqa: BLE001
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, -1.0
     v = f0[f0 > 0]
     if v.size == 0:
         return 0.0, 0.0, 0.0
@@ -445,7 +445,9 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             drop = None
             if dur < min_len:
                 drop = "too_short"
-            elif vratio and vratio < min_voiced:
+            elif vratio < 0:
+                drop = "f0_analysis_failed"
+            elif vratio < min_voiced:
                 drop = "too_quiet"
             elif clip > 0.002:
                 drop = "clipped"
@@ -521,7 +523,7 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
         "sources": old_sources + src_meta,
         "slices": records,
         "stats": {
-            "sources": len(src_meta),
+            "sources": len(old_sources + src_meta),
             "slices": len(records),
             "kept": len(kept),
             "dropped": len(records) - len(kept),
@@ -616,7 +618,9 @@ def import_experiment(gt_dir, out_dir, label, progress, cancel, append=False) ->
         drop = None
         if dur < MIN_LEN:
             drop = "too_short"
-        elif vratio and vratio < 0.25:
+        elif vratio < 0:
+            drop = "f0_analysis_failed"
+        elif vratio < 0.25:
             drop = "too_quiet"
         elif peak >= 0.999:
             drop = "clipped"

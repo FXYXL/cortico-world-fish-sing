@@ -870,7 +870,7 @@ class SingEngine:
 
     # -- 选模对比试听 -----------------------------------------------
 
-    def ab_test(self, test: Path, out_dir: Path, variants: list, *, pitch: int = 0,
+    def ab_test(self, test: Path, out_dir: Path, variants: list, *, tests=None, pitch: int = 0,
                 index_rate: float = 0.75, protect: float = 0.33, rms_mix_rate: float = 0.0,
                 progress: Optional[Callable[[float, str], None]] = None,
                 cancel: Optional[threading.Event] = None) -> dict:
@@ -878,14 +878,16 @@ class SingEngine:
         选模对比：同一测试句，每个变体（.pth）各换声一遍，结束后恢复原模型。
 
         variants: [{"ckpt": <pth 路径>, "label": "e100", "index": <index 路径或 "">}, ...]
-        测试句用训练切片（0_gt_wavs，目标音色清唱）——换回模型本身就是最干净的
-        存档对比：输入完全一致，听出来的差异全是模型/存档本身的差别。
+        tests 为独立低、中、高音干声。每档使用相同输入和参数，避免训练集自测。
         """
         cancel = cancel or threading.Event()
         out_dir.mkdir(parents=True, exist_ok=True)
         report = progress or (lambda p, m: None)
         original = (self.model_path or str(RVC_ROOT / "assets" / "weights" / self.model), self.index)
         outputs: list = []
+        tests = tests or [test]
+        variants = [{**v, "label": f"{v['label']}_{band}", "test": str(source)}
+                    for v in variants for band, source in zip(("low", "mid", "high"), tests)]
         n = max(1, len(variants))
         try:
             for i, v in enumerate(variants):
@@ -897,7 +899,7 @@ class SingEngine:
                 dst = out_dir / f"{label}.wav"
                 report((i + 0.25) / n, f"换声：{label}")
                 self.convert(
-                    test, dst, pitch=pitch, index_rate=index_rate, protect=protect,
+                    Path(v["test"]), dst, pitch=pitch, index_rate=index_rate, protect=protect,
                     rms_mix_rate=rms_mix_rate,
                     progress=lambda p, m, _i=i, _n=n: report((_i + 0.25 + 0.7 * p) / _n, m),
                     cancel=cancel,

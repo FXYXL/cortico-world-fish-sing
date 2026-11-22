@@ -5,6 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import numpy as np
+import soundfile as sf
 import torch
 import torch.utils.data
 
@@ -44,7 +45,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             audiopath, text, pitch, pitchf, dv = record[:5]
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text, pitch, pitchf, dv])
-                lengths.append(os.path.getsize(audiopath) // (3 * self.hop_length))
+                lengths.append(sf.info(audiopath).frames // self.hop_length)
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
@@ -441,7 +442,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             raise ValueError(f"权重数量 {w.numel()} 与样本数 {len(self.lengths)} 不一致")
         w = w.clamp_min(1e-6)
         # 全 1 时退回原路径，保证「不加权」和官方行为逐位一致
-        self.sample_weights = None if bool((w - 1.0).abs().max() < 1e-9) else w
+        self.sample_weights = None if bool((w.max() - w.min()).abs() < 1e-9) else w
 
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
@@ -518,6 +519,26 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             batch_ids = torch.randperm(len(batches), generator=g).tolist()
             batches = [batches[i] for i in batch_ids]
         self.batches = batches
+
+        report = os.environ.get('FISHSING_SAMPLING_REPORT')
+        if report and self.rank == 0:
+            import json
+            from collections import Counter
+            counts = Counter(os.path.basename(self.dataset.audiopaths_and_text[idx][0])
+                             for batch in batches for idx in batch)
+            band_counts = Counter()
+            bands_file = os.environ.get('FISHSING_SAMPLE_BANDS')
+            if bands_file:
+                with open(bands_file, encoding='utf8') as stream:
+                    bands = json.load(stream)
+                for name, count in counts.items():
+                    band_counts[bands.get(name, 'unknown')] += count
+            temporary = report + '.tmp'
+            with open(temporary, 'w', encoding='utf8') as stream:
+                json.dump({'epoch': self.epoch, 'rank': self.rank,
+                           'replicas': self.num_replicas, 'counts': dict(counts),
+                           'bands': dict(band_counts)}, stream)
+            os.replace(temporary, report)
 
         assert len(self.batches) * self.batch_size == self.num_samples
         return iter(self.batches)

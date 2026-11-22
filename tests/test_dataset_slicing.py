@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,18 @@ def make_sine_wav(path: Path, sec: float, freq=318.0, amp=0.3):
 
 
 class DatasetSlicing(unittest.TestCase):
+    def test_zero_voicing_and_analysis_failures_are_not_kept(self):
+        for stats, reason in [((0, 0, 0), 'too_quiet'), ((0, 0, -1), 'f0_analysis_failed')]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as td:
+                src = Path(td) / 'dry.wav'
+                make_sine_wav(src, 10)
+                with patch.object(dataset, 'f0_stats', return_value=stats):
+                    result = dataset.build([{'path': str(src), 'name': src.name, 'dry': True}],
+                        Path(td) / 'out', {'sliceMode': 'fixed'}, lambda *a: None,
+                        __import__('threading').Event())
+                self.assertEqual(result['stats']['kept'], 0)
+                self.assertGreater(result['stats']['droppedByReason'][reason], 0)
+
     """端到端：build() 对一个 10 秒干声切片，产物必须是真实长度的音频。"""
 
     def test_slices_have_real_duration(self):

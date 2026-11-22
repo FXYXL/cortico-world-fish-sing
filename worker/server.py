@@ -149,7 +149,8 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
         out_dir = Path(params.get("out") or (WORK_ROOT / jid))
         out_dir.mkdir(parents=True, exist_ok=True)
         return ENGINE.ab_test(
-            Path(params["test"]), out_dir, list(params.get("variants") or []),
+            Path((params.get("tests") or [params.get("test", "")])[0]), out_dir, list(params.get("variants") or []),
+            tests=[Path(p) for p in params.get("tests", [])] or None,
             pitch=int(params.get("pitch", 0)),
             index_rate=float(params.get("index_rate", 0.75)),
             protect=float(params.get("protect", 0.33)),

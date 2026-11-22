@@ -40,6 +40,8 @@ import {
   writeTrainState,
   writeDatasetState,
   weightedRows,
+  validateEvaluation,
+  readSamplingReport,
   sliceWeights,
   type TrainSource,
   type WeightConfig,
@@ -316,7 +318,7 @@ export class FishSingWorld implements World {
    * 的差别——比拿着不同版本整首唱一遍再凭记忆比要靠谱。
    * 片段进作品库；配了 notify.qqTarget 就同时发 QQ。
    */
-  private async runAbTest(exp: string, enabled?: boolean): Promise<string> {
+  private async runAbTest(exp: string, enabled?: boolean, evaluationPaths?: string[]): Promise<string> {
     if (enabled === false || this.opts.cfg.train?.abTest === false) return '';
     const weights = join(this.routes.rvcRoot, 'assets', 'weights');
     const logDir = join(this.routes.rvcRoot, 'logs', exp);
@@ -370,22 +372,14 @@ export class FishSingWorld implements World {
       return '';
     }
     const gtDir = join(logDir, '0_gt_wavs');
-    let test = '';
-    try {
-      const wavs = readdirSync(gtDir).filter((f) => f.endsWith('.wav')).sort();
-      const mid = wavs[Math.floor(wavs.length / 2)];
-      test = mid ? join(gtDir, mid) : '';
-    } catch {
-      test = '';
-    }
-    if (!test || !existsSync(test)) {
-      this.host?.log.warn('[fish-sing] 没找到可用的训练切片当测试句，跳过选模对比');
-      return '';
-    }
+    const saved = join(logDir, 'evaluation.json');
+    const tests = validateEvaluation(evaluationPaths ?? (existsSync(saved)
+      ? JSON.parse(readFileSync(saved, 'utf8')) : []),
+      existsSync(gtDir) ? readdirSync(gtDir).filter(f => f.endsWith('.wav')).map(f => join(gtDir, f)) : []);
     const ts = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
     const outDir = join(this.data().dataDir, 'ab', `${exp}-${ts}`);
     const jobId = await this.worker.submit('ab', {
-      test, out: outDir, variants, pitch: 0, index_rate: 0.75, protect: 0.33,
+      tests, out: outDir, variants, pitch: 0, index_rate: 0, protect: 0.33,
     });
     const job = await this.worker.wait(
       jobId,
@@ -394,7 +388,7 @@ export class FishSingWorld implements World {
     );
     const outputs = ((job.result?.outputs ?? []) as { label: string; file: string }[])
       .filter((o) => existsSync(o.file));
-    if (!outputs.length) return;
+    if (!outputs.length) throw new Error('选模任务未生成试听文件');
     const labels: string[] = [];
     const obTarget = parseTarget(String(this.opts.cfg.notify?.qqTarget ?? ''));
     const onebot = { httpUrl: String(this.opts.cfg.send?.httpUrl ?? ''), token: this.onebotToken() };
@@ -409,7 +403,7 @@ export class FishSingWorld implements World {
         file: mp3,
         durationSec: await duration(mp3, this.ffmpeg()).catch(() => 0),
         at: Date.now(),
-        params: { model: o.label, index: '', indexRate: 0.75, protect: 0.33, pitch: 0, mode: 'vocals' },
+        params: { model: o.label, index: '', indexRate: 0, protect: 0.33, pitch: 0, mode: 'vocals' },
         target: '',
       }, mp3);
       if (obTarget && onebot.httpUrl) {
@@ -428,7 +422,7 @@ export class FishSingWorld implements World {
     this.host?.log.info(`[fish-sing] 选模对比已生成：${labels.join(' / ')}（${outDir}）`);
     void this.notifyEvent(
       `选模试听已生成：${exp}`,
-      `同一句训练切片，用 ${labels.join('、')} 各唱了一遍。在作品库里对比听（fish_sing_library）${obTarget ? '，QQ 那边也各发了一条' : ''}。`,
+      `独立低、中、高音干声（关闭检索），用 ${labels.join('、')} 对比。在作品库里试听（fish_sing_library）${obTarget ? '，QQ 那边也各发了一条' : ''}。`,
     );
     return labels.join(' / ');
   }
@@ -1036,6 +1030,7 @@ export class FishSingWorld implements World {
         /** 低音增强：合成 -2/-4 半音低音数据（默认开） */
         augment?: boolean;
         keepEvery?: number;
+        evaluationPaths?: string[];
       };
       const dir = this.datasetJob?.dir;
       const m = dir ? readManifest(dir) : null;
@@ -1046,10 +1041,17 @@ export class FishSingWorld implements World {
         throw new Error('运行时没装好：去「安装与运行时」页点「安装 GPU 运行时」');
       }
 
-      const epochs = Math.max(10, Math.min(600, Number(cfg.epochs) || 200));
+      const epochs = Math.max(10, Math.min(600, Number(cfg.epochs) || suggestTrainParams(m.stats.seconds).epochs));
       const batch = Math.max(1, Math.min(16, Number(cfg.batch) || 4));
       const saveEvery = Math.max(1, Math.min(100, Number(cfg.saveEvery) || 10));
       const exp = String(cfg.exp ?? '').trim().replace(/[^\w.-]/g, '') || `fish${stamp()}`;
+      if (cfg.resume !== true && existsSync(this.expDirFor(exp)) && readdirSync(this.expDirFor(exp)).length) {
+        throw new Error('同名实验已存在：从头训练请换新实验名，断点续训请勾选续训');
+      }
+      const evaluationPaths = cfg.abTest === true ? validateEvaluation(cfg.evaluationPaths ?? [], [
+        ...m.slices.filter(s => s.kept).map(s => join(dir, s.file)),
+        ...m.sources.flatMap(s => [String(s.path ?? ''), String(s.vocalFile ?? '')]),
+      ]) : undefined;
 
       // 同名实验的日志刚刚还在写 → 可能有训练在跑（包括重启 Coo 后留下的孤儿进程，
       // 那种情况 worker 已经不认识它了，光靠状态拦不住）。撞上去就是两个训练抢一张卡。
@@ -1081,7 +1083,11 @@ export class FishSingWorld implements World {
       // 逐片权重：按权重口径算好，键用文件 basename（实验目录里的切片同名）
       const weightCfg = readWeights(dir);
       const weightMap: Record<string, number> = {};
-      for (const it of sliceWeights(m, weightCfg)) weightMap[basename(it.file)] = it.weight;
+      const bandMap: Record<string, string> = {};
+      for (const it of sliceWeights(m, weightCfg)) {
+        weightMap[basename(it.file)] = it.weight;
+        bandMap[basename(it.file)] = it.band;
+      }
       const weighted = Object.values(weightMap).filter((v) => Math.abs(v - 1) > 1e-9).length;
 
       const job = {
@@ -1098,10 +1104,12 @@ export class FishSingWorld implements World {
           batch,
           saveEvery,
           resume: cfg.resume === true,
+          evaluationPaths,
           rebuild: cfg.rebuild === true,
           // 低音增强：-2/-4 半音各合成一份低音数据，副本权重按份数摊薄（见 trainer.prepare）
-          augmentShifts: cfg.augment === false ? [] : [-2, -4],
+          augmentShifts: cfg.augment === true ? [-2, -4] : [],
           weightMap,
+          bandMap,
         });
         job.id = id;
         this.ownedJob = 'train';
@@ -1129,7 +1137,7 @@ export class FishSingWorld implements World {
           this.host?.log.info(`[fish-sing] 训练完成：${exp}`);
           // 勾了「训练完自动清理」才动文件：中间档删了只能重训才拿得回来，
           // 默认不自动删，宁可让用户自己点那一下。
-          if (cfg.pruneAfter === true) {
+          if (cfg.pruneAfter === true && cfg.abTest !== true) {
             const step = Math.max(1, Number(cfg.keepEvery) || 50);
             const done = pruneCheckpoints(
               join(this.routes.rvcRoot, 'assets', 'weights'),
@@ -1141,7 +1149,12 @@ export class FishSingWorld implements World {
             }
           }
           void this.notifyEvent(`训练完成：${exp}`, `${epochs} 轮全部完成。${job.msg}`);
-          void this.runAbTest(exp, cfg.abTest !== false).catch((e: unknown) => {
+          void this.runAbTest(exp, cfg.abTest === true, evaluationPaths).then(() => {
+            if (cfg.pruneAfter === true && cfg.abTest === true) {
+              pruneCheckpoints(join(this.routes.rvcRoot, 'assets', 'weights'), exp,
+                Math.max(1, Number(cfg.keepEvery) || 50), join(this.routes.rvcRoot, 'logs'));
+            }
+          }).catch((e: unknown) => {
             this.host?.log.warn(`[fish-sing] 选模对比失败：${e instanceof Error ? e.message : String(e)}`);
           });
         })
@@ -1204,6 +1217,7 @@ export class FishSingWorld implements World {
         logAgeSec: logAgeSec(expDir),
         ckpt: exp ? checkpointStats(join(this.routes.rvcRoot, 'assets', 'weights'), exp) : { n: 0, totalMb: 0 },
         weights: exp && expDir ? readWeights(this.datasetJob?.dir ?? '') : null,
+        sampling: expDir ? readSamplingReport(expDir) : null,
       };
     }
 
@@ -1230,7 +1244,7 @@ export class FishSingWorld implements World {
     if (method === 'trainAbTest') {
       const exp = String(args[0]?.exp ?? '').trim() || this.trainJob?.exp || '';
       if (!exp) throw new Error('没有实验名：先在「训练」页填实验名，或跑一次训练');
-      const text = await this.runAbTest(exp, true);
+      const text = await this.runAbTest(exp, true, args[0]?.evaluationPaths);
       return { text: text || `没生成：${exp} 只找到一个可用存档（中间档可能已被清理）` };
     }
 

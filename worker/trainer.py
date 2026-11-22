@@ -16,12 +16,16 @@ RVC 训练流水线（面板用）。
 """
 
 import json
+import hashlib
 import os
+import queue
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 
 import soundfile as sf
@@ -56,6 +60,24 @@ def child_env(extra=None):
     return env
 
 
+def process_options():
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+
+
+def stop_process(proc):
+    """取消整个任务进程树，等待退出后才释放队列。"""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                capture_output=True)
+        if result.returncode and proc.poll() is None:
+            proc.kill()
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=30)
+
+
 def run(args, title, on_line=None, cancel=None) -> None:
     """跑一个子进程；on_line 逐行回调（用于从输出里抠进度）。"""
     log(f"\n>>> {title}")
@@ -69,20 +91,40 @@ def run(args, title, on_line=None, cancel=None) -> None:
         encoding="utf-8",
         errors="ignore",
         bufsize=1,
+        **process_options(),
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log(line)
-            if on_line:
-                try:
+    lines = queue.Queue()
+    def read_output():
+        try:
+            for line in proc.stdout:
+                lines.put(line.rstrip())
+        finally:
+            lines.put(None)
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                stop_process(proc)
+                raise RuntimeError("已取消")
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            if line:
+                log(line)
+                if on_line:
                     on_line(line)
-                except Exception:  # noqa: BLE001
-                    pass
-        if cancel is not None and cancel.is_set():
-            proc.kill()
-            raise RuntimeError("已取消")
+    except BaseException:
+        if proc.poll() is None:
+            stop_process(proc)
+        raise
+    finally:
+        reader.join(timeout=5)
+        proc.stdout.close()
     code = proc.wait()
     if code != 0:
         raise RuntimeError(f"{title} 失败（退出码 {code}），看上面的日志")
@@ -95,7 +137,52 @@ def count_files(d: Path, suffix=".npy") -> int:
 
 
 def exp_dir_of(exp: str) -> Path:
+    if not re.fullmatch(r"[\w-][\w.-]*", exp) or exp in (".", ".."):
+        raise ValueError("实验名只能使用字母、数字、下划线、短横线和点")
     return RVC_ROOT / "logs" / exp
+
+
+def dataset_snapshot(dataset_dir, augment_shifts):
+    """只信 manifest 中保留的样本；哈希绑定内容、增强参数与流水线版本。"""
+    root = Path(dataset_dir).resolve()
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf8"))
+    files = []
+    for row in manifest["slices"]:
+        if not row.get("kept"):
+            continue
+        path = (root / row["file"]).resolve()
+        if not path.is_relative_to(root / "slices") or not path.is_file():
+            raise RuntimeError(f"切片路径无效：{row['file']}")
+        if path.stat().st_size <= 1000:
+            raise RuntimeError(f"切片为空或损坏：{path.name}")
+        files.append((path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    names = [p.name for p, _ in files]
+    if not files or len(set(names)) != len(names):
+        raise RuntimeError("数据集为空或切片文件名重复")
+    payload = {"pipeline": 2, "samples": sorted((p.name, h) for p, h in files),
+               "shifts": sorted(set(int(s) for s in augment_shifts if int(s)))}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return [p for p, _ in files], {"fingerprint": digest, **payload}
+
+
+def validate_experiment(exp, dataset_dir, params):
+    """保留旧实验；新训练不能覆盖，续训必须证明数据一致。"""
+    directory = exp_dir_of(exp)
+    slices, snapshot = dataset_snapshot(dataset_dir, params.get("augmentShifts") or [])
+    binding = directory / "dataset_binding.json"
+    occupied = directory.exists() and any(directory.iterdir())
+    if occupied and not params.get("resume"):
+        raise RuntimeError("同名实验已存在。要从头训练请换新实验名；断点续训请勾选续训。")
+    if params.get("resume"):
+        if not binding.is_file():
+            raise RuntimeError("旧实验没有数据指纹，无法安全续训；请用新实验名重训。")
+        old = json.loads(binding.read_text(encoding="utf8"))
+        if old.get("fingerprint") != snapshot["fingerprint"]:
+            raise RuntimeError("数据集或增强参数已变化，不能断点续训；请用新实验名训练。")
+        ck = find_checkpoint(exp)
+        if not ck or not ck["D"]:
+            raise RuntimeError("续训需要完整且配对的 G/D 存档")
+    return slices, snapshot
 
 
 def find_checkpoint(exp: str):
@@ -111,13 +198,15 @@ def find_checkpoint(exp: str):
     if not gs:
         return None
     gs.sort()
+    gs = [(step, path) for step, path in gs if (d / f"D_{step}.pth").is_file()]
+    if not gs:
+        return None
     step, gpath = gs[-1]
     dpath = d / f"D_{step}.pth"
     return {
         "step": step,
         "G": str(gpath),
         "D": str(dpath) if dpath.is_file() else "",
-        "epoch": step // 100,  # RVC 的 step 是 epoch × 100（每 epoch 100 个 batch 左右）
     }
 
 
@@ -165,9 +254,9 @@ def prepare(exp, dataset_dir: Path, progress, cancel, keep_existing=True, augmen
     gt.mkdir(exist_ok=True)
     hi.mkdir(exist_ok=True)
 
-    shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
+    shifts = sorted(set(int(s) for s in (augment_shifts or []) if int(s) != 0))
     # 防御：空壳切片（<1KB）是数据准备事故的残留，混进来会让特征提取全灭
-    all_slices = sorted((dataset_dir / "slices").glob("*.wav"))
+    all_slices, _snapshot = dataset_snapshot(dataset_dir, shifts)
     slices = [s for s in all_slices if s.stat().st_size > 1000]
     skipped_shells = len(all_slices) - len(slices)
     if skipped_shells:
@@ -248,7 +337,15 @@ def write_filelist(exp_dir: Path) -> int:
     f0b = exp_dir / "2b-f0nsf"
 
     rows, skipped = [], 0
+    binding = exp_dir / "dataset_binding.json"
+    names = None
+    if binding.is_file():
+        snap = json.loads(binding.read_text(encoding="utf8"))
+        names = {name for name, _ in snap["samples"]}
+        names |= {f"aug{s}_{name}" for name, _ in snap["samples"] for s in snap["shifts"]}
     for wav in sorted(gt.glob("*.wav")):
+        if names is not None and wav.name not in names:
+            continue
         npy = fea / f"{wav.stem}.npy"
         a = f0a / f"{wav.name}.npy"
         b = f0b / f"{wav.name}.npy"
@@ -308,12 +405,9 @@ def expand_aug_weights(weights: dict, augment_shifts: list) -> dict:
     shifts = [int(s) for s in (augment_shifts or []) if int(s) != 0]
     if not shifts or not weights:
         return weights or {}
-    # 源权重全是 1x 时不该造副本权重：会得到一堆 0.333 的"全均匀"权重表，
-    # 白白激活加权采样路径（0.4.0 夜里的事故现场）。
-    if all(abs(float(v) - 1.0) <= 1e-9 for v in weights.values()):
-        return dict(weights)
+    shifts = sorted(set(shifts))
     div = len(shifts) + 1
-    expanded = dict(weights)
+    expanded = {k: float(v) / div for k, v in weights.items()}
     for s in shifts:
         for k, v in weights.items():
             expanded[f"aug{s}_{k}"] = float(v) / div
@@ -327,9 +421,18 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
       augmentShifts([int])：低音增强，如 [-2, -4]（合成降调副本，见 prepare）
     """
     t0 = time.time()
+    if params.get("fromG") or params.get("fromD"):
+        raise RuntimeError("断点续训只使用当前实验的配对存档；跨实验微调请使用独立流程")
+    training_code = (RVC_ROOT / "train" / "train.py").read_text(encoding="utf8")
+    if "FISHSING_RESUME" not in training_code:
+        raise RuntimeError("RVC 训练代码尚未更新，请在安装与运行时更新 RVC 代码后再训练")
+    slices, snapshot = validate_experiment(exp, dataset_dir, params)
     augment_shifts = [int(s) for s in (params.get("augmentShifts") or [])]
     exp_dir = prepare(exp, Path(dataset_dir), progress, cancel,
                       augment_shifts=augment_shifts, weights=weights)
+    (exp_dir / "dataset_binding.json").write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf8")
+    if params.get("evaluationPaths"):
+        (exp_dir / "evaluation.json").write_text(json.dumps(params["evaluationPaths"], ensure_ascii=False), encoding="utf8")
     total = count_files(exp_dir / "0_gt_wavs", ".wav")
 
     if augment_shifts and weights:
@@ -344,7 +447,9 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
         for d in ("2a_f0", "2b-f0nsf", f"3_feature{FEA_DIM}"):
             shutil.rmtree(exp_dir / d, ignore_errors=True)
     have = count_files(f0a)
-    if have >= total and total > 0 and not rebuild:
+    wavs = list((exp_dir / "0_gt_wavs").glob("*.wav"))
+    if total > 0 and not rebuild and all((f0a / f"{w.name}.npy").is_file()
+            and (exp_dir / "2b-f0nsf" / f"{w.name}.npy").is_file() for w in wavs):
         log(f"F0 已齐（{have}），跳过")
         progress(0.16, f"F0 已存在（{have}）")
     else:
@@ -364,7 +469,7 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
     # ---- 特征
     fea = exp_dir / f"3_feature{FEA_DIM}"
     have = count_files(fea)
-    if have >= total and total > 0 and not rebuild:
+    if total > 0 and not rebuild and all((fea / f"{w.stem}.npy").is_file() for w in wavs):
         log(f"特征已齐（{have}），跳过")
         progress(0.30, f"特征已存在（{have}）")
     else:
@@ -391,11 +496,20 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
     log(f"索引：{[p.name for p in idx]}")
 
     # ---- 训练
-    epochs = int(params.get("epochs", 200))
+    epochs = int(params.get("epochs", 70))
     batch = int(params.get("batch", 4))
     save_every = int(params.get("saveEvery", 10))
 
-    env_extra = {}
+    env_extra = {"FISHSING_RESUME": "1" if params.get("resume") else "0",
+                 "FISHSING_SAMPLING_REPORT": str(exp_dir / "sampling_report.json"),
+                 "FISHSING_SAMPLE_WEIGHTS": ""}
+    bands = dict(params.get("bandMap") or {})
+    for shift in snapshot["shifts"]:
+        for name, band in (params.get("bandMap") or {}).items():
+            bands[f"aug{shift}_{name}"] = band
+    bands_file = exp_dir / "sample_bands.json"
+    bands_file.write_text(json.dumps(bands), encoding="utf8")
+    env_extra["FISHSING_SAMPLE_BANDS"] = str(bands_file)
     wfile = build_weights_file(exp_dir, weights or {})
     if wfile:
         env_extra["FISHSING_SAMPLE_WEIGHTS"] = str(wfile)
@@ -412,7 +526,11 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
             from_d = ck["D"] if ck.get("D") and Path(ck["D"]).is_file() else ""
             log(f"续训：从 {Path(from_g).name} 开始")
         else:
-            log("没找到可续的存档，从底模开始")
+            raise RuntimeError("没找到可续的配对 G/D 存档")
+
+    if params.get("resume"):
+        env_extra["FISHSING_RESUME_G"] = from_g
+        env_extra["FISHSING_RESUME_D"] = from_d
 
     progress(0.35, f"开始训练 {epochs} 轮（batch {batch}）")
     log_file = exp_dir / "train.log"
@@ -445,6 +563,7 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
             env=child_env(env_extra),
             stdout=stdout_f,
             stderr=subprocess.STDOUT,
+            **process_options(),
         )
     finally:
         # 子进程已经继承了这个句柄，父进程这边可以关掉；不关的话取消时文件句柄会挂着
@@ -455,8 +574,7 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
     tail_pos = start_size
     while proc.poll() is None:
         if cancel.is_set():
-            proc.kill()
-            proc.wait()
+            stop_process(proc)
             raise RuntimeError("已取消")
         time.sleep(3)
         try:
@@ -471,7 +589,7 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
         for line in chunk.splitlines():
             ep = _epoch_of(line)
             if ep is not None:
-                last_epoch = ep + 1
+                last_epoch = ep
                 pct = 0.35 + 0.63 * min(1.0, last_epoch / max(1, epochs))
                 progress(pct, f"训练 {last_epoch}/{epochs} 轮")
             lo = _loss_of(line)
@@ -486,6 +604,10 @@ def train_run(exp, dataset_dir, params, progress, cancel, weights=None):
         except OSError:
             pass
         raise RuntimeError(f"训练退出码 {code}。日志尾部：\n{tail}")
+
+    final_model = WEIGHTS_DIR / f"{exp}.pth"
+    if not final_model.is_file() or final_model.stat().st_mtime < t0:
+        raise RuntimeError("训练进程结束，但本次没有生成最终模型；请查看 train.stdout.log")
 
     # ---- 收尾：把最终模型落到 assets/weights
     progress(0.98, "整理产物")

@@ -270,19 +270,28 @@ def run(rank, n_gpus, hps, logger, use_ddp):
             net_d = DDP(net_d)
 
     try:  # 如果能加载自动resume
-        _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
+        if os.environ.get("FISHSING_RESUME") == "0":
+            raise RuntimeError("本次从底模开始，不自动恢复旧存档")
+        _, _, _, discriminator_epoch = utils.load_checkpoint(
+            os.environ.get("FISHSING_RESUME_D") or utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
         )  # D多半加载没事
         if rank == 0:
             logger.info(i18n("已恢复判别器检查点"))
         # _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g,load_opt=0)
         _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
+            os.environ.get("FISHSING_RESUME_G") or utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
         )
-        global_step = (epoch_str - 1) * len(train_loader)
+        if discriminator_epoch != epoch_str:
+            raise RuntimeError("G/D 存档轮次不一致，不能安全续训")
+        global_step = epoch_str * len(train_loader)
+        epoch_str += 1  # 存档记录的是已完成轮次，不重复训练该轮
+        if epoch_str > hps.total_epoch:
+            raise RuntimeError("目标总轮次不大于存档轮次，请提高目标总轮次")
         # epoch_str = 1
         # global_step = 0
     except Exception:  # 如果首次不能加载，加载pretrain
+        if os.environ.get("FISHSING_RESUME") == "1":
+            raise RuntimeError("断点存档加载失败，已中止；不会静默改为从底模训练")
         # traceback.print_exc()
         epoch_str = 1
         global_step = 0
