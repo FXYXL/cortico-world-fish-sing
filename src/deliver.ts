@@ -39,6 +39,8 @@ export interface PlayOptions {
   dir: string;
   playerPath: string;
   volume: number;
+  /** 从第几秒开始起播（用于任意句/副歌跳播，默认 0） */
+  seekSec?: number;
   /** 曲目元信息（用于唱中实时追踪播到第几秒/第几句与提词推送） */
   meta?: PlayMeta;
   /** 唱中歌词提词配置（smart / interval / off） */
@@ -66,6 +68,7 @@ export class Player {
   private proc: ChildProcess | null = null;
   private current = '';
   private startedAt = 0;
+  private seekOffsetSec = 0;
   private meta: PlayMeta = {};
   private stopFlag = false;
   private activeOnEnd: PlayOptions['onEnd'];
@@ -78,24 +81,39 @@ export class Player {
     }
   }
 
+  /** 正在播放时热更新歌词时间轴（如手动微调 LRC 偏移后立即生效，无需重播）。 */
+  updateMetaLyrics(lyrics: LyricsSheet, chorusRanges?: TimeSpan[]): void {
+    if (!this.meta) return;
+    this.meta = {
+      ...this.meta,
+      lyrics,
+      chorusRanges: chorusRanges ?? this.meta.chorusRanges,
+    };
+  }
+
   /** 启动唱中提词调度器：仅在播放中生效，播完/切歌/停止立刻销毁。 */
   private startLyricPrompter(
     started: number,
+    seekOffset: number,
     meta: PlayMeta,
     cfg: LyricPushConfig | undefined,
     onCue: PlayOptions['onLyricCue'],
   ): void {
     this.clearLyricTimer();
     if (!cfg || cfg.mode === 'off' || !onCue) return;
-    const lyrics = meta.lyrics;
-    const chorus = meta.chorusRanges ?? [];
-    if (!lyrics?.lines?.length && !chorus.length) return;
+    const initLyrics = meta.lyrics;
+    const initChorus = meta.chorusRanges ?? [];
+    if (!initLyrics?.lines?.length && !initChorus.length) return;
 
     const title = String(meta.title || '当前歌曲');
     const durationSec = Number(meta.durationSec || 0);
     const leadSec = Math.max(0, Math.min(10, Number(cfg.leadSec ?? 3)));
     const intervalSec = Math.max(0, Math.min(120, Number(cfg.intervalSec ?? 25)));
     const firedChorus = new Set<number>();
+    // 跳播到后半段时，把起播点之前的副歌直接标为已触发，避免误报过去段落
+    initChorus.forEach((c, idx) => {
+      if (c.start < seekOffset - 0.8) firedChorus.add(idx);
+    });
     let lastPushAt = -999;
     let lastCueLineIdx = -1;
 
@@ -104,7 +122,10 @@ export class Player {
         this.clearLyricTimer();
         return;
       }
-      const elapsed = Math.max(0, (Date.now() - started) / 1000);
+      const lyrics = this.meta.lyrics ?? initLyrics;
+      const chorus = this.meta.chorusRanges ?? initChorus;
+      const playedSec = Math.max(0, (Date.now() - started) / 1000);
+      const elapsed = seekOffset + playedSec;
       if (durationSec > 6 && elapsed > durationSec - 2.5) return;
 
       // 1) 副歌提前预告（smart 和 interval 模式都优先触发，每段副歌只推一次）
@@ -146,7 +167,7 @@ export class Player {
       }
 
       const firstWait = cfg.mode === 'interval' ? Math.min(minStep, 10) : Math.min(minStep, 18);
-      if (lastPushAt < 0 ? elapsed < firstWait : elapsed - lastPushAt < minStep) return;
+      if (lastPushAt < 0 ? playedSec < firstWait : elapsed - lastPushAt < minStep) return;
 
       const curPos = lineAtTime(lyrics, elapsed);
       const aheadPos = lineAtTime(lyrics, elapsed + leadSec);
@@ -179,10 +200,12 @@ export class Player {
   /** 查询当前实时播放进度与正唱到哪一句歌词（支持唱到一半插话定位「这句」）。 */
   playbackState(): PlaybackState {
     const active = Boolean(this.proc && this.current);
-    const elapsedSec = active && this.startedAt > 0
-      ? Math.max(0, Math.round(((Date.now() - this.startedAt) / 1000) * 10) / 10)
-      : 0;
     const durationSec = Number(this.meta.durationSec ?? 0);
+    const rawElapsed = active && this.startedAt > 0
+      ? this.seekOffsetSec + Math.max(0, (Date.now() - this.startedAt) / 1000)
+      : 0;
+    const clamped = durationSec > 0 ? Math.min(durationSec, rawElapsed) : rawElapsed;
+    const elapsedSec = Math.max(0, Math.round(clamped * 10) / 10);
     const pos = active ? lineAtTime(this.meta.lyrics, elapsedSec) : {};
     return {
       playing: active,
@@ -196,7 +219,7 @@ export class Player {
     };
   }
 
-  /** 放一首；新的一来就把旧的掐掉（同时放两首只会互相盖住）。 */
+  /** 放一首；新的一来就把旧的掐掉（同时放两首只会互相盖住）。支持 seekSec 从任意位置起播。 */
   play(file: string, opts: PlayOptions): void {
     this.stop();
     if (!existsSync(file)) throw new Error(`要播的文件不存在：${file}`);
@@ -205,7 +228,11 @@ export class Player {
       : join(opts.dir, 'ffplay.exe');
     if (!existsSync(exe)) throw new Error(`找不到 ffplay：${exe}（配置 → 运行时 → ffmpeg 目录）`);
     const vol = Math.max(0, Math.min(1, Number(opts.volume) || 1));
-    const child = spawn(exe, ['-nodisp', '-autoexit', '-loglevel', 'error', '-volume', String(Math.round(vol * 100)), file], {
+    const seek = Math.max(0, Number(opts.seekSec ?? 0) || 0);
+    const ffArgs = ['-nodisp', '-autoexit', '-loglevel', 'error', '-volume', String(Math.round(vol * 100))];
+    if (seek > 0.1) ffArgs.push('-ss', seek.toFixed(2));
+    ffArgs.push(file);
+    const child = spawn(exe, ffArgs, {
       windowsHide: true,
       stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -215,12 +242,13 @@ export class Player {
     const finish = (reason: 'ended' | 'stopped' | 'error') => {
       if (settled) return;
       settled = true;
-      const elapsed = Math.max(0, Math.round(((Date.now() - started) / 1000) * 10) / 10);
+      const elapsed = Math.max(0, Math.round((seek + (Date.now() - started) / 1000) * 10) / 10);
       if (this.proc === child) {
         this.clearLyricTimer();
         this.proc = null;
         this.current = '';
         this.startedAt = 0;
+        this.seekOffsetSec = 0;
         this.activeOnEnd = undefined;
       }
       opts.onEnd?.(reason, elapsed);
@@ -245,9 +273,10 @@ export class Player {
     this.proc = child;
     this.current = file;
     this.startedAt = started;
+    this.seekOffsetSec = seek;
     this.meta = opts.meta ?? {};
     this.activeOnEnd = opts.onEnd;
-    this.startLyricPrompter(started, this.meta, opts.lyricPush, opts.onLyricCue);
+    this.startLyricPrompter(started, seek, this.meta, opts.lyricPush, opts.onLyricCue);
   }
 
   stop(): void {
@@ -255,18 +284,20 @@ export class Player {
     if (!this.proc) return;
     const child = this.proc;
     const started = this.startedAt;
+    const seek = this.seekOffsetSec;
     const onEnd = this.activeOnEnd;
     this.stopFlag = true;
     this.proc = null;
     this.current = '';
     this.startedAt = 0;
+    this.seekOffsetSec = 0;
     this.activeOnEnd = undefined;
     try {
       child.kill();
     } catch {
       /* ignore */
     }
-    const elapsed = started > 0 ? Math.max(0, Math.round(((Date.now() - started) / 1000) * 10) / 10) : 0;
+    const elapsed = started > 0 ? Math.max(0, Math.round((seek + (Date.now() - started) / 1000) * 10) / 10) : 0;
     onEnd?.('stopped', elapsed);
   }
 }

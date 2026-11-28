@@ -476,8 +476,8 @@ class SingEngine:
     def separate(self, src: Path, out_dir: Path, cancel: threading.Event,
                  progress: Optional[Callable[[float, str], None]] = None,
                  *, engine: str = "htdemucs", dereverb: bool = False,
-                 fallback: bool = True) -> tuple:
-        """分离 vocals/inst：支持快速档 htdemucs 与精唱档 roformer（+ 可选去混响）。
+                 karaoke: bool = False, fallback: bool = True) -> tuple:
+        """分离 vocals/inst：支持快速档 htdemucs 与精唱档 roformer（+ 可选去伴唱和声与去混响）。
 
         坑：`Popen(stdout=PIPE)` 之后必须**持续读**，否则子进程写满管道缓冲区（Windows 64KB）
         就会永久阻塞在 write 上——现象是 CPU 0%、显存也没动静、看起来"卡死"。
@@ -493,8 +493,8 @@ class SingEngine:
             raise RuntimeError(f"找不到分离脚本：{SEP_SCRIPT}")
 
         sep_engine = "roformer" if str(engine or "").strip().lower() in ("roformer", "uvr", "uvr5") else "htdemucs"
-        # 8G 卡跑 RoFormer/De-Reverb 需要约 2.5~3.5GB 显存，空闲不足时先卸载常驻 RVC 避免 OOM
-        if (sep_engine == "roformer" or dereverb) and self.ready and self._free_gb() < 3.6:
+        # 8G 卡跑 RoFormer/Karaoke/De-Reverb 需要约 2.5~3.5GB 显存，空闲不足时先卸载常驻 RVC 避免 OOM
+        if (sep_engine == "roformer" or dereverb or karaoke) and self.ready and self._free_gb() < 3.6:
             self.unload("精唱分离腾出显存")
 
         cmd = [
@@ -502,6 +502,8 @@ class SingEngine:
             "--device", "auto",
             "--engine", sep_engine,
         ]
+        if karaoke:
+            cmd.append("--karaoke")
         if dereverb:
             cmd.append("--dereverb")
         if not fallback:
@@ -524,7 +526,7 @@ class SingEngine:
                     continue
                 tail.append(s)
                 del tail[:-40]
-                if "自动回落" in s or "未安装 audio-separator" in s:
+                if any(k in s for k in ("自动回落", "未安装 audio-separator", "去伴唱", "去混响")):
                     log(s)
                 # tqdm 的 "... 12%|█  | 3/24" 或 "分离 12%" / "去混响 78%"
                 m = re.search(r"(\d{1,3})%", s)
@@ -1013,7 +1015,10 @@ class SingEngine:
              f0_method: str = "rmvpe",
              separator: str = "htdemucs",
              dereverb: bool = False,
+             karaoke: bool = False,
              model: str = "",
+             duet_model: str = "",
+             duet_mode: str = "alternate",
              dynamic_style: str = "off",
              segments: "list | None" = None,
              snap_cut: "dict | None" = None,
@@ -1037,6 +1042,8 @@ class SingEngine:
         f0_m = "fcpe" if str(f0_method or "").strip().lower() == "fcpe" else "rmvpe"
         dyn_style = str(dynamic_style or "off").strip().lower()
         req_model = str(model or "").strip()
+        req_duet = str(duet_model or "").strip()
+        req_duet_mode = "unison" if str(duet_mode or "").strip().lower() == "unison" else "alternate"
         original_model = (self.model_path or str(RVC_ROOT / "assets" / "weights" / self.model), self.index)
         switched_model = False
 
@@ -1050,8 +1057,9 @@ class SingEngine:
             return self._song_body(
                 src, work, separate=separate, mode=mode, pitch=pitch,
                 index_rate=index_rate, protect=protect, rms_mix_rate=rms_mix_rate,
-                f0_m=f0_m, sep_engine=sep_engine, dereverb=dereverb, dyn_style=dyn_style,
+                f0_m=f0_m, sep_engine=sep_engine, dereverb=dereverb, karaoke=karaoke, dyn_style=dyn_style,
                 segments=segments, snap_cut=snap_cut, session_dir=session_dir,
+                duet_model=req_duet, duet_mode=req_duet_mode,
                 harmony=harmony, reverb=reverb, polish=polish, sep_cache=sep_cache,
                 report=report, cancel=cancel, t0=t0,
             )
@@ -1064,9 +1072,10 @@ class SingEngine:
 
     def _song_body(self, src: Path, work: Path, *, separate: bool, mode: str,
                    pitch: "int | str", index_rate: float, protect: float,
-                   rms_mix_rate: float, f0_m: str, sep_engine: str, dereverb: bool,
+                   rms_mix_rate: float, f0_m: str, sep_engine: str, dereverb: bool, karaoke: bool,
                    dyn_style: str, segments: "list | None", snap_cut: "dict | None",
-                   session_dir: Optional[Path], harmony: "dict | None", reverb: str,
+                   session_dir: Optional[Path], duet_model: str, duet_mode: str,
+                   harmony: "dict | None", reverb: str,
                    polish: bool, sep_cache: Optional[Path], report, cancel: threading.Event,
                    t0: float) -> dict:
 
@@ -1094,7 +1103,7 @@ class SingEngine:
                 vocal_src, inst = self.separate(
                     to_wav(src, work / "src.wav"), sep_out, cancel,
                     progress=lambda p, m: report(p, m),
-                    engine=sep_engine, dereverb=bool(dereverb), fallback=True,
+                    engine=sep_engine, dereverb=bool(dereverb), karaoke=bool(karaoke), fallback=True,
                 )
                 if sep_cache and vocal_src.is_file():
                     try:
@@ -1154,7 +1163,16 @@ class SingEngine:
             )
             log(f"主歌柔/副歌亮分段换声：共 {len(eff_segments)} 段（副歌 {len(chorus_ranges)} 处）")
 
-        if eff_segments:
+        if duet_model:
+            info = self._convert_duet(
+                vocal_src, conv,
+                duet_model=duet_model, duet_mode=duet_mode,
+                chorus_ranges=chorus_ranges, phrases=phrases,
+                pitch=int(pitch), index_rate=index_rate, protect=protect,
+                rms_mix_rate=rms_mix_rate, f0_method=f0_m, work=work,
+                progress=lambda p, m: report(p, m), cancel=cancel,
+            )
+        elif eff_segments:
             info = self._convert_segmented(
                 vocal_src, conv, eff_segments,
                 pitch=int(pitch), index_rate=index_rate, protect=protect,
@@ -1260,6 +1278,9 @@ class SingEngine:
         }
         if snapped_range is not None:
             result["snappedRange"] = snapped_range
+        if duet_model:
+            result["duetModel"] = duet_model
+            result["duetMode"] = duet_mode
         if suggestion is not None:
             result["pitchSuggest"] = suggestion
         return result
@@ -1672,6 +1693,240 @@ class SingEngine:
             except Exception as e:  # noqa: BLE001
                 log(f"分段换声后恢复原模型失败：{e}")
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def _convert_duet(self, vocal_src: Path, dst: Path, *, duet_model: str, duet_mode: str,
+                      chorus_ranges: list, phrases: list, pitch: int, index_rate: float,
+                      protect: float, rms_mix_rate: float, f0_method: str, work: Path,
+                      progress: Optional[Callable[[float, str], None]] = None,
+                      cancel: Optional[threading.Event] = None) -> dict:
+        """双音色真合唱 / 对唱：
+        - alternate：主歌按乐段由主模型 A 与搭档模型 B 交替轮唱，副歌左右立体声双声部真合唱；
+        - unison：整首 A 左 B 右真双人合唱（含 14ms 微延迟拉开立体声宽度防同相干涉）。
+        """
+        if not self.ready:
+            self.load()
+        cancel = cancel or threading.Event()
+        report = progress or (lambda p, m: None)
+        ckpt_b, idx_b = self._resolve_model_ckpt(duet_model)
+        original = (self.model_path or str(RVC_ROOT / "assets" / "weights" / self.model), self.index)
+        conv_a = work / "duet_a.wav"
+        conv_b = work / "duet_b.wav"
+        try:
+            report(0.22, f"双音色合唱（主唱 {Path(original[0]).name}）")
+            info_a = self.convert(
+                vocal_src, conv_a, pitch=pitch, index_rate=index_rate, protect=protect,
+                rms_mix_rate=rms_mix_rate, f0_method=f0_method,
+                progress=lambda p, m: report(0.22 + 0.27 * p, f"合唱轨 A · {m}"),
+                cancel=cancel,
+            )
+            if cancel.is_set():
+                raise RuntimeError("已取消")
+            report(0.50, f"双音色合唱（搭档 {ckpt_b.name}）")
+            self.set_model(ckpt_b, idx_b)
+            info_b = self.convert(
+                vocal_src, conv_b, pitch=pitch, index_rate=index_rate, protect=protect,
+                rms_mix_rate=rms_mix_rate, f0_method=f0_method,
+                progress=lambda p, m: report(0.50 + 0.27 * p, f"合唱轨 B · {m}"),
+                cancel=cancel,
+            )
+        finally:
+            try:
+                self.set_model(Path(original[0]), original[1])
+            except Exception as e:  # noqa: BLE001
+                log(f"双音色合唱后恢复原模型失败：{e}")
+
+        ya, sr_a = read_audio(conv_a)
+        yb, sr_b = read_audio(conv_b)
+        if sr_b != sr_a:
+            yb = resample_linear_fallback(yb, sr_b, sr_a)
+        n = min(ya.shape[0], yb.shape[0])
+        ma = ya[:n].mean(axis=1).astype(np.float32)
+        mb = yb[:n].mean(axis=1).astype(np.float32)
+
+        # 按有效发声 RMS 平衡双轨响度，防止一个模型天生更响盖住另一个
+        ra = self._active_rms(ma.reshape(-1, 1))
+        rb = self._active_rms(mb.reshape(-1, 1))
+        if ra > 1e-4 and rb > 1e-4:
+            mb = mb * float(np.clip(ra / rb, 0.72, 1.38))
+
+        # 给 B 声部加 14ms 微延迟用于合唱段防同相干涉、撑开双声部宽度
+        delay = max(1, int(round(0.014 * sr_a)))
+        mb_wide = np.concatenate([np.zeros(delay, dtype=np.float32), mb[:-delay]]) if delay < n else mb
+
+        if duet_mode == "unison" or not chorus_ranges:
+            left = ma * 0.78 + mb_wide * 0.50
+            right = ma * 0.50 + mb_wide * 0.78
+        else:
+            # 构造平滑副歌掩码与主歌交替掩码
+            ch_raw = np.zeros(n, dtype=np.float32)
+            for c in chorus_ranges:
+                i0 = max(0, min(n, int(round(float(c["start"]) * sr_a))))
+                i1 = max(i0, min(n, int(round(float(c["end"]) * sr_a))))
+                ch_raw[i0:i1] = 1.0
+
+            # 0.5s 滑动均值让主副歌切换柔和自然
+            win_ch = max(1, int(round(0.5 * sr_a)))
+            k_ch = np.ones(win_ch, dtype=np.float32) / win_ch
+            ch_mask = np.convolve(ch_raw, k_ch, mode="same").astype(np.float32)
+
+            # 主歌段落：按非副歌乐句每 2 句轮换 A / B
+            verse_phrases = [p for p in (phrases or []) if p.get("section") != "chorus"]
+            turn_b = np.zeros(n, dtype=np.float32)
+            if len(verse_phrases) >= 2:
+                for idx, p in enumerate(verse_phrases):
+                    if (idx // 2) % 2 == 1:
+                        i0 = max(0, min(n, int(round(float(p["start"]) * sr_a))))
+                        i1 = max(i0, min(n, int(round(float(p["end"]) * sr_a))))
+                        turn_b[i0:i1] = 1.0
+            else:
+                # 兜底：没有细乐句时，第 1 段副歌之后的主歌切给 B
+                first_end = float(chorus_ranges[0]["end"])
+                i0 = max(0, min(n, int(round(first_end * sr_a))))
+                turn_b[i0:] = 1.0
+
+            win_v = max(1, int(round(0.35 * sr_a)))
+            k_v = np.ones(win_v, dtype=np.float32) / win_v
+            b_solo = np.convolve(turn_b, k_v, mode="same").astype(np.float32)
+            a_solo = 1.0 - b_solo
+
+            solo_l = ma * a_solo + mb * b_solo
+            solo_r = solo_l
+            choir_l = ma * 0.78 + mb_wide * 0.52
+            choir_r = ma * 0.52 + mb_wide * 0.78
+            left = solo_l * (1.0 - ch_mask) + choir_l * ch_mask
+            right = solo_r * (1.0 - ch_mask) + choir_r * ch_mask
+
+        stereo = np.stack([left, right], axis=1).astype(np.float32)
+        peak = float(np.abs(stereo).max())
+        if peak > 0.98:
+            stereo *= 0.98 / peak
+        write_audio(dst, stereo, sr_a)
+        log(f"双音色合唱完成（{duet_mode}）：{Path(original[0]).name} + {ckpt_b.name}")
+        return {
+            "sr": sr_a,
+            "chunks": int(info_a.get("chunks", 1)) + int(info_b.get("chunks", 1)),
+            "seconds": n / float(sr_a),
+        }
+
+    def fuse_models(self, model_a: str, model_b: str, out_name: str, alpha: float = 0.5) -> dict:
+        """RVC 模型权重 CPU 线性融合：alpha * A + (1 - alpha) * B，秒级生成新音色 .pth。"""
+        import torch
+
+        ckpt_a, idx_a = self._resolve_model_ckpt(model_a)
+        ckpt_b, idx_b = self._resolve_model_ckpt(model_b)
+        if str(ckpt_a.resolve()) == str(ckpt_b.resolve()):
+            raise RuntimeError("请选择两个不同的模型进行融合")
+        a_ratio = float(np.clip(float(alpha), 0.05, 0.95))
+        b_ratio = 1.0 - a_ratio
+
+        clean_name = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", str(out_name or "").strip()).strip("_")
+        if not clean_name:
+            clean_name = f"{ckpt_a.stem}_{ckpt_b.stem}_{int(round(a_ratio * 100))}"
+        if not clean_name.endswith(".pth"):
+            clean_name = f"{clean_name}.pth"
+        dst = RVC_ROOT / "assets" / "weights" / clean_name
+        if dst.exists():
+            raise RuntimeError(f"目标模型已存在：{clean_name}，请换一个新名字")
+
+        ca = torch.load(str(ckpt_a), map_location="cpu", weights_only=False)
+        cb = torch.load(str(ckpt_b), map_location="cpu", weights_only=False)
+        if not isinstance(ca, dict) or not isinstance(cb, dict) or "weight" not in ca or "weight" not in cb:
+            raise RuntimeError("所选文件不是有效的 RVC 推理模型（缺少 weight 字典）")
+
+        for k in ("sr", "f0", "version"):
+            va = ca.get(k)
+            vb = cb.get(k)
+            if va is not None and vb is not None and str(va) != str(vb):
+                raise RuntimeError(f"两个模型规格不一致（{k}: {va} vs {vb}），无法直接融合")
+
+        wa = ca["weight"]
+        wb = cb["weight"]
+        merged = {}
+        fused_tensors = 0
+        for k, ta in wa.items():
+            tb = wb.get(k)
+            if (tb is not None and isinstance(ta, torch.Tensor) and isinstance(tb, torch.Tensor)
+                    and ta.shape == tb.shape and ta.is_floating_point()):
+                merged[k] = (ta.float() * a_ratio + tb.float() * b_ratio).to(ta.dtype)
+                fused_tensors += 1
+            else:
+                merged[k] = ta
+
+        if fused_tensors == 0:
+            raise RuntimeError("两个模型没有可对齐的权重张量，融合中止")
+
+        out_obj = dict(ca)
+        out_obj["weight"] = merged
+        out_obj["info"] = (
+            f"fused {ckpt_a.name}({int(round(a_ratio * 100))}%) + "
+            f"{ckpt_b.name}({int(round(b_ratio * 100))}%)"
+        )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dst = dst.with_suffix(".pth.tmp")
+        torch.save(out_obj, str(tmp_dst))
+        os.replace(tmp_dst, dst)
+
+        # 自动零空间硬链接占比更高父模型的 .index，并按比例加权合成 range.json 音域统计
+        out_exp = dst.stem
+        out_log_dir = RVC_ROOT / "logs" / out_exp
+        inherited_index = ""
+        primary_idx = (idx_a or idx_b) if a_ratio >= 0.5 else (idx_b or idx_a)
+        if primary_idx and Path(primary_idx).is_file():
+            try:
+                out_log_dir.mkdir(parents=True, exist_ok=True)
+                src_idx = Path(primary_idx)
+                dst_idx = out_log_dir / f"added_fused_{src_idx.parent.name}_{out_exp}.index"
+                if dst_idx.exists():
+                    dst_idx.unlink()
+                try:
+                    os.link(str(src_idx), str(dst_idx))
+                except OSError:
+                    shutil.copy2(str(src_idx), str(dst_idx))
+                inherited_index = dst_idx.name
+            except Exception as e:  # noqa: BLE001
+                log(f"融合模型继承索引失败（不影响使用）：{e}")
+
+        try:
+            ra = self.model_range(ckpt_a.name)
+            rb = self.model_range(ckpt_b.name)
+            fused_range = None
+            if ra and rb:
+                fused_range = {
+                    "p5": round(float(ra["p5"]) * a_ratio + float(rb["p5"]) * b_ratio, 1),
+                    "median": round(float(ra["median"]) * a_ratio + float(rb["median"]) * b_ratio, 1),
+                    "p95": round(float(ra["p95"]) * a_ratio + float(rb["p95"]) * b_ratio, 1),
+                    "frames": int(round(float(ra.get("frames", 0)) * a_ratio + float(rb.get("frames", 0)) * b_ratio)),
+                    "source": out_obj["info"],
+                }
+            elif ra or rb:
+                base_r = ra if (a_ratio >= 0.5 and ra) or not rb else rb
+                fused_range = {
+                    "p5": round(float(base_r["p5"]), 1),
+                    "median": round(float(base_r["median"]), 1),
+                    "p95": round(float(base_r["p95"]), 1),
+                    "frames": int(base_r.get("frames", 0)),
+                    "source": out_obj["info"],
+                }
+            if fused_range:
+                out_log_dir.mkdir(parents=True, exist_ok=True)
+                (out_log_dir / "range.json").write_text(
+                    json.dumps(fused_range, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception as e:  # noqa: BLE001
+            log(f"融合模型生成音域统计失败（不影响使用）：{e}")
+
+        size_mb = round(dst.stat().st_size / 1048576.0, 1)
+        log(f"模型融合完成：{dst.name}（{size_mb} MB，合并 {fused_tensors} 个张量"
+            f"{f'，已继承索引 {inherited_index}' if inherited_index else ''}）")
+        return {
+            "output": str(dst),
+            "name": dst.name,
+            "sizeMb": size_mb,
+            "fusedTensors": fused_tensors,
+            "index": inherited_index,
+            "info": out_obj["info"],
+        }
 
     def patch(self, vocal_src: Path, base_conv: Path, inst_path: Optional[Path], work: Path, *,
               start_sec: float, end_sec: float, snap: bool = True,

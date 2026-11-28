@@ -87,8 +87,19 @@ import {
   saveSession,
   type LibraryOptions,
 } from './library.ts';
-import { fmtTime, formatLyricsTable, resolveLyrics, type LyricsSheet } from './lyrics.ts';
-import { patchSong, singSong, type PlaybackEndInfo, type SingDeps, type SingSegmentSpec } from './sing.ts';
+import { fmtTime, formatLyricsTable, locatePatchRange, resolveLyrics, shiftLyrics, type LyricsSheet } from './lyrics.ts';
+import {
+  extractRecipe,
+  formatRecipeBrief,
+  loadRepertoire,
+  parseTags,
+  pickRepertoire,
+  removeRepertoire,
+  toggleFavoriteFromLibrary,
+  upsertRepertoire,
+} from './repertoire.ts';
+import { SingQueue, type QueueItem, type QueueLoopMode } from './queue.ts';
+import { autoFixSession, patchSong, singSong, type PlaybackEndInfo, type SingDeps, type SingRequest, type SingSegmentSpec } from './sing.ts';
 import { notify } from './notify.ts';
 import { WorkerClient } from './worker.ts';
 
@@ -118,6 +129,18 @@ export class FishSingWorld implements World {
   private lastSong: { title: string; at: number; duration: number } | null = null;
   /** 同一时刻只允许一首在跑（GPU 只有一张卡）。 */
   private busy = false;
+  /** 点歌队列与后台预热状态（小歌会 / 连唱模式）。 */
+  private readonly queue = new SingQueue();
+  private queueWarming = false;
+  private queuePlayWhenWarm = false;
+  private queueActiveSong: {
+    id: string;
+    title: string;
+    file: string;
+    durationSec: number;
+    song: string;
+    req?: SingRequest;
+  } | null = null;
   /** 本实例提交过的任务类型。stop() 用它判断要不要顺手取消。 */
   private ownedJob: 'song' | 'dataset' | 'train' | null = null;
   /**
@@ -577,23 +600,249 @@ export class FishSingWorld implements World {
         f0Method: cfg.voice?.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe',
         separator: cfg.voice?.separator === 'roformer' ? 'roformer' : 'htdemucs',
         dereverb: cfg.voice?.dereverb === true,
+        karaoke: cfg.voice?.karaoke === true,
         dynamicStyle: cfg.voice?.dynamicStyle === 'soft-verse-bright-chorus' ? 'soft-verse-bright-chorus' : 'off',
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
       lyricPush: this.lyricPushConfig(),
       onLyricCue: (cue: LyricCueEvent) => this.emitLyricCue(cue),
       onPlaybackEnd: (ev: PlaybackEndInfo) => {
-        if (ev.reason !== 'ended') return;
-        const issueHint = ev.report?.issues?.length
-          ? `（声学体检留意：${ev.report.issues[0].note}，如想重唱某句可调 fish_sing_patch）`
-          : '';
-        void this.pushSingEvent(
-          'fishsing.ended',
-          `《${ev.title}》刚刚自然唱完了（${fmtTime(ev.durationSec)}）${issueHint}。可以顺着气氛自然接话，问问要不要再来一首或重唱哪一句。`,
-          { id: ev.id, title: ev.title, durationSec: ev.durationSec, report: ev.report },
-        );
+        this.handlePlaybackEnded(ev);
       },
     };
+  }
+
+  /** 统一处理歌曲自然播完：单曲循环 → 列表循环回队尾 → 自动无缝衔接下一首 → 队列为空时通知桌宠。 */
+  private handlePlaybackEnded(ev: PlaybackEndInfo): void {
+    if (ev.reason !== 'ended') return;
+    const active = this.queueActiveSong;
+    if (this.queue.mode === 'loop-one' && active && existsSync(active.file)) {
+      this.playPreparedItem(active);
+      return;
+    }
+    if (this.queue.mode === 'loop-all' && active && existsSync(active.file)) {
+      this.queue.enqueue({
+        song: active.song,
+        title: active.title,
+        req: active.req,
+        prepared: {
+          id: active.id,
+          title: active.title,
+          file: active.file,
+          durationSec: active.durationSec,
+        },
+      });
+    }
+    if (this.queue.length > 0) {
+      void this.advanceQueue('auto', ev.title);
+      return;
+    }
+    const issueHint = ev.report?.issues?.length
+      ? `（声学体检留意：${ev.report.issues[0].note}，如想重唱某句可调 fish_sing_patch）`
+      : '';
+    void this.pushSingEvent(
+      'fishsing.ended',
+      `《${ev.title}》刚刚自然唱完了（${fmtTime(ev.durationSec)}）${issueHint}。可以顺着气氛自然接话，问问要不要再来一首或重唱哪一句。`,
+      { id: ev.id, title: ev.title, durationSec: ev.durationSec, report: ev.report },
+    );
+  }
+
+  /** 统一播放已就绪音频，挂载歌词提词、自然播完衔接队列，并顺手拉起下一首后台预热。 */
+  private playPreparedItem(item: {
+    id: string;
+    title: string;
+    file: string;
+    durationSec: number;
+    song?: string;
+    req?: SingRequest;
+  }): void {
+    const snap = loadSession(this.data(), item.id);
+    this.queueActiveSong = {
+      id: item.id,
+      title: item.title,
+      file: item.file,
+      durationSec: item.durationSec,
+      song: item.song || item.title,
+      req: item.req,
+    };
+    this.lastSong = { title: item.title, at: Date.now(), duration: item.durationSec };
+    this.player.play(item.file, {
+      dir: this.ffmpeg().dir,
+      playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
+      volume: Number(this.opts.cfg.play?.volume ?? 1),
+      meta: {
+        id: item.id,
+        title: item.title,
+        durationSec: item.durationSec,
+        lyrics: snap?.lyrics as LyricsSheet | undefined,
+        chorusRanges: snap?.report?.chorusRanges,
+      },
+      lyricPush: this.lyricPushConfig(),
+      onLyricCue: (cue) => this.emitLyricCue(cue),
+      onEnd: (reason, elapsedSec) => {
+        this.handlePlaybackEnded({
+          id: item.id,
+          title: item.title,
+          reason,
+          elapsedSec,
+          durationSec: item.durationSec,
+          report: snap?.report,
+        });
+      },
+      log: (m: string) => this.host?.log.warn(m),
+    });
+    this.kickQueueWarmup();
+  }
+
+  /** 当前正在播放或刚切完歌时，趁 GPU 空闲在后台悄悄预热队列中下一首待准备的歌。 */
+  private kickQueueWarmup(): void {
+    if (this.queueWarming || this.busy || this.trainJob?.state === 'running' || this.opts.cfg.enabled === false) return;
+    const next = this.queue.findNextToWarm();
+    if (!next) return;
+    this.queueWarming = true;
+    this.busy = true;
+    this.ownedJob = 'song';
+    this.queue.markState(next.qid, 'warming');
+    this.host?.log.info(`[fish-sing] 后台预热队列下一首：《${next.title}》`);
+    void (async () => {
+      try {
+        const r = await singSong({ ...next.req, to: 'none' }, this.deps());
+        if (r.ok && r.detail?.file) {
+          const title = String(r.detail.title ?? next.title);
+          const id = String(r.detail.id ?? '');
+          const file = String(r.detail.file ?? '');
+          const durationSec = Number(r.detail.duration ?? 0);
+          const reportSummary = (r.detail.report as { summary?: string } | undefined)?.summary;
+          this.queue.markState(next.qid, 'ready', {
+            title,
+            prepared: { id, title, file, durationSec, reportSummary },
+          });
+          this.host?.log.info(`[fish-sing] 队列预热完成：《${title}》已就绪，播完当前曲即可 0 秒衔接`);
+        } else {
+          this.queue.markState(next.qid, 'failed', { error: r.message });
+          this.host?.log.warn(`[fish-sing] 队列预热失败：《${next.title}》${r.message}`);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.queue.markState(next.qid, 'failed', { error: msg });
+        this.host?.log.warn(`[fish-sing] 队列预热异常：《${next.title}》${msg}`);
+      } finally {
+        this.busy = false;
+        this.queueWarming = false;
+        // 如果刚才上一首已经播完正等着这首出锅，立刻开播；否则继续预热后面还没准备的歌
+        if (this.queuePlayWhenWarm && !this.player.playing && this.queue.length > 0) {
+          this.queuePlayWhenWarm = false;
+          void this.advanceQueue('auto');
+        } else if (this.queue.length > 0) {
+          this.kickQueueWarmup();
+        }
+      }
+    })();
+  }
+
+  /** 切到队列下一首（支持自动连播或手动切歌）。 */
+  private async advanceQueue(reason: 'auto' | 'manual', prevTitle = ''): Promise<string> {
+    if (this.opts.cfg.play?.enabled === false) return '本机播放被关掉了（配置 → 播放与发送）。';
+    while (this.queue.length > 0) {
+      const head = this.queue.peek();
+      if (!head) break;
+      if (head.state === 'failed') {
+        this.queue.shift();
+        continue;
+      }
+      if (head.state === 'warming') {
+        if (reason === 'manual') this.player.stop();
+        this.queuePlayWhenWarm = true;
+        return `下一首《${head.title}》正在后台预热收尾，准备完立刻自动开播。`;
+      }
+      const item = this.queue.shift()!;
+      if (item.state === 'ready' && item.prepared && existsSync(item.prepared.file)) {
+        this.playPreparedItem({
+          ...item.prepared,
+          song: item.song,
+          req: item.req,
+        });
+        const rest = this.queue.length;
+        const msg = reason === 'auto'
+          ? `《${prevTitle || '上一首'}》唱完啦，已无缝切到队列下一首《${item.prepared.title}》（${fmtTime(item.prepared.durationSec)}，队里还剩 ${rest} 首）。可以轻声报个幕顺着接话~`
+          : `已切到队列下一首《${item.prepared.title}》（队里还剩 ${rest} 首）。`;
+        if (reason === 'auto') {
+          void this.pushSingEvent('fishsing.started', msg, {
+            id: item.prepared.id,
+            title: item.prepared.title,
+            durationSec: item.prepared.durationSec,
+            queueRemaining: rest,
+          });
+        }
+        return msg;
+      }
+      // 还没预热：立即在后台准备并自动开唱
+      if (this.trainJob?.state === 'running') {
+        this.queue.enqueue({ song: item.song, title: item.title, req: item.req }, true);
+        return '正在训练模型（显存被占着），队列暂缓开唱。';
+      }
+      if (this.busy) {
+        this.queue.enqueue({ song: item.song, title: item.title, req: item.req }, true);
+        this.queuePlayWhenWarm = true;
+        return `上一任务还在收尾，完成后立刻准备《${item.title}》。`;
+      }
+      this.busy = true;
+      this.ownedJob = 'song';
+      if (reason === 'manual') this.player.stop();
+      void (async () => {
+        try {
+          const r = await singSong({ ...item.req, to: 'local' }, this.deps());
+          if (r.ok && r.detail?.file) {
+            const title = String(r.detail.title ?? item.title);
+            const id = String(r.detail.id ?? '');
+            const file = String(r.detail.file ?? '');
+            const durationSec = Number(r.detail.duration ?? 0);
+            this.queueActiveSong = { id, title, file, durationSec, song: item.song, req: item.req };
+            this.lastSong = { title, at: Date.now(), duration: durationSec };
+            await this.pushSingEvent('fishsing.started', r.message, { ...r.detail, queueRemaining: this.queue.length });
+          } else {
+            await this.pushSingEvent('fishsing.error', `队列里的《${item.title}》没唱成：${r.message}`);
+            if (this.queue.length > 0 && !this.player.playing) {
+              void this.advanceQueue('auto', item.title);
+            }
+          }
+        } catch (e) {
+          await this.pushSingEvent('fishsing.error', `队列里的《${item.title}》出错：${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+          this.busy = false;
+          this.kickQueueWarmup();
+        }
+      })();
+      return `开始准备队列下一首《${item.title}》，好了自动开唱（队里还剩 ${this.queue.length} 首）。`;
+    }
+    return '点歌队列已经空啦。';
+  }
+
+  /** 把拿手歌本里的星标曲目一键排进小歌会队列（定稿文件在的 0 秒直接标为就绪）。 */
+  private enqueueRepertoireParty(tag?: string): { added: number; readyCount: number; titles: string[] } {
+    let rows = loadRepertoire(this.opts.dataDir).filter((it) => it.favorite);
+    const kw = String(tag || '').trim().toLowerCase();
+    if (kw) {
+      rows = rows.filter((it) => it.tags.some((t) => t.toLowerCase().includes(kw))
+        || it.note.toLowerCase().includes(kw)
+        || it.title.toLowerCase().includes(kw));
+    }
+    if (!rows.length) return { added: 0, readyCount: 0, titles: [] };
+    const libRows = loadLibrary(this.data());
+    let readyCount = 0;
+    const titles: string[] = [];
+    for (const it of rows.slice(0, 12)) {
+      const libHit = libRows.find((r) => r.id === it.bestLibraryId)
+        ?? libRows.find((r) => (it.bvid && r.bvid === it.bvid) || r.title === it.title);
+      const prepared = libHit && existsSync(libHit.file)
+        ? { id: libHit.id, title: libHit.title, file: libHit.file, durationSec: libHit.durationSec }
+        : undefined;
+      if (prepared) readyCount += 1;
+      const songSrc = it.bvid || it.source || it.title;
+      this.queue.enqueue({ song: songSrc, title: it.title, prepared });
+      titles.push(it.title);
+    }
+    return { added: titles.length, readyCount, titles };
   }
 
   private async pushSingEvent(type: string, text: string, meta?: Record<string, unknown>): Promise<void> {
@@ -721,9 +970,22 @@ export class FishSingWorld implements World {
             type: 'boolean',
             description: '分离后是否额外去混响（减少原唱混响导致的电音）',
           },
+          karaoke: {
+            type: 'boolean',
+            description: '分离后是否额外去原唱伴唱和声（UVR5 MelBand RoFormer Karaoke，剥离原唱垫音）',
+          },
           model: {
             type: 'string',
             description: '临时指定本次演唱使用的音色模型（如 dfy7.pth），唱完自动恢复默认模型；可先调 fish_sing_status 查看本机全部可用音色模型',
+          },
+          duetModel: {
+            type: 'string',
+            description: '双音色真合唱搭档模型（如 dfy7.pth）：与当前主模型一起对唱或双声部合唱',
+          },
+          duetMode: {
+            type: 'string',
+            enum: ['alternate', 'unison'],
+            description: '双音色合唱模式：alternate = 主歌交替轮唱 + 副歌左右立体声双声部真合唱（默认）；unison = 全程双声部合唱',
           },
           dynamicStyle: {
             type: 'string',
@@ -749,6 +1011,14 @@ export class FishSingWorld implements World {
           async: {
             type: 'boolean',
             description: '是否异步后台准备并自动开唱（默认按配置开启；开唱和自然播完时会通过事件通知你）',
+          },
+          ignoreRecipe: {
+            type: 'boolean',
+            description: 'true = 忽略拿手歌本里存的旧配方，按当前配置/入参重新唱',
+          },
+          lyricQuery: {
+            type: 'string',
+            description: '可选指定准确歌名与歌手用于匹配歌词（如用 BV 号点歌且视频标题花哨时填 "潮汐 傅梦彤"）',
           },
         },
         required: ['song'],
@@ -777,16 +1047,21 @@ export class FishSingWorld implements World {
           f0Method: args.f0Method === 'fcpe' || args.f0Method === 'rmvpe' ? (args.f0Method as 'rmvpe' | 'fcpe') : undefined,
           separator: args.separator === 'roformer' || args.separator === 'htdemucs' ? (args.separator as 'htdemucs' | 'roformer') : undefined,
           dereverb: typeof args.dereverb === 'boolean' ? args.dereverb : undefined,
+          karaoke: typeof args.karaoke === 'boolean' ? args.karaoke : undefined,
           model: args.model === undefined ? undefined : String(args.model),
+          duetModel: args.duetModel === undefined ? undefined : String(args.duetModel),
+          duetMode: args.duetMode === 'unison' ? ('unison' as const) : args.duetMode === 'alternate' ? ('alternate' as const) : undefined,
           dynamicStyle: args.dynamicStyle === 'soft-verse-bright-chorus' || args.dynamicStyle === 'off'
             ? (args.dynamicStyle as 'off' | 'soft-verse-bright-chorus') : undefined,
           segments: Array.isArray(args.segments) ? (args.segments as SingSegmentSpec[]) : undefined,
           start: args.start === undefined ? undefined : Number(args.start),
           duration: args.duration === undefined ? undefined : Number(args.duration),
           refresh: args.refresh === true,
+          ignoreRecipe: args.ignoreRecipe === true,
           search: args.search === true,
           pick: args.pick === undefined ? undefined : String(args.pick),
           order: args.order === 'click' || args.order === 'pubdate' ? (args.order as 'click' | 'pubdate') : ('default' as const),
+          lyricQuery: args.lyricQuery === undefined ? undefined : String(args.lyricQuery),
         };
 
         const wantAsync = req.search !== true && (
@@ -806,6 +1081,16 @@ export class FishSingWorld implements World {
                   at: Date.now(),
                   duration: Number(r.detail.duration ?? 0),
                 };
+                if (r.detail.file) {
+                  this.queueActiveSong = {
+                    id: String(r.detail.id ?? ''),
+                    title: String(r.detail.title ?? ''),
+                    file: String(r.detail.file ?? ''),
+                    durationSec: Number(r.detail.duration ?? 0),
+                    song: req.song,
+                    req,
+                  };
+                }
                 await this.pushSingEvent('fishsing.started', r.message, r.detail);
               } else {
                 await this.pushSingEvent('fishsing.error', r.message);
@@ -814,6 +1099,7 @@ export class FishSingWorld implements World {
               await this.pushSingEvent('fishsing.error', `没唱成：${e instanceof Error ? e.message : String(e)}`);
             } finally {
               this.busy = false;
+              this.kickQueueWarmup();
             }
           })();
           return `已开始后台准备「${req.song}」，分离换声完成后会自动开唱并通知你（期间可以正常聊天，想停随时调用 fish_sing_stop）。`;
@@ -827,10 +1113,21 @@ export class FishSingWorld implements World {
               at: Date.now(),
               duration: Number(r.detail.duration ?? 0),
             };
+            if (r.detail.file) {
+              this.queueActiveSong = {
+                id: String(r.detail.id ?? ''),
+                title: String(r.detail.title ?? ''),
+                file: String(r.detail.file ?? ''),
+                durationSec: Number(r.detail.duration ?? 0),
+                song: req.song,
+                req,
+              };
+            }
           }
           return r.message;
         } finally {
           this.busy = false;
+          this.kickQueueWarmup();
         }
       },
     });
@@ -859,6 +1156,7 @@ export class FishSingWorld implements World {
           f0Method: { type: 'string', enum: ['rmvpe', 'fcpe'], description: '该句临时切换 F0 算法' },
           model: { type: 'string', description: '临时换另一个音色模型来唱这一句（如 dfy7.pth），可先调 fish_sing_status 查看本机全部可用音色模型' },
           previewOnly: { type: 'boolean', description: 'true = 只试听返工句（前后带 2 秒上下文），不改整首；false = 贴回整首并重放' },
+          autoFix: { type: 'boolean', description: 'true = 一键自动修补声学体检标出的所有破音/音域越界问题段（自动切 fcpe 或微调参数贴回并播新版）' },
           to: { type: 'string', description: '投递目标，默认 local' },
         },
         required: [],
@@ -870,6 +1168,12 @@ export class FishSingWorld implements World {
         this.busy = true;
         this.ownedJob = 'song';
         try {
+          if (args.autoFix === true) {
+            const r = await autoFixSession(this.deps(), {
+              to: args.to === undefined ? 'local' : String(args.to),
+            });
+            return r.message;
+          }
           const r = await patchSong({
             lines: args.lines === undefined ? undefined : String(args.lines),
             lyric: args.lyric === undefined ? undefined : String(args.lyric),
@@ -896,7 +1200,7 @@ export class FishSingWorld implements World {
 
     list.push({
       name: 'fish_sing_lyrics',
-      description: '查看当前或最近一首歌的时间轴歌词表（句号、起止秒、主/副歌标签）、当前播到第几句，以及声学体检明细。唱中插话、按句返工或顺着歌词情绪接话时调用。',
+      description: '查看当前或最近一首歌的时间轴歌词表（句号、起止秒、主/副歌标签）、当前播到第几句以及声学体检明细；也支持微调或重置歌词时间轴偏移（offsetSec / resetOffset），调整后会即时刷新正在播放的提词时间轴。',
       tags: ['music'],
       parameters: {
         type: 'object',
@@ -904,21 +1208,26 @@ export class FishSingWorld implements World {
           fromLine: { type: 'number', description: '从第几句开始显示，默认 1' },
           limit: { type: 'number', description: '最多返回几句，默认 45' },
           refresh: { type: 'boolean', description: '强制重新联网匹配歌词并更新会话缓存' },
+          query: { type: 'string', description: '手动指定准确歌名/歌手重新联网匹配歌词（如 "潮汐 傅梦彤"），解决 B 站标题花哨导致回退乐句的问题' },
+          offsetSec: { type: 'number', description: '相对微调歌词时间轴偏移秒数（正数延后、负数提前，如 +1.5 或 -2.0）' },
+          resetOffset: { type: 'boolean', description: 'true = 把当前歌词时间轴偏移归零（恢复原始 LRC 时间）' },
         },
         required: [],
       },
       handler: async (args) => {
         const snap = loadSession(this.data());
         if (!snap) return '还没有最近唱过歌的记录。';
+        const customQuery = String(args.query ?? '').trim();
         const needRetryLang = Boolean(
           /[\u4e00-\u9fff]/.test(snap.title)
           && snap.lyrics?.lines?.length
           && snap.lyrics.source !== 'phrases'
           && !/[\u4e00-\u9fff]/.test(snap.lyrics.lines.map((l) => l.text).join('')),
         );
-        if (args.refresh === true || needRetryLang) {
+        if (args.refresh === true || Boolean(customQuery) || needRetryLang) {
           const fresh = await resolveLyrics({
-            title: snap.title,
+            title: customQuery || snap.title,
+            hintQuery: customQuery || undefined,
             bvid: snap.bvid || undefined,
             fullDurationSec: snap.durationSec,
             cutStart: snap.cutStart,
@@ -928,15 +1237,32 @@ export class FishSingWorld implements World {
           }).catch(() => undefined);
           if (fresh) {
             snap.lyrics = fresh;
-            try {
-              saveSession(this.data(), snap);
-            } catch {
-              /* 忽略 */
+            this.persistSessionLyrics(snap);
+          }
+        }
+        let offsetNote = '';
+        if (snap.lyrics?.lines?.length) {
+          if (args.resetOffset === true) {
+            const curOff = Number(snap.lyrics.offsetSec ?? 0);
+            if (Math.abs(curOff) >= 0.05) {
+              snap.lyrics = shiftLyrics(snap.lyrics as LyricsSheet, -curOff, snap.report?.chorusRanges);
+              snap.lyrics.offsetSec = 0;
+              this.persistSessionLyrics(snap);
+            }
+            offsetNote = '已将歌词时间轴偏移重置为 0s。';
+          } else if (args.offsetSec !== undefined && Number.isFinite(Number(args.offsetSec))) {
+            const delta = Number(args.offsetSec);
+            if (Math.abs(delta) >= 0.05) {
+              snap.lyrics = shiftLyrics(snap.lyrics as LyricsSheet, delta, snap.report?.chorusRanges);
+              this.persistSessionLyrics(snap);
+              const cur = Number(snap.lyrics.offsetSec ?? 0);
+              offsetNote = `已将歌词时间轴${delta > 0 ? '延后' : '提前'} ${Math.abs(delta).toFixed(1)}s（当前累计偏移 ${cur > 0 ? '+' : ''}${cur.toFixed(1)}s，正在播的提词已同步更新）。`;
             }
           }
         }
         const pb = this.player.playbackState();
         const head: string[] = [`《${snap.title}》（${fmtTime(snap.durationSec)}）`];
+        if (offsetNote) head.push(offsetNote);
         if (pb.playing) {
           const curTxt = pb.currentLine
             ? `，正唱到第 ${pb.currentLine.index} 句「${pb.currentLine.text}」`
@@ -962,15 +1288,153 @@ export class FishSingWorld implements World {
     });
 
     list.push({
+      name: 'fish_sing_seek',
+      description: '从任意一句、副歌或指定秒数直接跳播最近一首唱过的歌（不用从头听）。用户说「从副歌重新放一遍」「跳到第 12 句」「直接放高潮那段」时用。',
+      tags: ['music'],
+      parameters: {
+        type: 'object',
+        properties: {
+          line: { type: 'number', description: '跳到第几句开始播（1 基句号）' },
+          lyric: { type: 'string', description: '按歌词关键词匹配跳播到对应句' },
+          section: { type: 'string', enum: ['chorus'], description: '直接跳到副歌开头开始播' },
+          chorusIndex: { type: 'number', description: '第几段副歌（从 1 开始，配合 section="chorus"）' },
+          sec: { type: 'number', description: '直接跳到第几秒开始播（如 0 表示从头重播）' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        const res = this.seekRecentSession({
+          line: args.line === undefined ? undefined : Number(args.line),
+          lyric: args.lyric === undefined ? undefined : String(args.lyric),
+          section: args.section === 'chorus' ? 'chorus' : undefined,
+          chorusIndex: args.chorusIndex === undefined ? undefined : Number(args.chorusIndex),
+          sec: args.sec === undefined ? undefined : Number(args.sec),
+        });
+        return res.text;
+      },
+    });
+
+    list.push({
       name: 'fish_sing_stop',
-      description: '让她别唱了：停掉本机正在放的那首，并取消正在处理的歌。用户说「别唱了」「停」「安静」时用。',
+      description: '让她别唱了：停掉本机正在放的那首，并取消正在处理的歌（也会暂停队列自动连播）。用户说「别唱了」「停」「安静」时用。',
       tags: ['music'],
       parameters: { type: 'object', properties: {}, required: [] },
       handler: async () => {
         const was = this.player.playing;
+        this.queuePlayWhenWarm = false;
+        this.queueActiveSong = null;
         this.player.stop();
         await this.worker.cancel().catch(() => undefined);
         return was ? '停了。' : '本来就没在唱（正在处理的那首也取消了）。';
+      },
+    });
+
+    list.push({
+      name: 'fish_sing_queue',
+      description: '点歌队列与小歌会连唱：一次排多首歌连续唱、边唱边后台预热下一首、切下一首、设置单曲/列表循环、或一键把拿手歌本排成一场小歌会。用户说「连唱三首 A、B、C」「把下一首加进队列」「切下一首」「单曲循环」「开一场拿手歌会」时用。',
+      tags: ['music'],
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'add', 'next', 'remove', 'clear', 'mode', 'repertoire'],
+            description: '默认 list；add 加歌入队；next 立刻切下一首；remove 移出某首；clear 清空；mode 切循环模式；repertoire 一键排拿手歌会',
+          },
+          song: { type: 'string', description: 'add 时单首歌名 / BV 号 / 路径' },
+          songs: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'add 时一次排入多首歌（如 ["晴天", "雨爱", "心似烟火"]）',
+          },
+          front: { type: 'boolean', description: 'add 时是否插队到下一首，默认 false' },
+          query: { type: 'string', description: 'remove 时填序号（从 1 开始）或歌名' },
+          mode: {
+            type: 'string',
+            enum: ['sequence', 'loop-one', 'loop-all'],
+            description: '循环模式：sequence 顺序连唱 / loop-one 单曲循环 / loop-all 列表循环',
+          },
+          tag: { type: 'string', description: 'repertoire 时可按情绪/风格标签筛选拿手曲（如 "温柔"）' },
+          model: { type: 'string', description: 'add 时可选临时指定这批歌用的音色模型' },
+          pitch: { type: 'string', description: 'add 时可选移调（auto 或半音数）' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        const action = String(args.action ?? 'list');
+        if (action === 'list') return this.queue.formatText();
+
+        if (action === 'clear') {
+          const n = this.queue.clear();
+          this.queuePlayWhenWarm = false;
+          return n ? `已清空点歌队列（移出 ${n} 首）。` : '点歌队列本来就是空的。';
+        }
+
+        if (action === 'remove') {
+          const hit = this.queue.remove(String(args.query ?? ''));
+          return hit ? `已从队列移出《${hit.title}》。` : '队列里没找到那一首。';
+        }
+
+        if (action === 'mode') {
+          const m = args.mode === 'loop-one' || args.mode === 'loop-all' ? args.mode : 'sequence';
+          this.queue.mode = m;
+          const label = m === 'loop-one' ? '单曲循环' : m === 'loop-all' ? '列表循环' : '顺序连唱';
+          return `已切换到「${label}」模式。`;
+        }
+
+        if (action === 'next') {
+          return this.advanceQueue('manual');
+        }
+
+        if (action === 'repertoire') {
+          const { added, readyCount, titles } = this.enqueueRepertoireParty(
+            args.tag === undefined ? undefined : String(args.tag),
+          );
+          if (!added) {
+            return args.tag
+              ? `拿手歌本里没有匹配「${String(args.tag)}」的星标曲目。`
+              : '拿手歌本里还没有星标拿手曲，先收藏几首再开小歌会吧。';
+          }
+          const idle = !this.player.playing && !this.busy;
+          if (idle) {
+            const firstMsg = await this.advanceQueue('manual');
+            return `已排入 ${added} 首拿手曲（其中 ${readyCount} 首有定稿可 0 秒开播）：${titles.join('、')}。\n${firstMsg}`;
+          }
+          this.kickQueueWarmup();
+          return `已将 ${added} 首拿手曲排进小歌会队列（${readyCount} 首已就绪，其余将在后台预热）：${titles.join('、')}。`;
+        }
+
+        if (action === 'add') {
+          const listIn: string[] = [];
+          if (Array.isArray(args.songs)) {
+            for (const x of args.songs) {
+              const s = String(x || '').trim();
+              if (s) listIn.push(s);
+            }
+          }
+          const single = String(args.song ?? '').trim();
+          if (single) listIn.push(single);
+          if (!listIn.length) return '请给要排进队列的歌名（song 或 songs 数组）。';
+          const reqExtra: Partial<SingRequest> = {};
+          if (args.model) reqExtra.model = String(args.model);
+          if (args.pitch !== undefined) {
+            reqExtra.pitch = String(args.pitch).toLowerCase() === 'auto' ? 'auto' : Number(args.pitch);
+          }
+          const front = args.front === true;
+          const ordered = front ? listIn.slice().reverse() : listIn;
+          for (const s of ordered) {
+            this.queue.enqueue({ song: s, req: reqExtra }, front);
+          }
+          const idle = !this.player.playing && !this.busy;
+          if (idle) {
+            const firstMsg = await this.advanceQueue('manual');
+            return `已排入 ${listIn.length} 首（${listIn.join('、')}）。${firstMsg}`;
+          }
+          this.kickQueueWarmup();
+          return `已将 ${listIn.length} 首加入点歌队列（${listIn.join('、')}），当前队列共 ${this.queue.length} 首，后台会自动预热下一首。`;
+        }
+
+        return `不认识的 action「${action}」。`;
       },
     });
 
@@ -1049,6 +1513,148 @@ export class FishSingWorld implements World {
     });
 
     list.push({
+      name: 'fish_sing_repertoire',
+      description: '个人拿手歌本与唱法记忆：列出拿手曲、把刚唱好听的歌和当前参数配方收进歌本（含标签和心得）、或按情绪/标签随机挑一首拿手曲开播。用户说「记住这个唱法」「这首收进你的拿手歌」「随便唱首你拿手的」「唱首温柔的」时用。',
+      tags: ['music'],
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'save', 'pick', 'remove'], description: '默认 list' },
+          query: { type: 'string', description: 'save 时可指定作品库歌名/ID（不填默认最近刚唱的那首）；remove 时填歌名' },
+          tags: { type: 'string', description: 'save 时给曲目打标签，逗号分隔，如 "温柔,古风,睡前"' },
+          note: { type: 'string', description: 'save 时记一句唱法心得，如 "降2半音配dfy7最稳"' },
+          favorite: { type: 'boolean', description: 'save 时是否标为拿手曲，默认 true' },
+          tag: { type: 'string', description: 'list / pick 时按标签或关键词筛选（如 "温柔"）' },
+          play: { type: 'boolean', description: 'pick 时是否立刻播放定稿录音，默认 true' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        const action = String(args.action ?? 'list');
+        if (action === 'list') {
+          let rows = loadRepertoire(this.opts.dataDir);
+          const tag = String(args.tag ?? '').trim().toLowerCase();
+          if (tag) {
+            rows = rows.filter((it) => it.tags.some((t) => t.toLowerCase().includes(tag))
+              || it.note.toLowerCase().includes(tag)
+              || it.title.toLowerCase().includes(tag));
+          }
+          if (!rows.length) {
+            return tag
+              ? `拿手歌本里暂时没有带「${tag}」标签的歌。`
+              : '拿手歌本还是空的；唱到满意的歌时可以调 fish_sing_repertoire(action="save") 收进来。';
+          }
+          return rows.slice(0, 20).map((it, i) => {
+            const star = it.favorite ? '⭐' : '·';
+            const tagsTxt = it.tags.length ? ` [${it.tags.join('/')}]` : '';
+            const brief = formatRecipeBrief(it.bestParams);
+            const noteTxt = it.note ? `｜心得：${it.note}` : '';
+            return `${i + 1}. ${star} 《${it.title}》${tagsTxt}${brief ? `（${brief}）` : ''} · 唱过 ${it.singCount} 次${noteTxt}`;
+          }).join('\n');
+        }
+
+        if (action === 'remove') {
+          const q = String(args.query ?? '').trim();
+          if (!q) return '请给要从歌本移出的歌名。';
+          const hit = removeRepertoire(this.opts.dataDir, q);
+          return hit ? `已把《${hit.title}》从拿手歌本里移出。` : `拿手歌本里没找到「${q}」。`;
+        }
+
+        if (action === 'save') {
+          const q = String(args.query ?? '').trim();
+          const tags = parseTags(args.tags);
+          const note = args.note === undefined ? undefined : String(args.note);
+          const fav = args.favorite !== false;
+          if (!q) {
+            const snap = loadSession(this.data());
+            if (!snap) return '还没有最近唱过的歌可以保存，可以先传 query 指定作品库里的歌名。';
+            const saved = upsertRepertoire(this.opts.dataDir, {
+              title: snap.title,
+              source: snap.source,
+              bvid: snap.bvid,
+              favorite: fav,
+              tags: tags.length ? tags : undefined,
+              note,
+              bestLibraryId: snap.id,
+              bestParams: extractRecipe(snap.params, snap.lyrics?.offsetSec),
+            });
+            const brief = formatRecipeBrief(saved.bestParams);
+            return `已将《${saved.title}》收进拿手歌本${saved.tags.length ? `（标签：${saved.tags.join('、')}）` : ''}${brief ? `，记住配方：${brief}` : ''}。`;
+          }
+          const rows = listLibrary(this.data(), 500);
+          const libHit = rows.find((r) => r.id === q || r.title.toLowerCase().includes(q.toLowerCase()));
+          if (!libHit) return `作品库里没找到「${q}」。`;
+          const snap = loadSession(this.data(), libHit.id);
+          const saved = upsertRepertoire(this.opts.dataDir, {
+            title: libHit.title,
+            source: libHit.source,
+            bvid: libHit.bvid,
+            favorite: fav,
+            tags: tags.length ? tags : undefined,
+            note,
+            bestLibraryId: libHit.id,
+            bestParams: extractRecipe(libHit.params, snap?.lyrics?.offsetSec),
+          });
+          const brief = formatRecipeBrief(saved.bestParams);
+          return `已将《${saved.title}》收进拿手歌本${brief ? `，记住配方：${brief}` : ''}。`;
+        }
+
+        if (action === 'pick') {
+          const pb = this.player.playbackState();
+          const exclude = pb.playing ? loadRepertoire(this.opts.dataDir).find((it) => it.bestLibraryId === pb.id)?.key : undefined;
+          const picked = pickRepertoire(this.opts.dataDir, {
+            tag: args.tag === undefined ? undefined : String(args.tag),
+            favoriteOnly: true,
+            excludeKey: exclude,
+          });
+          if (!picked) {
+            return args.tag
+              ? `拿手歌本里暂时没有匹配「${String(args.tag)}」的拿手曲。`
+              : '拿手歌本里还没有星标曲目，先唱一首满意的存进来吧。';
+          }
+          const brief = formatRecipeBrief(picked.bestParams);
+          if (args.play === false) {
+            return `从拿手歌本挑了《${picked.title}》${picked.tags.length ? ` [${picked.tags.join('/')}]` : ''}${brief ? `（${brief}）` : ''}${picked.note ? `，心得：${picked.note}` : ''}。`;
+          }
+          const libRows = loadLibrary(this.data());
+          const libHit = libRows.find((r) => r.id === picked.bestLibraryId)
+            ?? libRows.find((r) => (picked.bvid && r.bvid === picked.bvid) || r.title === picked.title);
+          if (libHit && existsSync(libHit.file) && this.opts.cfg.play?.enabled !== false) {
+            const snap = loadSession(this.data(), libHit.id);
+            this.player.play(libHit.file, {
+              dir: this.ffmpeg().dir,
+              playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
+              volume: Number(this.opts.cfg.play?.volume ?? 1),
+              meta: {
+                id: libHit.id,
+                title: libHit.title,
+                durationSec: libHit.durationSec,
+                lyrics: snap?.lyrics as LyricsSheet | undefined,
+                chorusRanges: snap?.report?.chorusRanges,
+              },
+              lyricPush: this.lyricPushConfig(),
+              onLyricCue: (cue) => this.emitLyricCue(cue),
+              onEnd: (reason, elapsedSec) => {
+                if (reason !== 'ended') return;
+                void this.pushSingEvent(
+                  'fishsing.ended',
+                  `《${libHit.title}》刚刚自然唱完了（${fmtTime(libHit.durationSec)}）。可以自然接话问问要不要再来一首。`,
+                  { id: libHit.id, title: libHit.title, durationSec: libHit.durationSec, elapsedSec },
+                );
+              },
+              log: (m: string) => this.host?.log.warn(m),
+            });
+            return `从拿手歌本挑了《${picked.title}》直接开播定稿录音${brief ? `（${brief}）` : ''}${picked.note ? `；心得：${picked.note}` : ''}。`;
+          }
+          const srcHint = picked.bvid || picked.source || picked.title;
+          return `从拿手歌本挑了《${picked.title}》${brief ? `（${brief}）` : ''}，但定稿录音文件已不在作品库里；可直接调 fish_sing(song="${srcHint}") 按歌本配方重唱一遍。`;
+        }
+
+        return `不认识的 action「${action}」，支持 list / save / pick / remove。`;
+      },
+    });
+
+    list.push({
       name: 'fish_sing_status',
       description: '查看唱歌状态、当前播到第几句，以及本机所有可用的音色模型列表（想换音色重唱或局部返工前先调这个查看有哪些模型）。',
       tags: ['music'],
@@ -1116,6 +1722,8 @@ export class FishSingWorld implements World {
 
     if (method === 'list') {
       const dir = join(this.opts.dataDir, 'library');
+      const repList = loadRepertoire(this.opts.dataDir);
+      const favByLib = new Map(repList.filter((it) => it.favorite && it.bestLibraryId).map((it) => [it.bestLibraryId, it]));
       const rows = loadLibrary(this.data()).map((r) => {
         let sizeMb = 0;
         try {
@@ -1123,6 +1731,7 @@ export class FishSingWorld implements World {
         } catch {
           /* 文件没了就显示 0 */
         }
+        const fav = favByLib.get(r.id);
         return {
           id: r.id,
           title: r.title,
@@ -1135,8 +1744,14 @@ export class FishSingWorld implements World {
           pitch: r.params?.pitch ?? 0,
           mode: r.params?.mode ?? 'full',
           model: String(r.params?.model ?? ''),
+          duetModel: String(r.params?.duetModel ?? ''),
+          duetMode: String(r.params?.duetMode ?? ''),
+          karaoke: Boolean(r.params?.karaoke),
           indexRate: r.params?.indexRate ?? 0,
           missing: sizeMb === 0,
+          isFav: Boolean(fav),
+          favTags: fav?.tags ?? [],
+          favNote: fav?.note ?? '',
         };
       });
       return {
@@ -1144,10 +1759,26 @@ export class FishSingWorld implements World {
         playing: this.player.playing ? this.player.playing.split(/[\\/]/).pop() : '',
         dir,
         totalMb: Math.round(rows.reduce((n, r) => n + r.sizeMb, 0) * 10) / 10,
+        favCount: repList.filter((it) => it.favorite).length,
         playingEnabled: this.opts.cfg.play?.enabled !== false,
         qqEnabled: Boolean(String(this.opts.cfg.send?.httpUrl ?? '').trim()),
         defaultQqTarget: String(this.opts.cfg.notify?.qqTarget ?? '').trim(),
         currentModel: this.current.model,
+      };
+    }
+
+    if (method === 'favorite') {
+      const rows = loadLibrary(this.data());
+      const hit = rows.find((r) => r.id === a0);
+      if (!hit) throw new Error('作品库里没有这一首');
+      const snap = loadSession(this.data(), hit.id);
+      const { item, favored } = toggleFavoriteFromLibrary(this.opts.dataDir, hit, snap?.lyrics?.offsetSec);
+      const brief = formatRecipeBrief(item.bestParams);
+      return {
+        favored,
+        text: favored
+          ? `已将《${hit.title}》星标为拿手曲${brief ? `（记住配方：${brief}）` : ''}`
+          : `已取消《${hit.title}》的拿手曲星标`,
       };
     }
 
@@ -1157,10 +1788,28 @@ export class FishSingWorld implements World {
       if (!hit) throw new Error('作品库里没有这一首');
       if (!existsSync(hit.file)) throw new Error('文件不见了（可能被清理过）');
       if (this.opts.cfg.play?.enabled === false) throw new Error('本机播放被关掉了（配置 → 播放与发送）');
+      const snap = loadSession(this.data(), hit.id);
       this.player.play(hit.file, {
         dir: this.ffmpeg().dir,
         playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
         volume: Number(this.opts.cfg.play?.volume ?? 1),
+        meta: {
+          id: hit.id,
+          title: hit.title,
+          durationSec: hit.durationSec,
+          lyrics: snap?.lyrics as LyricsSheet | undefined,
+          chorusRanges: snap?.report?.chorusRanges,
+        },
+        lyricPush: this.lyricPushConfig(),
+        onLyricCue: (cue) => this.emitLyricCue(cue),
+        onEnd: (reason, elapsedSec) => {
+          if (reason !== 'ended') return;
+          void this.pushSingEvent(
+            'fishsing.ended',
+            `《${hit.title}》刚刚自然唱完了（${fmtTime(hit.durationSec)}）。可以自然接话问问要不要再来一首。`,
+            { id: hit.id, title: hit.title, durationSec: hit.durationSec, elapsedSec },
+          );
+        },
         log: (m: string) => this.host?.log.warn(m),
       });
       return { text: `正在放《${hit.title}》` };
@@ -1214,6 +1863,7 @@ export class FishSingWorld implements World {
           pitch: hit.params?.pitch ?? 'auto',
           to: 'local',
           refresh: true,
+          ignoreRecipe: true,
         }, this.deps());
         if (!r.ok) throw new Error(r.message);
         if (r.detail) {
@@ -1244,8 +1894,18 @@ export class FishSingWorld implements World {
         training: this.trainJob?.state === 'running',
         model: this.current.model,
         index: this.current.index ? basename(this.current.index) : '',
+        models: listModels(this.routes, this.current.model).map((m) => ({ name: m.name, current: m.current })),
         worker: h,
         playback: pb,
+        queue: {
+          mode: this.queue.mode,
+          items: this.queue.list().map((q: QueueItem) => ({
+            qid: q.qid,
+            title: q.title,
+            state: q.state,
+            error: q.error || '',
+          })),
+        },
         defaults: {
           mode: v?.mode === 'vocals' ? 'vocals' : 'full',
           pitch: v?.pitch ?? 'auto',
@@ -1258,6 +1918,7 @@ export class FishSingWorld implements World {
           f0Method: v?.f0Method ?? 'rmvpe',
           separator: v?.separator ?? 'htdemucs',
           dereverb: v?.dereverb === true,
+          karaoke: v?.karaoke === true,
           dynamicStyle: v?.dynamicStyle ?? 'off',
           qqEnabled: Boolean(String(this.opts.cfg.send?.httpUrl ?? '').trim()),
           defaultQqTarget: String(this.opts.cfg.notify?.qqTarget ?? '').trim(),
@@ -1312,6 +1973,9 @@ export class FishSingWorld implements World {
           f0Method: raw.f0Method === 'fcpe' || raw.f0Method === 'rmvpe' ? raw.f0Method : undefined,
           separator: raw.separator === 'roformer' || raw.separator === 'htdemucs' ? raw.separator : undefined,
           dereverb: typeof raw.dereverb === 'boolean' ? raw.dereverb : undefined,
+          karaoke: typeof raw.karaoke === 'boolean' ? raw.karaoke : undefined,
+          duetModel: raw.duetModel ? String(raw.duetModel) : undefined,
+          duetMode: raw.duetMode === 'unison' ? 'unison' : raw.duetMode === 'alternate' ? 'alternate' : undefined,
           dynamicStyle: raw.dynamicStyle === 'soft-verse-bright-chorus' || raw.dynamicStyle === 'off'
             ? raw.dynamicStyle : undefined,
           start: raw.start === undefined || raw.start === '' ? undefined : Number(raw.start),
@@ -1334,9 +1998,78 @@ export class FishSingWorld implements World {
     }
 
     if (method === 'stop') {
+      this.queuePlayWhenWarm = false;
+      this.queueActiveSong = null;
       this.player.stop();
       await this.worker.cancel().catch(() => undefined);
       return { text: '已停止播放并取消当前任务' };
+    }
+
+    if (method === 'queueAdd') {
+      const raw = (args[0] as Record<string, unknown>) ?? {};
+      const song = String(raw.song ?? '').trim();
+      if (!song) throw new Error('请先输入歌名、BV 号或本机路径');
+      const reqExtra: Partial<SingRequest> = {
+        mode: raw.mode === 'vocals' ? 'vocals' : 'full',
+        separator: raw.separator === 'roformer' ? 'roformer' : 'htdemucs',
+        dereverb: raw.dereverb === true,
+        karaoke: raw.karaoke === true,
+        f0Method: raw.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe',
+        dynamicStyle: raw.dynamicStyle === 'soft-verse-bright-chorus' ? 'soft-verse-bright-chorus' : 'off',
+        harmony: raw.harmony === 'double' || raw.harmony === 'double+third'
+          || raw.harmony === 'third' || raw.harmony === 'third+fifth' ? raw.harmony : 'off',
+        reverb: raw.reverb === 'light' ? 'light' : 'off',
+        duetModel: raw.duetModel ? String(raw.duetModel) : undefined,
+        duetMode: raw.duetMode === 'unison' ? 'unison' : 'alternate',
+        pitch: raw.pitch === undefined || raw.pitch === '' || String(raw.pitch).toLowerCase() === 'auto'
+          ? 'auto' : Number(raw.pitch),
+        indexRate: raw.indexRate === undefined || raw.indexRate === '' ? undefined : Number(raw.indexRate),
+        protect: raw.protect === undefined || raw.protect === '' ? undefined : Number(raw.protect),
+        rmsMixRate: raw.rmsMixRate === undefined || raw.rmsMixRate === '' ? undefined : Number(raw.rmsMixRate),
+      };
+      this.queue.enqueue({ song, req: reqExtra }, raw.front === true);
+      if (!this.player.playing && !this.busy) {
+        const text = await this.advanceQueue('manual');
+        return { text };
+      }
+      this.kickQueueWarmup();
+      return { text: `已将「${song}」加入点歌队列（当前 ${this.queue.length} 首）` };
+    }
+
+    if (method === 'queueNext') {
+      const text = await this.advanceQueue('manual');
+      return { text };
+    }
+
+    if (method === 'queueRemove') {
+      const hit = this.queue.remove(String(args[0] ?? ''));
+      return { text: hit ? `已移出《${hit.title}》` : '队列里没找到这一首' };
+    }
+
+    if (method === 'queueClear') {
+      const n = this.queue.clear();
+      this.queuePlayWhenWarm = false;
+      return { text: n ? `已清空点歌队列（${n} 首）` : '队列本来就是空的' };
+    }
+
+    if (method === 'queueMode') {
+      const m = args[0] === 'loop-one' || args[0] === 'loop-all' ? (args[0] as QueueLoopMode) : 'sequence';
+      this.queue.mode = m;
+      const label = m === 'loop-one' ? '单曲循环' : m === 'loop-all' ? '列表循环' : '顺序连唱';
+      return { text: `已切换为「${label}」` };
+    }
+
+    if (method === 'queueRepertoire') {
+      const { added, readyCount, titles } = this.enqueueRepertoireParty(
+        args[0] === undefined ? undefined : String(args[0]),
+      );
+      if (!added) throw new Error('拿手歌本里还没有星标曲目，请先在「作品库」给喜欢的歌点一下「☆ 拿手」');
+      if (!this.player.playing && !this.busy) {
+        const first = await this.advanceQueue('manual');
+        return { text: `已排入 ${added} 首拿手曲（${readyCount} 首 0 秒就绪）：${titles.join('、')} · ${first}` };
+      }
+      this.kickQueueWarmup();
+      return { text: `已排入 ${added} 首拿手曲（${readyCount} 首 0 秒就绪）：${titles.join('、')}` };
     }
 
     if (method === 'unload') {
@@ -1347,11 +2080,13 @@ export class FishSingWorld implements World {
 
     if (method === 'lyrics') {
       const forceRefresh = args[0] === true;
+      const customQuery = String(args[1] ?? '').trim();
       const snap = loadSession(this.data());
-      if (!snap) return { text: '还没有最近唱过歌的记录', body: '' };
-      if (forceRefresh) {
+      if (!snap) return { text: '还没有最近唱过歌的记录', body: '', lines: [] };
+      if (forceRefresh || customQuery) {
         const fresh = await resolveLyrics({
-          title: snap.title,
+          title: customQuery || snap.title,
+          hintQuery: customQuery || undefined,
           bvid: snap.bvid || undefined,
           fullDurationSec: snap.durationSec,
           cutStart: snap.cutStart,
@@ -1361,26 +2096,48 @@ export class FishSingWorld implements World {
         }).catch(() => undefined);
         if (fresh) {
           snap.lyrics = fresh;
-          try {
-            saveSession(this.data(), snap);
-          } catch {
-            /* 忽略 */
-          }
+          this.persistSessionLyrics(snap);
         }
       }
-      const pb = this.player.playbackState();
-      const head: string[] = [`《${snap.title}》（${fmtTime(snap.durationSec)}）`];
-      if (pb.playing) {
-        head.push(`当前播放：${fmtTime(pb.elapsedSec)}/${fmtTime(pb.durationSec || snap.durationSec)}${pb.currentLine ? ` · 第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : ''}`);
+      return this.formatLyricsPanelPayload(snap);
+    }
+
+    if (method === 'offset') {
+      const deltaSec = Number(args[0] ?? 0);
+      const reset = args[1] === true;
+      const snap = loadSession(this.data());
+      if (!snap || !snap.lyrics?.lines?.length) throw new Error('当前没有可校准的歌词时间轴');
+      if (reset) {
+        const curOff = Number(snap.lyrics.offsetSec ?? 0);
+        if (Math.abs(curOff) >= 0.05) {
+          snap.lyrics = shiftLyrics(snap.lyrics as LyricsSheet, -curOff, snap.report?.chorusRanges);
+          snap.lyrics.offsetSec = 0;
+          this.persistSessionLyrics(snap);
+        }
+      } else if (Number.isFinite(deltaSec) && Math.abs(deltaSec) >= 0.05) {
+        snap.lyrics = shiftLyrics(snap.lyrics as LyricsSheet, deltaSec, snap.report?.chorusRanges);
+        this.persistSessionLyrics(snap);
       }
-      if (snap.report?.summary) head.push(`声学体检：${snap.report.summary}`);
-      if (snap.report?.issues?.length) {
-        head.push('风险时间段：\n' + snap.report.issues.map((it) => `  - ${it.note}`).join('\n'));
-      }
-      if (snap.lyrics?.lines?.length) {
-        head.push(formatLyricsTable(snap.lyrics as LyricsSheet, { fromLine: 1, limit: 120 }));
-      }
-      return { body: head.join('\n') };
+      const curOff = Number(snap.lyrics.offsetSec ?? 0);
+      return {
+        ...this.formatLyricsPanelPayload(snap),
+        text: reset
+          ? '歌词偏移已重置为 0s'
+          : `歌词偏移已调整为 ${curOff > 0 ? '+' : ''}${curOff.toFixed(1)}s`,
+      };
+    }
+
+    if (method === 'seek') {
+      const raw = (args[0] as Record<string, unknown>) ?? {};
+      const res = this.seekRecentSession({
+        line: raw.line === undefined || raw.line === '' ? undefined : Number(raw.line),
+        lyric: raw.lyric ? String(raw.lyric) : undefined,
+        section: raw.section === 'chorus' ? 'chorus' : undefined,
+        chorusIndex: raw.chorusIndex === undefined ? undefined : Number(raw.chorusIndex),
+        sec: raw.sec === undefined || raw.sec === '' ? undefined : Number(raw.sec),
+      });
+      if (!res.ok) throw new Error(res.text);
+      return { text: res.text, seekSec: res.seekSec };
     }
 
     if (method === 'patch') {
@@ -1414,7 +2171,133 @@ export class FishSingWorld implements World {
       }
     }
 
+    if (method === 'autoFix') {
+      if (this.trainJob?.state === 'running') throw new Error('正在训练模型，稍后再自动修补');
+      if (this.busy) throw new Error('当前有任务在进行，稍等几秒');
+      this.busy = true;
+      this.ownedJob = 'song';
+      try {
+        const r = await autoFixSession(this.deps(), { to: 'local' });
+        if (!r.ok) throw new Error(r.message);
+        return { text: r.message, detail: r.detail };
+      } finally {
+        this.busy = false;
+      }
+    }
+
     throw new Error(`未知方法：${method}`);
+  }
+
+  /** 把更新后的歌词表落盘到当前会话，并在正在播放同一首歌时热更新播放器提词时间轴。 */
+  private persistSessionLyrics(snap: NonNullable<ReturnType<typeof loadSession>>): void {
+    try {
+      saveSession(this.data(), snap);
+    } catch {
+      /* 忽略 */
+    }
+    const pb = this.player.playbackState();
+    if (pb.playing && pb.id === snap.id && snap.lyrics) {
+      this.player.updateMetaLyrics(snap.lyrics as LyricsSheet, snap.report?.chorusRanges);
+    }
+  }
+
+  /** 组装试唱面板的歌词与体检结构化载荷。 */
+  private formatLyricsPanelPayload(snap: NonNullable<ReturnType<typeof loadSession>>) {
+    const pb = this.player.playbackState();
+    const head: string[] = [`《${snap.title}》（${fmtTime(snap.durationSec)}）`];
+    if (pb.playing) {
+      head.push(`当前播放：${fmtTime(pb.elapsedSec)}/${fmtTime(pb.durationSec || snap.durationSec)}${pb.currentLine ? ` · 第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : ''}`);
+    }
+    if (snap.report?.summary) head.push(`声学体检：${snap.report.summary}`);
+    if (snap.report?.issues?.length) {
+      head.push('风险时间段：\n' + snap.report.issues.map((it) => `  - ${it.note}`).join('\n'));
+    }
+    if (snap.lyrics?.lines?.length) {
+      head.push(formatLyricsTable(snap.lyrics as LyricsSheet, { fromLine: 1, limit: 120 }));
+    }
+    return {
+      body: head.join('\n'),
+      title: snap.title,
+      durationSec: snap.durationSec,
+      sourceLabel: snap.lyrics?.sourceLabel ?? '',
+      offsetSec: Number(snap.lyrics?.offsetSec ?? 0),
+      autoOffsetSec: snap.lyrics?.autoOffsetSec,
+      summary: snap.report?.summary ?? '',
+      issues: snap.report?.issues ?? [],
+      chorusRanges: snap.report?.chorusRanges ?? [],
+      lines: snap.lyrics?.lines ?? [],
+      playingLine: pb.playing && pb.id === snap.id ? (pb.currentLine?.index ?? 0) : 0,
+    };
+  }
+
+  /** 按句号/歌词关键词/副歌/秒数跳播最近一首歌（不重跑换声，直接 ffplay -ss 定位起播）。 */
+  private seekRecentSession(query: {
+    line?: number;
+    lyric?: string;
+    section?: 'chorus';
+    chorusIndex?: number;
+    sec?: number;
+  }): { ok: boolean; text: string; seekSec?: number } {
+    const snap = loadSession(this.data());
+    if (!snap) return { ok: false, text: '还没有最近唱过歌的记录，先唱一首吧。' };
+    if (!snap.mp3 || !existsSync(snap.mp3)) {
+      return { ok: false, text: `《${snap.title}》的音频文件不存在，无法跳播。` };
+    }
+    if (this.opts.cfg.play?.enabled === false) {
+      return { ok: false, text: '本机播放被关掉了（配置 → 播放与发送）。' };
+    }
+
+    let seekSec = 0;
+    let label = '开头（0:00）';
+    if (query.sec !== undefined && Number.isFinite(query.sec)) {
+      seekSec = Math.max(0, Math.min(Math.max(0, snap.durationSec - 1), query.sec));
+      label = fmtTime(seekSec);
+    } else {
+      const hit = locatePatchRange(
+        snap.lyrics as LyricsSheet | undefined,
+        snap.report?.chorusRanges,
+        {
+          lines: query.line !== undefined ? String(query.line) : undefined,
+          lyric: query.lyric,
+          section: query.section,
+          chorusIndex: query.chorusIndex,
+        },
+      );
+      if (!hit) {
+        return {
+          ok: false,
+          text: '没找到要跳的位置：请传 line（句号）、lyric（关键词）、section="chorus" 或 sec（秒数）。',
+        };
+      }
+      seekSec = Math.max(0, hit.start - 0.3);
+      label = `${hit.label}（${fmtTime(seekSec)}）`;
+    }
+
+    this.player.play(snap.mp3, {
+      dir: this.ffmpeg().dir,
+      playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
+      volume: Number(this.opts.cfg.play?.volume ?? 1),
+      seekSec,
+      meta: {
+        id: snap.id,
+        title: snap.title,
+        durationSec: snap.durationSec,
+        lyrics: snap.lyrics as LyricsSheet | undefined,
+        chorusRanges: snap.report?.chorusRanges,
+      },
+      lyricPush: this.lyricPushConfig(),
+      onLyricCue: (cue) => this.emitLyricCue(cue),
+      onEnd: (reason, elapsedSec) => {
+        if (reason !== 'ended') return;
+        void this.pushSingEvent(
+          'fishsing.ended',
+          `《${snap.title}》刚刚自然唱完了（${fmtTime(snap.durationSec)}）。可以自然接话问问要不要再来一首。`,
+          { id: snap.id, title: snap.title, durationSec: snap.durationSec, elapsedSec },
+        );
+      },
+      log: (m: string) => this.host?.log.warn(m),
+    });
+    return { ok: true, text: `已跳到《${snap.title}》${label}开始播。`, seekSec };
   }
 
   /**
@@ -2017,6 +2900,28 @@ export class FishSingWorld implements World {
         text: r.index
           ? `导入了 ${r.name}，顺便找到了索引 ${basename(r.index)}`
           : `导入了 ${r.name}（没找到同名实验的索引，切过去后音色会淡一些）`,
+      };
+    }
+
+    if (method === 'fuse') {
+      if (this.trainJob?.state === 'running') throw new Error('正在训练模型，等训练完再融合');
+      const modelA = String(args[0] ?? '').trim();
+      const modelB = String(args[1] ?? '').trim();
+      const outName = String(args[2] ?? '').trim();
+      const alpha = Number(args[3] ?? 0.5);
+      if (!modelA || !modelB) throw new Error('请先选择两个要融合的模型');
+      if (modelA === modelB) throw new Error('请选择两个不同的模型进行融合');
+      const jid = await this.worker.submit('fuse', {
+        model_a: modelA,
+        model_b: modelB,
+        out_name: outName,
+        alpha: Number.isFinite(alpha) ? alpha : 0.5,
+      });
+      const job = await this.worker.wait(jid, undefined, { timeoutMs: 120_000 });
+      const res = (job.result ?? {}) as { name?: string; sizeMb?: number; index?: string; info?: string };
+      return {
+        name: res.name || '',
+        text: `融合完成：${res.name || '新模型'}（${res.sizeMb ?? 0} MB${res.index ? '，已自动继承主父模型索引与音域' : ''}，${res.info || ''}），可直接点「使用」试唱`,
       };
     }
 

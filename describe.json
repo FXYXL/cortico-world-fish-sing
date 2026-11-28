@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "cortico-world-fish-sing",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "describe": {
     "tools": [
       {
@@ -102,9 +102,25 @@
               "type": "boolean",
               "description": "分离后是否额外去混响"
             },
+            "karaoke": {
+              "type": "boolean",
+              "description": "分离后是否额外去原唱伴唱和声（UVR5 Karaoke）"
+            },
             "model": {
               "type": "string",
               "description": "临时指定本次演唱使用的音色模型（可先调 fish_sing_status 查看全部可用模型）"
+            },
+            "duetModel": {
+              "type": "string",
+              "description": "双音色真合唱搭档模型（与主模型交替对唱或副歌双声部合唱）"
+            },
+            "duetMode": {
+              "type": "string",
+              "enum": [
+                "alternate",
+                "unison"
+              ],
+              "description": "合唱模式（alternate 主歌对唱+副歌真合唱 / unison 全程双声部合唱）"
             },
             "dynamicStyle": {
               "type": "string",
@@ -121,6 +137,14 @@
             "async": {
               "type": "boolean",
               "description": "异步后台准备并自动开唱"
+            },
+            "ignoreRecipe": {
+              "type": "boolean",
+              "description": "是否忽略拿手歌本里的该曲最佳配方"
+            },
+            "lyricQuery": {
+              "type": "string",
+              "description": "可选指定准确歌名与歌手用于精准匹配时间轴歌词"
             }
           },
           "required": [
@@ -195,6 +219,10 @@
             "previewOnly": {
               "type": "boolean"
             },
+            "autoFix": {
+              "type": "boolean",
+              "description": "一键自动修补声学体检标出的所有破音/越界问题段"
+            },
             "to": {
               "type": "string"
             }
@@ -204,7 +232,7 @@
       },
       {
         "name": "fish_sing_lyrics",
-        "description": "查看最近一首歌的时间轴歌词表、当前播到第几句以及声学体检报告。",
+        "description": "查看最近一首歌的时间轴歌词表、当前播到第几句以及声学体检报告；支持微调或重置歌词时间轴偏移。",
         "summary": {
           "zh": "歌词与体检",
           "en": "Lyrics timeline and vocal inspection"
@@ -220,6 +248,61 @@
             },
             "limit": {
               "type": "number"
+            },
+            "refresh": {
+              "type": "boolean"
+            },
+            "query": {
+              "type": "string",
+              "description": "手动指定准确歌名/歌手重新联网匹配歌词"
+            },
+            "offsetSec": {
+              "type": "number",
+              "description": "相对微调歌词偏移秒数（正数延后、负数提前）"
+            },
+            "resetOffset": {
+              "type": "boolean",
+              "description": "重置歌词时间轴偏移为 0"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "fish_sing_seek",
+        "description": "从任意一句、副歌或指定秒数直接跳播最近一首唱过的歌。",
+        "summary": {
+          "zh": "跳播指定句或副歌",
+          "en": "Seek playback to a line or chorus"
+        },
+        "tags": [
+          "music"
+        ],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "line": {
+              "type": "number",
+              "description": "跳到第几句开始播（1 基句号）"
+            },
+            "lyric": {
+              "type": "string",
+              "description": "按歌词关键词跳播"
+            },
+            "section": {
+              "type": "string",
+              "enum": [
+                "chorus"
+              ],
+              "description": "跳到副歌开头"
+            },
+            "chorusIndex": {
+              "type": "number",
+              "description": "第几段副歌（从 1 开始）"
+            },
+            "sec": {
+              "type": "number",
+              "description": "直接跳到第几秒"
             }
           },
           "required": []
@@ -238,6 +321,67 @@
         "parameters": {
           "type": "object",
           "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "fish_sing_queue",
+        "description": "点歌队列与小歌会连唱：一次排多首歌连续唱、边唱边后台预热下一首、切歌、切换循环模式或一键排入拿手歌会。",
+        "summary": {
+          "zh": "点歌队列 / 连唱",
+          "en": "Singing queue and continuous mode"
+        },
+        "tags": [
+          "music"
+        ],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "add",
+                "next",
+                "remove",
+                "clear",
+                "mode",
+                "repertoire"
+              ]
+            },
+            "song": {
+              "type": "string"
+            },
+            "songs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "front": {
+              "type": "boolean"
+            },
+            "query": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "sequence",
+                "loop-one",
+                "loop-all"
+              ]
+            },
+            "tag": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "pitch": {
+              "type": "string"
+            }
+          },
           "required": []
         }
       },
@@ -272,6 +416,50 @@
             },
             "limit": {
               "type": "number"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "fish_sing_repertoire",
+        "description": "个人拿手歌本与唱法记忆：列出、收藏最佳配方与心得、或按标签挑一首拿手曲开播。",
+        "summary": {
+          "zh": "拿手歌本",
+          "en": "Personal singing repertoire"
+        },
+        "tags": [
+          "music"
+        ],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "save",
+                "pick",
+                "remove"
+              ]
+            },
+            "query": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            },
+            "favorite": {
+              "type": "boolean"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "play": {
+              "type": "boolean"
             }
           },
           "required": []

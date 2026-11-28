@@ -41,7 +41,8 @@ import {
   type SingSessionSnapshot,
   type VocalReport,
 } from './library.ts';
-import { fmtTime, locatePatchRange, resolveLyrics, type LyricsSheet } from './lyrics.ts';
+import { fmtTime, locatePatchRange, resolveLyrics, shiftLyrics, type LyricsSheet } from './lyrics.ts';
+import { findRepertoire, formatRecipeBrief, recordSingCount } from './repertoire.ts';
 import type { LoggerLike, WorkerClient } from './worker.ts';
 
 export interface PlaybackEndInfo {
@@ -121,8 +122,14 @@ export interface SingRequest {
   separator?: 'htdemucs' | 'roformer';
   /** 分离后额外去混响 */
   dereverb?: boolean;
+  /** 分离后额外去原唱伴唱和声（UVR5 Karaoke） */
+  karaoke?: boolean;
   /** 临时指定本次演唱使用的音色模型名（如 dfy7.pth），唱完自动恢复默认模型 */
   model?: string;
+  /** 双音色合唱搭档模型名（与当前/主模型双声部合唱或交替对唱） */
+  duetModel?: string;
+  /** 双音色合唱模式：alternate=主歌交替+副歌真合唱 / unison=全程双声部合唱 */
+  duetMode?: 'alternate' | 'unison';
   /** 动态主副歌演绎：off / soft-verse-bright-chorus */
   dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
   /** 显式分段换音色/换参数 */
@@ -131,12 +138,16 @@ export interface SingRequest {
   duration?: number;
   /** 跳过缓存（想重唱一遍时用） */
   refresh?: boolean;
+  /** true = 忽略拿手歌本里存的该曲最佳配方，强制按当前配置与入参演唱 */
+  ignoreRecipe?: boolean;
   /** 只搜索不下载：把候选列表交回去，让她自己挑 */
   search?: boolean;
   /** 指定要下哪一条：序号（从 1 开始）或 BV 号 */
   pick?: string;
   /** B 站排序：default 综合 / click 播放多 / pubdate 最新 */
   order?: SearchOrder;
+  /** 可选指定准确歌名/歌手用于检索时间轴歌词（如用 BV 号点歌时填 "潮汐 傅梦彤"） */
+  lyricQuery?: string;
 }
 
 export interface PatchRequest {
@@ -376,9 +387,12 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     f0Method: (req.f0Method ?? deps.voice.f0Method) === 'fcpe' ? 'fcpe' : 'rmvpe',
     separator: (req.separator ?? deps.voice.separator) === 'roformer' ? 'roformer' : 'htdemucs',
     dereverb: Boolean(req.dereverb ?? deps.voice.dereverb),
+    karaoke: Boolean(req.karaoke ?? deps.voice.karaoke),
     dynamicStyle: (req.dynamicStyle ?? deps.voice.dynamicStyle) === 'soft-verse-bright-chorus'
       ? 'soft-verse-bright-chorus' : 'off',
     segmentsKey: Array.isArray(req.segments) && req.segments.length ? JSON.stringify(req.segments) : '',
+    duetModel: req.duetModel ? String(req.duetModel).trim() : '',
+    duetMode: req.duetMode === 'unison' ? 'unison' : 'alternate',
     // 不传 pitch = 按配置默认（配置默认 'auto' = 按音域自动推荐）
     pitch: req.pitch === undefined || req.pitch === 'auto'
       ? (deps.voice.pitch ?? 'auto')
@@ -398,6 +412,38 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     // ---- 1. 来源
     const src = await resolveSource(req, deps, root);
     deps.log.info(`唱歌：${src.title}（${src.note}，${human(src.durationSec)}）`);
+
+    // ---- 1b. 若该曲已在「拿手歌本」里存过最佳配方，且本次未要求忽略配方，则对未显式指定的参数自动沿用配方
+    const repHit = req.ignoreRecipe
+      ? null
+      : findRepertoire(deps.data.dataDir, { bvid: src.bvid, source: src.input, title: src.title });
+    const recipe = repHit?.favorite ? repHit.bestParams : undefined;
+    let recipeNote = '';
+    let effectiveModel = reqModel;
+    if (recipe) {
+      if (!reqModel && recipe.model) {
+        effectiveModel = recipe.model;
+        params.model = recipe.model;
+        if (recipe.model !== deps.voice.model) params.index = '';
+      }
+      if (req.pitch === undefined && recipe.pitch !== undefined) params.pitch = recipe.pitch;
+      if (req.indexRate === undefined && recipe.indexRate !== undefined) params.indexRate = recipe.indexRate;
+      if (req.protect === undefined && recipe.protect !== undefined) params.protect = recipe.protect;
+      if (req.rmsMixRate === undefined && recipe.rmsMixRate !== undefined) params.rmsMixRate = clamp01(recipe.rmsMixRate);
+      if (req.harmony === undefined && recipe.harmony !== undefined) params.harmony = recipe.harmony;
+      if (req.reverb === undefined && recipe.reverb !== undefined) params.reverb = recipe.reverb;
+      if (req.polish === undefined && recipe.polish !== undefined) params.polish = recipe.polish;
+      if (req.f0Method === undefined && recipe.f0Method !== undefined) params.f0Method = recipe.f0Method;
+      if (req.separator === undefined && recipe.separator !== undefined) params.separator = recipe.separator;
+      if (req.dereverb === undefined && recipe.dereverb !== undefined) params.dereverb = recipe.dereverb;
+      if (req.dynamicStyle === undefined && recipe.dynamicStyle !== undefined) params.dynamicStyle = recipe.dynamicStyle;
+      if (req.mode === undefined && recipe.mode !== undefined) params.mode = recipe.mode;
+      const brief = formatRecipeBrief(recipe);
+      if (brief) {
+        recipeNote = `；沿用拿手歌本配方（${brief}）`;
+        deps.log.info(`命中拿手歌本配方《${repHit!.title}》：${brief}`);
+      }
+    }
 
     // ---- 2. 缓存
     const cutStart = Math.max(0, Number(req.start ?? 0) || 0);
@@ -424,7 +470,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       if (!lyrics) {
         lyrics = await resolveLyrics({
           title: src.title,
-          hintQuery: songText,
+          hintQuery: req.lyricQuery || songText,
           localPath: src.kind === 'file' ? src.input : undefined,
           bvid: src.bvid || undefined,
           fullDurationSec: src.durationSec,
@@ -439,6 +485,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       const fullSepDir = sepCacheDir(deps.data, fullSourceKey, {
         separator: params.separator,
         dereverb: params.dereverb,
+        karaoke: params.karaoke,
       });
       const hasFullSep = !src.alreadyVocal && existsSync(join(fullSepDir, 'vocals.wav'));
       let feed = src.input;
@@ -463,6 +510,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         sep_cache: src.alreadyVocal ? '' : (useSnapCut ? fullSepDir : sepCacheDir(deps.data, sourceCutKey, {
           separator: params.separator,
           dereverb: params.dereverb,
+          karaoke: params.karaoke,
         })),
         snap_cut: useSnapCut ? { start: cutStart, duration: cutDuration } : null,
         session_dir: sessDir,
@@ -474,7 +522,10 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         f0_method: params.f0Method,
         separator: params.separator,
         dereverb: params.dereverb,
-        model: reqModel,
+        karaoke: params.karaoke,
+        model: effectiveModel,
+        duet_model: params.duetModel || '',
+        duet_mode: params.duetMode || 'alternate',
         dynamic_style: params.dynamicStyle ?? 'off',
         segments: Array.isArray(req.segments) && req.segments.length ? req.segments : null,
         reverb: params.reverb,
@@ -517,7 +568,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         : cutDuration;
       lyrics = await resolveLyrics({
         title: src.title,
-        hintQuery: songText,
+        hintQuery: req.lyricQuery || songText,
         localPath: src.kind === 'file' ? src.input : undefined,
         bvid: src.bvid || undefined,
         fullDurationSec: src.durationSec,
@@ -526,6 +577,15 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         phrases: report?.phrases,
         chorusRanges: report?.chorusRanges,
       }).catch(() => undefined);
+      // 若拿手歌本里存过手工校准的歌词偏移，且与当前自动偏移不同，自动套用歌本偏移
+      if (lyrics?.lines?.length && typeof recipe?.lrcOffsetSec === 'number') {
+        const curOff = Number(lyrics.offsetSec ?? 0);
+        const delta = recipe.lrcOffsetSec - curOff;
+        if (Math.abs(delta) >= 0.05) {
+          lyrics = shiftLyrics(lyrics, delta, report?.chorusRanges);
+          lyrics.offsetSec = recipe.lrcOffsetSec;
+        }
+      }
     }
 
     const totalSec = await duration(mp3, deps.ffmpeg);
@@ -621,13 +681,23 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       }
     } else if (isBoth) {
       problems.push('「both」只做了本机播放——要发 QQ 请写 group:<群号> 或 private:<QQ号>');
-    } else if (toRaw && lower !== 'local') {
+    } else if (toRaw && lower !== 'local' && lower !== 'none') {
       problems.push(`不认识的会话地址「${toRaw}」，要 group:<群号> 或 private:<QQ号>`);
     }
 
-    // ---- 7. 作品库条目补充"投递到哪"
+    // ---- 7. 作品库条目补充"投递到哪"，并悄悄累计歌本唱次
     if (delivered.length) {
       addToLibrary(deps.data, { ...libEntry, target: delivered.join(' + ') }, libEntry.file);
+    }
+    try {
+      recordSingCount(deps.data.dataDir, {
+        bvid: src.bvid,
+        source: src.bvid || src.input,
+        title: src.title,
+        lrcOffsetSec: lyrics?.offsetSec,
+      });
+    } catch {
+      /* 忽略 */
     }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
@@ -637,8 +707,14 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       ? `；变调 ${suggest.pitch >= 0 ? '+' : ''}${suggest.pitch}（${suggest.reason}）`
       : '';
     const reportNote = report?.summary ? `；体检：${report.summary}` : '';
-    const lyricsNote = lyrics?.lines?.length ? `；已备时间轴（${lyrics.sourceLabel}，${lyrics.lines.length} 句）` : '';
-    const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}${autoNote}`;
+    const offVal = Number(lyrics?.offsetSec ?? 0);
+    const offTag = Math.abs(offVal) >= 0.05 ? `，前奏偏移 ${offVal > 0 ? '+' : ''}${offVal.toFixed(1)}s` : '';
+    const lyricsNote = lyrics?.lines?.length ? `；已备时间轴（${lyrics.sourceLabel}，${lyrics.lines.length} 句${offTag}）` : '';
+    const duetTag = params.duetModel
+      ? `；双音色合唱（${params.model} + ${params.duetModel}，${params.duetMode === 'unison' ? '全程双声部' : '主歌对唱+副歌合唱'}）`
+      : '';
+    const karTag = params.karaoke ? '；已启去伴唱(Karaoke)' : '';
+    const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}${autoNote}${recipeNote}${duetTag}${karTag}`;
     const tail = delivered.length ? `；${delivered.join('，')}` : '；没投递（文件进了作品库，可以用 fish_sing_library 回放）';
     const warn = problems.length ? `；但${problems.join('；')}` : '';
     return {
@@ -881,4 +957,92 @@ export async function patchSong(req: PatchRequest, deps: SingDeps): Promise<Sing
       scheduleTmpCleanup(deps.worker, jobId, root);
     }
   }
+}
+
+/**
+ * 声学体检一键自动修补：
+ * 读取最近一次演唱的声学体检报告（report.issues），针对破音/跳变（unstable）、高音越界（too_high）
+ * 与低音越界（too_low）段落自动匹配补救参数，依次调用 patchSong 无缝贴回并播放新版全曲。
+ */
+export async function autoFixSession(
+  deps: SingDeps,
+  opts?: { sessionId?: string; maxFixes?: number; to?: string },
+): Promise<SingResult> {
+  const snap = loadSession(deps.data, opts?.sessionId);
+  if (!snap) return { ok: false, message: '还没有可修补的最近演唱记录，先唱一首歌吧。' };
+  const issues = snap.report?.issues ?? [];
+  if (!issues.length) {
+    return { ok: true, message: `《${snap.title}》的声学体检未发现明显破音或越界问题段，这版已经挺稳啦！` };
+  }
+  const limit = Math.max(1, Math.min(5, Number(opts?.maxFixes ?? 3)));
+  // 合并重叠或间距 <= 1.5s 的相邻问题段，避免对同一句反复返工
+  const kindRank = (k: string) => (k === 'unstable' ? 3 : k === 'too_high' ? 2 : 1);
+  const sorted = issues.slice().sort((a, b) => a.start - b.start);
+  const merged: typeof sorted = [];
+  for (const it of sorted) {
+    const prev = merged[merged.length - 1];
+    if (prev && it.start <= prev.end + 1.5) {
+      prev.end = Math.max(prev.end, it.end);
+      if (kindRank(it.kind) > kindRank(prev.kind)) prev.kind = it.kind;
+    } else {
+      merged.push({ ...it });
+    }
+  }
+  const targets = merged.slice(0, limit);
+  const baseProtect = Number(snap.params?.protect ?? 0.33);
+  const baseIndex = Number(snap.params?.indexRate ?? 0.75);
+  const finalTo = opts?.to ?? 'local';
+  const notes: string[] = [];
+
+  for (let i = 0; i < targets.length; i += 1) {
+    const it = targets[i];
+    const isLast = i === targets.length - 1;
+    let f0Method: 'rmvpe' | 'fcpe' = 'fcpe';
+    let protect = baseProtect;
+    let indexRate = baseIndex;
+    let strategy = '';
+
+    if (it.kind === 'unstable') {
+      f0Method = 'fcpe';
+      protect = Math.min(0.46, Math.round((baseProtect + 0.08) * 100) / 100);
+      indexRate = Math.max(0.55, Math.round((baseIndex - 0.1) * 100) / 100);
+      strategy = `切 fcpe + protect=${protect}`;
+    } else if (it.kind === 'too_high') {
+      f0Method = 'fcpe';
+      protect = Math.min(0.45, Math.round((baseProtect + 0.06) * 100) / 100);
+      indexRate = Math.max(0.55, Math.round((baseIndex - 0.12) * 100) / 100);
+      strategy = `切 fcpe + 柔化高音 index=${indexRate}`;
+    } else {
+      f0Method = snap.params?.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe';
+      protect = Math.max(0.22, Math.round((baseProtect - 0.08) * 100) / 100);
+      indexRate = Math.min(0.85, Math.round((baseIndex + 0.05) * 100) / 100);
+      strategy = `增强低音 protect=${protect}`;
+    }
+
+    const r = await patchSong({
+      sessionId: snap.id,
+      start: it.start,
+      end: it.end,
+      f0Method,
+      protect,
+      indexRate,
+      previewOnly: false,
+      to: isLast ? finalTo : 'none',
+    }, deps);
+    if (!r.ok) {
+      return {
+        ok: notes.length > 0,
+        message: notes.length
+          ? `已修补 ${notes.length} 段（${notes.join('；')}），第 ${i + 1} 段中止：${r.message}`
+          : `自动修补失败：${r.message}`,
+      };
+    }
+    notes.push(`${fmtTime(it.start)}–${fmtTime(it.end)}（${strategy}）`);
+  }
+
+  return {
+    ok: true,
+    message: `已完成《${snap.title}》体检一键修补（共修 ${notes.length} 段：${notes.join('；')}），并已开播新版全曲。`,
+    detail: { id: snap.id, title: snap.title, fixedCount: notes.length, notes },
+  };
 }

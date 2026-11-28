@@ -50,6 +50,8 @@ export interface FishSingConfigSection {
     separator?: 'htdemucs' | 'roformer';
     /** 分离后额外去混响（依赖 audio-separator，去掉原唱混响减少电音） */
     dereverb?: boolean;
+    /** 分离后额外去伴唱和声（UVR5 MelBand RoFormer Karaoke，剥离原唱垫音更像纯个人演唱） */
+    karaoke?: boolean;
     /** 动态主副歌演绎：off / soft-verse-bright-chorus（主歌轻柔、副歌明亮） */
     dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
     /** full = 带伴奏；vocals = 只要人声 */
@@ -145,6 +147,7 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     f0Method: 'rmvpe',
     separator: 'htdemucs',
     dereverb: false,
+    karaoke: false,
     dynamicStyle: 'off',
     mode: 'full',
   },
@@ -308,6 +311,12 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             type: 'boolean',
             title: '分离后去混响（De-Reverb）',
             description: '开启后在分离人声后再做一次去混响，可减少原唱自带混响引起的电音发糊（需 audio-separator，首跑多耗时约 10~20 秒）。',
+            'x-hot': true,
+          },
+          [at('voice.karaoke')]: {
+            type: 'boolean',
+            title: '去原唱伴唱和声（UVR5 Karaoke）',
+            description: '开启后在分离人声后再用 MelBand RoFormer Karaoke 剥离原唱垫音/和声，减少换声时的双人糊音（需 audio-separator，首跑按需下载模型）。',
             'x-hot': true,
           },
           [at('voice.dynamicStyle')]: {

@@ -34,10 +34,16 @@ export interface SingParams {
   separator?: 'htdemucs' | 'roformer';
   /** 分离后额外去混响 */
   dereverb?: boolean;
+  /** 分离后额外去原唱伴唱和声（UVR5 Karaoke） */
+  karaoke?: boolean;
   /** 动态演绎风格：off / soft-verse-bright-chorus（主歌柔、副歌亮） */
   dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
   /** 显式分段换音色描述（用于缓存键隔离） */
   segmentsKey?: string;
+  /** 双音色合唱搭档模型名 */
+  duetModel?: string;
+  /** 双音色合唱模式：alternate=主歌对唱+副歌真合唱 / unison=全程双声部合唱 */
+  duetMode?: 'alternate' | 'unison';
   mode: string;
 }
 
@@ -76,6 +82,8 @@ export interface SingSessionSnapshot {
     source: 'local-lrc' | 'netease' | 'lrclib' | 'bili-subtitle' | 'phrases';
     sourceLabel: string;
     lines: Array<{ index: number; start: number; end: number; text: string; section?: 'verse' | 'chorus' }>;
+    offsetSec?: number;
+    autoOffsetSec?: number;
   };
   at: number;
 }
@@ -121,8 +129,10 @@ export function cacheKey(sourceId: string, p: SingParams): string {
   const f0Method = p.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe';
   const separator = p.separator === 'roformer' ? 'roformer' : 'htdemucs';
   const dereverb = p.dereverb ? '1' : '0';
+  const karaoke = p.karaoke ? '1' : '0';
   const dyn = p.dynamicStyle === 'soft-verse-bright-chorus' ? 'svbc' : 'off';
   const segs = p.segmentsKey ? `seg:${p.segmentsKey}` : '';
+  const duet = p.duetModel ? `duet:${p.duetModel}:${p.duetMode === 'unison' ? 'unison' : 'alt'}` : '';
   const raw = [
     `v${CACHE_SCHEMA}`,
     sourceId,
@@ -141,8 +151,10 @@ export function cacheKey(sourceId: string, p: SingParams): string {
     f0Method,
     separator,
     dereverb,
+    karaoke,
     dyn,
     segs,
+    duet,
   ].join('|');
   return createHash('sha1').update(raw).digest('hex').slice(0, 20);
 }
@@ -185,15 +197,16 @@ export function loadSession(opts: LibraryOptions, id?: string): SingSessionSnaps
 export function sepCacheDir(
   opts: LibraryOptions,
   sourceCutKey: string,
-  sep?: { separator?: string; dereverb?: boolean },
+  sep?: { separator?: string; dereverb?: boolean; karaoke?: boolean },
 ): string {
   const { cacheDir } = files(opts);
   const eng = sep?.separator === 'roformer' ? 'roformer' : 'htdemucs';
   const drv = sep?.dereverb === true;
-  // 默认 htdemucs + 不去混响沿用旧版 key，保证已有分离缓存继续命中
-  const raw = eng === 'htdemucs' && !drv
+  const kar = sep?.karaoke === true;
+  // 默认 htdemucs + 不去混响 + 不去伴唱沿用旧版 key，保证已有分离缓存继续命中
+  const raw = eng === 'htdemucs' && !drv && !kar
     ? `sep|${sourceCutKey}`
-    : `sep|${sourceCutKey}|${eng}|drv:${drv ? '1' : '0'}`;
+    : `sep|${sourceCutKey}|${eng}|drv:${drv ? '1' : '0'}${kar ? '|kar:1' : ''}`;
   const key = createHash('sha1').update(raw).digest('hex').slice(0, 16);
   return join(cacheDir, 'sep', key);
 }

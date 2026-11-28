@@ -138,6 +138,23 @@ select.fs-btn{appearance:auto;-webkit-appearance:menulist;padding:4px 8px;max-wi
 .fs-sin-sm{width:76px;padding:4px 7px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
   background:transparent;color:inherit;font-size:12px}
 .fs-qual-low{color:#d05555;font-weight:600}
+.fs-lyr-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}
+.fs-lyr-list{max-height:280px;overflow:auto;border-radius:6px;background:rgba(127,127,127,.06);padding:4px 6px;display:flex;flex-direction:column;gap:2px}
+.fs-lyr-item{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;cursor:pointer;font-size:12.5px}
+.fs-lyr-item:hover{background:rgba(127,127,127,.14)}
+.fs-lyr-item.now{background:rgba(80,160,255,.18);font-weight:600}
+.fs-lyr-idx{width:24px;text-align:right;opacity:.55;font-variant-numeric:tabular-nums;flex:0 0 auto}
+.fs-lyr-tm{width:78px;opacity:.65;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;flex:0 0 auto}
+.fs-lyr-txt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-lyr-ch{padding:0 5px;border-radius:4px;background:rgba(55,138,221,.18);color:#378ADD;font-size:11px;flex:0 0 auto}
+.fs-tscroll{width:100%;overflow-x:auto;border:1px solid rgba(127,127,127,.16);border-radius:8px}
+.fs-tscroll .fs-table{min-width:860px}
+.fs-table th.fs-sticky,.fs-table td.fs-sticky{position:sticky;right:0;z-index:2;
+  background:var(--bg,Canvas);border-left:1px solid rgba(127,127,127,.18);box-shadow:-6px 0 10px rgba(0,0,0,.08)}
+.fs-table tr.playing td.fs-sticky{background:color-mix(in srgb,var(--bg,Canvas) 86%,#50a0ff 14%)}
+.fs-table tbody tr:hover td.fs-sticky{background:color-mix(in srgb,var(--bg,Canvas) 92%,currentColor 8%)}
+.fs-pager{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding-top:8px;font-size:12px}
+.fs-pager-g{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 `;
 
 function ensureStyle() {
@@ -178,10 +195,11 @@ function mount(ctx) {
   const refresh = el('button', 'fs-btn', '刷新');
   const stop = el('button', 'fs-btn', '停止播放');
   const reveal = el('button', 'fs-btn', '打开目录');
+  const favOnlyBtn = el('button', 'fs-btn', '⭐ 拿手曲');
   const search = el('input', 'fs-input');
-  search.placeholder = '按标题或模型过滤…';
+  search.placeholder = '按标题、模型或标签过滤…';
   const meta = el('span', 'fs-meta');
-  bar.append(refresh, stop, reveal, el('span', 'fs-grow'), search, meta);
+  bar.append(refresh, stop, reveal, favOnlyBtn, el('span', 'fs-grow'), search, meta);
 
   const msg = el('div', 'fs-msg');
   const qqBar = el('div', 'fs-impbar');
@@ -201,6 +219,9 @@ function mount(ctx) {
   let sortKey = 'at';
   let sortAsc = false;
   let filter = '';
+  let favOnly = false;
+  let page = 1;
+  let pageSize = 10;
   let playingId = '';
   let qqEnabled = false;
   let defaultQqTarget = '';
@@ -234,6 +255,9 @@ function mount(ctx) {
       currentModel = String((data && data.currentModel) || '');
       stop.disabled = !playingId;
       const n = items.length;
+      const fn = Number((data && data.favCount) || 0);
+      favOnlyBtn.textContent = fn ? `⭐ 拿手曲 (${fn})` : '⭐ 拿手曲';
+      favOnlyBtn.classList.toggle('on', favOnly);
       meta.textContent = n
         ? `共 ${n} 首 · ${data.totalMb || 0} MB · ${data.playingEnabled === false ? '本机播放已关' : ''}`
         : '还一首都没唱过';
@@ -251,10 +275,13 @@ function mount(ctx) {
   };
 
   const sorted = () => {
-    const rows = filter
-      ? items.filter((r) => String(r.title).toLowerCase().includes(filter)
-        || String(r.model || '').toLowerCase().includes(filter))
-      : items.slice();
+    let rows = favOnly ? items.filter((r) => r.isFav) : items.slice();
+    if (filter) {
+      rows = rows.filter((r) => String(r.title).toLowerCase().includes(filter)
+        || String(r.model || '').toLowerCase().includes(filter)
+        || String(r.duetModel || '').toLowerCase().includes(filter)
+        || (Array.isArray(r.favTags) && r.favTags.some((t) => String(t).toLowerCase().includes(filter))));
+    }
     rows.sort((a, b) => {
       const va = a[sortKey];
       const vb = b[sortKey];
@@ -279,7 +306,7 @@ function mount(ctx) {
       ['', '操作'],
     ];
     for (const [key, label] of cols) {
-      const th = el('th', key ? '' : 'fs-num', label);
+      const th = el('th', key ? '' : 'fs-sticky', label);
       if (key) {
         th.title = '点一下按这列排序';
         th.addEventListener('click', () => {
@@ -288,6 +315,7 @@ function mount(ctx) {
             sortKey = key;
             sortAsc = key !== 'at';
           }
+          page = 1;
           render();
         });
       }
@@ -304,15 +332,29 @@ function mount(ctx) {
 
     const tdTitle = el('td', 'fs-title');
     const titleSpan = el('span', '', r.title || '(无标题)');
-    titleSpan.title = `${r.title}\n${r.bvid || ''}`;
+    titleSpan.title = `${r.title}\n${r.bvid || ''}${r.favNote ? `\n心得：${r.favNote}` : ''}`;
     tdTitle.append(titleSpan);
+    if (r.isFav) {
+      const favTag = el('span', 'fs-tag', r.favTags && r.favTags.length ? `⭐ ${r.favTags.join('/')}` : '⭐ 拿手');
+      favTag.style.color = '#c9962f';
+      tdTitle.append(favTag);
+    }
     if (r.missing) tdTitle.append(el('span', 'fs-tag', '文件缺失'));
     if (r.target) tdTitle.append(el('span', 'fs-tag', r.target));
 
     const modelTd = el('td', '');
-    const modelSpan = el('span', 'fs-mname', r.model || '—');
-    if (r.model) modelSpan.title = r.model;
+    const modelText = r.duetModel ? `${r.model || '—'} + ${r.duetModel}` : (r.model || '—');
+    const modelSpan = el('span', 'fs-mname', modelText);
+    modelSpan.style.maxWidth = '220px';
+    modelSpan.title = r.duetModel
+      ? `双音色合唱：${r.model || '默认'} + ${r.duetModel}（${r.duetMode === 'unison' ? '全程双声部合唱' : '主歌对唱+副歌合唱'}）${r.karaoke ? ' · 已去伴唱' : ''}`
+      : `${r.model || '—'}${r.karaoke ? ' · 已去伴唱' : ''}`;
     modelTd.append(modelSpan);
+    if (r.duetModel) {
+      const dt = el('span', 'fs-tag', r.duetMode === 'unison' ? '合唱' : '对唱');
+      dt.style.color = '#378ADD';
+      modelTd.append(dt);
+    }
 
     tr.append(
       tdTitle,
@@ -405,8 +447,20 @@ function mount(ctx) {
       }
     });
 
-    acts.append(play, sendQq, resing, rename, del);
-    const tdActs = el('td');
+    const favBtn = el('button', `fs-btn${r.isFav ? ' on' : ''}`, r.isFav ? '★ 拿手' : '☆ 拿手');
+    favBtn.title = r.isFav ? '已是拿手曲（点击取消星标）' : '设为拿手曲并记住这版的模型和参数配方';
+    favBtn.addEventListener('click', async () => {
+      favBtn.disabled = true;
+      try {
+        await call('favorite', [r.id]);
+        await load();
+      } finally {
+        favBtn.disabled = false;
+      }
+    });
+
+    acts.append(play, favBtn, sendQq, resing, rename, del);
+    const tdActs = el('td', 'fs-sticky');
     tdActs.append(acts);
     tr.append(tdActs);
     return tr;
@@ -419,12 +473,62 @@ function mount(ctx) {
       box.append(el('div', 'fs-empty', items.length ? '没有匹配的歌' : '还没有唱过歌'));
       return;
     }
+    const total = rows.length;
+    const effSize = pageSize > 0 ? pageSize : total;
+    const totalPages = Math.max(1, Math.ceil(total / effSize));
+    if (page > totalPages) page = totalPages;
+    if (page < 1) page = 1;
+    const startIdx = (page - 1) * effSize;
+    const pageRows = rows.slice(startIdx, startIdx + effSize);
+
+    const scroller = el('div', 'fs-tscroll');
     const table = el('table', 'fs-table');
     header(table);
     const tbody = el('tbody');
-    for (const r of rows) tbody.append(rowOf(r));
+    for (const r of pageRows) tbody.append(rowOf(r));
     table.append(tbody);
-    box.append(table);
+    scroller.append(table);
+    box.append(scroller);
+
+    // 分页条
+    const pager = el('div', 'fs-pager');
+    const left = el('div', 'fs-pager-g');
+    const fromN = startIdx + 1;
+    const toN = Math.min(total, startIdx + pageRows.length);
+    left.append(el('span', 'fs-meta', `显示第 ${fromN}–${toN} 条，共 ${total} 条（第 ${page} / ${totalPages} 页）`));
+
+    const sizeSel = el('select', 'fs-btn');
+    for (const [val, lbl] of [[10, '10 条/页'], [20, '20 条/页'], [50, '50 条/页'], [0, '全部']]) {
+      const o = el('option', '', lbl);
+      o.value = String(val);
+      if (pageSize === val) o.selected = true;
+      sizeSel.append(o);
+    }
+    sizeSel.addEventListener('change', () => {
+      pageSize = Number(sizeSel.value) || 0;
+      page = 1;
+      render();
+    });
+    left.append(sizeSel);
+
+    const right = el('div', 'fs-pager-g');
+    const mkNav = (lbl, targetPage, disabled) => {
+      const b = el('button', 'fs-btn', lbl);
+      b.disabled = disabled;
+      b.addEventListener('click', () => {
+        page = targetPage;
+        render();
+      });
+      return b;
+    };
+    right.append(
+      mkNav('首页', 1, page <= 1),
+      mkNav('上一页', page - 1, page <= 1),
+      mkNav('下一页', page + 1, page >= totalPages),
+      mkNav('末页', totalPages, page >= totalPages),
+    );
+    pager.append(left, right);
+    box.append(pager);
   }
 
   const submitSendQq = async () => {
@@ -458,6 +562,13 @@ function mount(ctx) {
     }
   });
 
+  favOnlyBtn.addEventListener('click', () => {
+    favOnly = !favOnly;
+    favOnlyBtn.classList.toggle('on', favOnly);
+    page = 1;
+    render();
+  });
+
   refresh.addEventListener('click', () => {
     say('');
     void load();
@@ -474,6 +585,7 @@ function mount(ctx) {
   reveal.addEventListener('click', () => void call('reveal', []));
   search.addEventListener('input', () => {
     filter = search.value.trim().toLowerCase();
+    page = 1;
     render();
   });
 
@@ -707,6 +819,8 @@ function mountModels(ctx) {
   const bar = el('div', 'fs-mhead');
   const refresh = el('button', 'fs-btn', '刷新');
   const imp = el('button', 'fs-btn', '导入 .pth');
+  const fuseToggle = el('button', 'fs-btn', '🧪 音色融合');
+  fuseToggle.title = '把两个同规格 RVC 模型按比例线性融合，秒级揉出新音色（无需重新训练）';
   const reveal = el('button', 'fs-btn', '打开目录');
   const expFilter = el('select', 'fs-btn');
   expFilter.title = '按实验名筛选模型';
@@ -714,7 +828,7 @@ function mountModels(ctx) {
   pruneBtn.disabled = true;
   pruneBtn.title = '先在左侧选一个具体实验，按每 50 轮留一个清理其导出的中间档';
   const meta = el('span', 'fs-meta');
-  bar.append(refresh, imp, reveal, expFilter, pruneBtn, el('span', 'fs-grow'), meta);
+  bar.append(refresh, imp, fuseToggle, reveal, expFilter, pruneBtn, el('span', 'fs-grow'), meta);
 
   // 内联导入栏，替代在 Electron 中可能被禁用的 window.prompt
   const impBar = el('div', 'fs-impbar');
@@ -725,9 +839,34 @@ function mountModels(ctx) {
   const impCancel = el('button', 'fs-btn', '取消');
   impBar.append(impIn, impOk, impCancel);
 
+  // 内联模型权重融合栏
+  const fuseBar = el('div', 'fs-impbar');
+  fuseBar.style.display = 'none';
+  const fuseA = el('select', 'fs-btn');
+  const fuseB = el('select', 'fs-btn');
+  const fuseRange = el('input', '');
+  fuseRange.type = 'range';
+  fuseRange.min = '10';
+  fuseRange.max = '90';
+  fuseRange.step = '5';
+  fuseRange.value = '50';
+  fuseRange.style.width = '110px';
+  const fuseRatioLbl = el('span', 'fs-meta', 'A 50% / B 50%');
+  const fuseNameIn = el('input', 'fs-input');
+  fuseNameIn.style.flex = '0 0 160px';
+  fuseNameIn.placeholder = '新模型名（留空自动生成）';
+  const fuseGo = el('button', 'fs-btn on', '生成融合模型');
+  const fuseCancel = el('button', 'fs-btn', '取消');
+  fuseBar.append(
+    el('span', 'fs-meta', '模型 A：'), fuseA,
+    el('span', 'fs-meta', '模型 B：'), fuseB,
+    fuseRange, fuseRatioLbl,
+    fuseNameIn, fuseGo, fuseCancel,
+  );
+
   const msg = el('div', 'fs-msg');
   const box = el('div', '');
-  root.append(bar, impBar, msg, box);
+  root.append(bar, impBar, fuseBar, msg, box);
 
   let rows = [];
   let selectedExp = '';
@@ -880,6 +1019,21 @@ function mountModels(ctx) {
         ? `共 ${rows.length} 个 · 当前 ${data.current.model}${data.busy ? ' · 正在唱' : ''}`
         : '还没有模型';
       syncExpFilter();
+      // 同步融合下拉选项
+      const prevA = fuseA.value;
+      const prevB = fuseB.value;
+      fuseA.replaceChildren();
+      fuseB.replaceChildren();
+      rows.forEach((m, idx) => {
+        const oa = el('option', '', m.name);
+        oa.value = m.name;
+        if (prevA ? m.name === prevA : idx === 0) oa.selected = true;
+        fuseA.append(oa);
+        const ob = el('option', '', m.name);
+        ob.value = m.name;
+        if (prevB ? m.name === prevB : idx === Math.min(1, rows.length - 1)) ob.selected = true;
+        fuseB.append(ob);
+      });
       render();
     } catch (e) {
       say((e && e.message) || String(e), true);
@@ -942,7 +1096,42 @@ function mountModels(ctx) {
   imp.addEventListener('click', () => {
     const show = impBar.style.display === 'none';
     impBar.style.display = show ? 'flex' : 'none';
-    if (show) impIn.focus();
+    if (show) {
+      fuseBar.style.display = 'none';
+      impIn.focus();
+    }
+  });
+  fuseToggle.addEventListener('click', () => {
+    const show = fuseBar.style.display === 'none';
+    fuseBar.style.display = show ? 'flex' : 'none';
+    if (show) impBar.style.display = 'none';
+  });
+  fuseRange.addEventListener('input', () => {
+    const a = Number(fuseRange.value) || 50;
+    fuseRatioLbl.textContent = `A ${a}% / B ${100 - a}%`;
+  });
+  fuseCancel.addEventListener('click', () => {
+    fuseBar.style.display = 'none';
+  });
+  fuseGo.addEventListener('click', async () => {
+    const a = String(fuseA.value || '');
+    const b = String(fuseB.value || '');
+    if (!a || !b || a === b) {
+      say('请选择两个不同的模型进行融合', true);
+      return;
+    }
+    const alpha = (Number(fuseRange.value) || 50) / 100;
+    const outName = String(fuseNameIn.value || '').trim();
+    fuseGo.disabled = true;
+    say(`正在融合 ${a} (${Math.round(alpha * 100)}%) + ${b} (${Math.round((1 - alpha) * 100)}%)…`);
+    try {
+      await call('fuse', [a, b, outName, alpha]);
+      fuseNameIn.value = '';
+      fuseBar.style.display = 'none';
+      await load();
+    } finally {
+      fuseGo.disabled = false;
+    }
   });
   impOk.addEventListener('click', () => void submitImport());
   impCancel.addEventListener('click', () => {
@@ -2111,10 +2300,11 @@ function mountSing(ctx) {
   const orderSel = mkSel([['default', 'B 站综合'], ['click', '按播放量'], ['pubdate', '按最新']], 'default');
   const searchBtn = el('button', 'fs-btn', 'B 站搜歌');
   const singBtn = el('button', 'fs-btn on', '开始试唱');
+  const enqueueBtn = el('button', 'fs-btn', '+ 加入队列');
   const stopBtn = el('button', 'fs-btn danger', '停止');
   const unloadBtn = el('button', 'fs-btn', '释放显存');
   unloadBtn.title = '立即卸载常驻 GPU 模型归还显存（下次点歌自动拉回）';
-  bar1.append(songIn, orderSel, searchBtn, singBtn, stopBtn, unloadBtn);
+  bar1.append(songIn, orderSel, searchBtn, singBtn, enqueueBtn, stopBtn, unloadBtn);
 
   // ---- 调参栏
   const bar2 = el('div', 'fs-sgrid');
@@ -2146,6 +2336,8 @@ function mountSing(ctx) {
   const modeSel = mkSel([['full', '带伴奏'], ['vocals', '清唱']], 'full');
   const sepSel = mkSel([['htdemucs', '快速 htdemucs'], ['roformer', 'UVR5 RoFormer 精唱']], 'htdemucs');
   const derevSel = mkSel([['off', '关去混响'], ['on', '开去混响']], 'off');
+  const karaokeSel = mkSel([['off', '关去伴唱'], ['on', '开去伴唱(Karaoke)']], 'off');
+  karaokeSel.title = '分离后再用 UVR5 MelBand RoFormer Karaoke 剥离原唱垫音/伴唱和声';
   const f0Sel = mkSel([['rmvpe', 'rmvpe'], ['fcpe', 'fcpe']], 'rmvpe');
   const dynSel = mkSel([['off', '统一音色'], ['soft-verse-bright-chorus', '主歌柔/副歌亮']], 'off');
   const harmSel = mkSel([
@@ -2156,6 +2348,9 @@ function mountSing(ctx) {
     ['third+fifth', '三+五度'],
   ], 'off');
   const revSel = mkSel([['off', '关混响'], ['light', '轻度混响']], 'off');
+  const duetSel = mkSel([['', '单人演唱']], '');
+  duetSel.title = '选择另一个音色模型做双人真合唱/对唱';
+  const duetModeSel = mkSel([['alternate', '主歌对唱+副歌合唱'], ['unison', '全程双声部合唱']], 'alternate');
   const toIn = el('input', 'fs-tin');
   toIn.value = 'local';
   toIn.title = 'local / group:群号 / private:QQ号';
@@ -2174,10 +2369,13 @@ function mountSing(ctx) {
     mkField('模式', modeSel),
     mkField('分离', sepSel),
     mkField('去混响', derevSel),
+    mkField('去伴唱', karaokeSel),
     mkField('F0', f0Sel),
     mkField('主副歌', dynSel),
     mkField('和声', harmSel),
     mkField('混响', revSel),
+    mkField('合唱搭档', duetSel),
+    mkField('合唱方式', duetModeSel),
     mkField('投递', toIn),
     refreshLbl,
   );
@@ -2187,6 +2385,20 @@ function mountSing(ctx) {
   prog.append(fill);
   const msg = el('div', 'fs-msg');
   const statusMeta = el('div', 'fs-meta', '');
+
+  // ---- 点歌队列 / 小歌会条
+  const qCard = el('div', 'fs-card2');
+  const qBar = el('div', 'fs-bar');
+  const qTitle = el('span', 'fs-wtitle', '点歌队列（0 首）');
+  const qModeSel = mkSel([['sequence', '顺序连唱'], ['loop-one', '单曲循环'], ['loop-all', '列表循环']], 'sequence');
+  const qRepBtn = el('button', 'fs-btn', '⭐ 排入拿手歌会');
+  const qNextBtn = el('button', 'fs-btn', '切下一首');
+  const qClearBtn = el('button', 'fs-btn', '清空');
+  qBar.append(qTitle, el('span', 'fs-grow'), qModeSel, qRepBtn, qNextBtn, qClearBtn);
+  const qList = el('div', 'fs-list');
+  qList.style.marginTop = '4px';
+  qCard.append(qBar, qList);
+
   const hitsBox = el('div', '');
 
   // ---- 折叠区：歌词时间轴、声学体检 & 局部返工补录
@@ -2199,6 +2411,9 @@ function mountSing(ctx) {
   const patchBody = el('div', 'fs-sec-body');
   const pBar = el('div', 'fs-sgrid');
   const lyrLoadBtn = el('button', 'fs-btn', '读取歌词与体检');
+  const lyrQueryIn = el('input', 'fs-tin');
+  lyrQueryIn.style.width = '140px';
+  lyrQueryIn.placeholder = '指定歌名(如 潮汐 傅梦彤)';
   const lyrRefBtn = el('button', 'fs-btn', '重新联网匹配歌词');
   const pLocSel = mkSel([['lines', '按句号/关键词'], ['chorus', '第 1 段副歌'], ['current', '当前正唱这句']], 'lines');
   const pLinesIn = el('input', 'fs-sin-sm');
@@ -2219,8 +2434,11 @@ function mountSing(ctx) {
   const pPrevLbl = el('label', 'fs-meta', '仅试听这句');
   pPrevLbl.prepend(pPrevChk);
   const pRunBtn = el('button', 'fs-btn on', '局部返工补录');
+  const autoFixBtn = el('button', 'fs-btn', '🩺 自动修问题句');
+  autoFixBtn.title = '根据声学体检报告标出的破音/越界段，自动切 fcpe 或调参逐段修补并无缝贴回';
   pBar.append(
     lyrLoadBtn,
+    lyrQueryIn,
     lyrRefBtn,
     mkField('定位', pLocSel),
     mkField('句号', pLinesIn),
@@ -2229,21 +2447,108 @@ function mountSing(ctx) {
     mkField('indexRate', pIdxIn),
     pPrevLbl,
     pRunBtn,
+    autoFixBtn,
   );
   const pMsg = el('div', 'fs-msg');
-  const lyrPre = el('pre', 'fs-pre', '点「读取歌词与体检」查看最近一首歌的时间轴歌词与声学体检明细');
-  patchBody.append(pBar, pMsg, lyrPre);
+  const offBar = el('div', 'fs-lyr-bar');
+  const offMeta = el('span', 'fs-meta', '偏移：0.0s');
+  const mkOffBtn = (lbl, delta, reset) => {
+    const b = el('button', 'fs-btn', lbl);
+    b.addEventListener('click', () => void adjustOffset(delta, reset));
+    return b;
+  };
+  const seekStartBtn = el('button', 'fs-btn', '▶ 从头播');
+  const seekChBtn = el('button', 'fs-btn', '▶ 跳副歌');
+  offBar.append(
+    el('span', 'fs-meta', '歌词对齐：'),
+    mkOffBtn('-2s', -2, false),
+    mkOffBtn('-0.5s', -0.5, false),
+    mkOffBtn('+0.5s', 0.5, false),
+    mkOffBtn('+2s', 2, false),
+    mkOffBtn('重置', 0, true),
+    offMeta,
+    seekStartBtn,
+    seekChBtn,
+  );
+  const lyrHead = el('div', 'fs-hint', '点「读取歌词与体检」查看最近一首歌的时间轴歌词与声学体检明细（点击任意一句可直接跳播）');
+  const lyrList = el('div', 'fs-lyr-list');
+  patchBody.append(pBar, offBar, pMsg, lyrHead, lyrList);
   patchSec.append(patchSum, patchBody);
 
-  root.append(bar1, bar2, prog, msg, statusMeta, hitsBox, patchSec);
+  root.append(bar1, bar2, prog, msg, statusMeta, qCard, hitsBox, patchSec);
 
   let inited = false;
   let pollTimer = null;
+  let lastLyricsData = null;
 
   const say = (t, bad) => {
     msg.textContent = t || '';
     msg.classList.toggle('bad', Boolean(bad));
   };
+
+  const renderLyrics = (r, activeLineIdx) => {
+    lastLyricsData = r;
+    const off = Number((r && r.offsetSec) || 0);
+    const autoOff = r && r.autoOffsetSec;
+    const isAuto = typeof autoOff === 'number' && Math.abs(autoOff - off) < 0.05 && Math.abs(off) >= 0.05;
+    offMeta.textContent = `偏移：${off > 0 ? '+' : ''}${off.toFixed(1)}s${isAuto ? '（自动校准）' : ''}`;
+    const infoLines = [];
+    if (r && r.title) {
+      infoLines.push(`《${r.title}》（${fmtDur(r.durationSec)}）${r.sourceLabel ? ` · ${r.sourceLabel}` : ''}`);
+    }
+    if (r && r.summary) infoLines.push(`声学体检：${r.summary}`);
+    if (r && Array.isArray(r.issues) && r.issues.length) {
+      infoLines.push('风险时间段：' + r.issues.map((it) => it.note).join('；'));
+    }
+    lyrHead.textContent = infoLines.length ? infoLines.join('\n') : ((r && r.text) || '暂无歌词记录');
+
+    lyrList.replaceChildren();
+    const lines = (r && r.lines) || [];
+    if (!lines.length) {
+      lyrList.append(el('div', 'fs-meta', '（暂无逐句歌词，点「读取歌词与体检」加载）'));
+      return;
+    }
+    const nowIdx = Number(activeLineIdx || (r && r.playingLine) || 0);
+    for (const ln of lines) {
+      const row = el('div', `fs-lyr-item${nowIdx === ln.index ? ' now' : ''}`);
+      row.title = `点击从第 ${ln.index} 句（${fmtDur(ln.start)}）开始跳播`;
+      row.append(
+        el('span', 'fs-lyr-idx', String(ln.index)),
+        el('span', 'fs-lyr-tm', `${fmtDur(ln.start)}–${fmtDur(ln.end)}`),
+      );
+      if (ln.section === 'chorus') row.append(el('span', 'fs-lyr-ch', '副歌'));
+      row.append(el('span', 'fs-lyr-txt', ln.text));
+      row.addEventListener('click', () => void runSeek({ line: ln.index }));
+      lyrList.append(row);
+    }
+  };
+
+  const adjustOffset = async (delta, reset) => {
+    try {
+      const r = await ctx.invoke('offset', [delta, Boolean(reset)]);
+      pMsg.classList.remove('bad');
+      pMsg.textContent = (r && r.text) || '偏移已更新';
+      renderLyrics(r);
+    } catch (e) {
+      pMsg.classList.add('bad');
+      pMsg.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  const runSeek = async (payload) => {
+    try {
+      const r = await ctx.invoke('seek', [payload]);
+      pMsg.classList.remove('bad');
+      pMsg.textContent = (r && r.text) || '已跳播';
+      void refreshStatus();
+    } catch (e) {
+      pMsg.classList.add('bad');
+      pMsg.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  seekStartBtn.addEventListener('click', () => void runSeek({ sec: 0 }));
+  seekChBtn.addEventListener('click', () => void runSeek({ section: 'chorus', chorusIndex: 1 }));
 
   const refreshStatus = async () => {
     try {
@@ -2258,10 +2563,24 @@ function mountSing(ctx) {
         modeSel.value = d.mode || 'full';
         sepSel.value = d.separator || 'htdemucs';
         derevSel.value = d.dereverb ? 'on' : 'off';
+        karaokeSel.value = d.karaoke ? 'on' : 'off';
         f0Sel.value = d.f0Method || 'rmvpe';
         dynSel.value = d.dynamicStyle || 'off';
         harmSel.value = d.harmony || 'off';
         revSel.value = d.reverb || 'off';
+      }
+      if (st && Array.isArray(st.models) && duetSel.options.length <= 1) {
+        const curVal = duetSel.value;
+        duetSel.replaceChildren();
+        const noneOpt = el('option', '', '单人演唱');
+        noneOpt.value = '';
+        duetSel.append(noneOpt);
+        for (const m of st.models) {
+          const o = el('option', '', m.current ? `${m.name}（当前）` : m.name);
+          o.value = m.name;
+          if (m.name === curVal) o.selected = true;
+          duetSel.append(o);
+        }
       }
       const w = st && st.worker;
       const cur = w && w.current;
@@ -2284,9 +2603,46 @@ function mountSing(ctx) {
       if (pb && pb.playing) {
         const ltxt = pb.currentLine ? ` · 第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : '';
         parts.push(`播放中《${pb.title || ''}》${fmtDur(pb.elapsedSec)}/${fmtDur(pb.durationSec)}${ltxt}`);
+        if (lastLyricsData && pb.currentLine) renderLyrics(lastLyricsData, pb.currentLine.index);
       }
       statusMeta.textContent = parts.join(' · ');
       singBtn.disabled = Boolean(st && (st.busy || st.training));
+
+      // 更新队列区
+      const q = (st && st.queue) || { mode: 'sequence', items: [] };
+      const qItems = Array.isArray(q.items) ? q.items : [];
+      qTitle.textContent = `点歌队列（${qItems.length} 首）`;
+      if (q.mode) qModeSel.value = q.mode;
+      qNextBtn.disabled = qItems.length === 0;
+      qClearBtn.disabled = qItems.length === 0;
+      qList.replaceChildren();
+      if (!qItems.length) {
+        qList.append(el('div', 'fs-meta', '暂无待唱曲目：点「+ 加入队列」连点多首，或点「⭐ 排入拿手歌会」一键连唱（唱第 1 首时自动在后台预热第 2 首）'));
+      } else {
+        const stLbl = (s) => (s === 'ready' ? '已就绪' : s === 'warming' ? '后台预热中' : s === 'failed' ? '失败' : '待准备');
+        qItems.forEach((it, idx) => {
+          const row = el('div', 'fs-row');
+          const left = el('span', 'n', `${idx + 1}. 《${it.title}》`);
+          const right = el('span', 'r');
+          const tag = el('span', 'fs-tag', stLbl(it.state));
+          if (it.state === 'ready') tag.classList.add('fs-ok');
+          else if (it.state === 'failed') tag.classList.add('fs-bad');
+          const rm = el('button', 'fs-btn', '移出');
+          rm.style.marginLeft = '6px';
+          rm.addEventListener('click', async () => {
+            try {
+              const r = await ctx.invoke('queueRemove', [it.qid]);
+              say((r && r.text) || '已移出');
+            } catch (e) {
+              say((e && e.message) || String(e), true);
+            }
+            void refreshStatus();
+          });
+          right.append(tag, rm);
+          row.append(left, right);
+          qList.append(row);
+        });
+      }
     } catch (e) {
       statusMeta.textContent = (e && e.message) || String(e);
     }
@@ -2306,10 +2662,13 @@ function mountSing(ctx) {
       order: orderSel.value,
       separator: sepSel.value,
       dereverb: derevSel.value === 'on',
+      karaoke: karaokeSel.value === 'on',
       f0Method: f0Sel.value,
       dynamicStyle: dynSel.value,
       harmony: harmSel.value,
       reverb: revSel.value,
+      duetModel: duetSel.value || '',
+      duetMode: duetModeSel.value || 'alternate',
       refresh: refreshChk.checked,
     };
     if (startIn.value !== '') payload.start = Number(startIn.value);
@@ -2341,10 +2700,11 @@ function mountSing(ctx) {
 
   const loadLyrics = async (forceRefresh) => {
     try {
-      const r = await ctx.invoke('lyrics', [Boolean(forceRefresh)]);
-      lyrPre.textContent = (r && r.body) || (r && r.text) || '暂无歌词记录';
+      const q = forceRefresh ? String(lyrQueryIn.value || '').trim() : '';
+      const r = await ctx.invoke('lyrics', [Boolean(forceRefresh), q]);
+      renderLyrics(r);
     } catch (e) {
-      lyrPre.textContent = (e && e.message) || String(e);
+      lyrHead.textContent = (e && e.message) || String(e);
     }
   };
 
@@ -2379,12 +2739,14 @@ function mountSing(ctx) {
         const tdA = el('td', 'fs-acts');
         const pick = el('button', 'fs-btn on', '选这条唱');
         pick.addEventListener('click', () => void runSing(h.bvid));
+        const qAdd = el('button', 'fs-btn', '+ 队列');
+        qAdd.addEventListener('click', () => void runEnqueue(h.bvid));
         const fillBv = el('button', 'fs-btn', '填 BV');
         fillBv.addEventListener('click', () => {
           songIn.value = h.bvid;
           songIn.focus();
         });
-        tdA.append(pick, fillBv);
+        tdA.append(pick, qAdd, fillBv);
         tr.append(
           el('td', 'fs-num', String(i + 1)),
           tdT,
@@ -2405,7 +2767,76 @@ function mountSing(ctx) {
     }
   });
 
+  const runEnqueue = async (songOverride) => {
+    const song = String(songOverride ?? songIn.value ?? '').trim();
+    if (!song) {
+      say('请先输入要排进队列的歌名、BV 号或路径', true);
+      return;
+    }
+    const payload = {
+      song,
+      mode: modeSel.value,
+      separator: sepSel.value,
+      dereverb: derevSel.value === 'on',
+      karaoke: karaokeSel.value === 'on',
+      f0Method: f0Sel.value,
+      dynamicStyle: dynSel.value,
+      harmony: harmSel.value,
+      reverb: revSel.value,
+      duetModel: duetSel.value || '',
+      duetMode: duetModeSel.value || 'alternate',
+    };
+    if (pitchIn.value.trim() !== '') payload.pitch = pitchIn.value.trim();
+    if (idxIn.value !== '') payload.indexRate = Number(idxIn.value);
+    if (protIn.value !== '') payload.protect = Number(protIn.value);
+    if (rmsIn.value !== '') payload.rmsMixRate = Number(rmsIn.value);
+    try {
+      const r = await ctx.invoke('queueAdd', [payload]);
+      say((r && r.text) || '已加入队列');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  };
+
   singBtn.addEventListener('click', () => void runSing());
+  enqueueBtn.addEventListener('click', () => void runEnqueue());
+  qModeSel.addEventListener('change', async () => {
+    try {
+      const r = await ctx.invoke('queueMode', [qModeSel.value]);
+      say((r && r.text) || '已切换循环模式');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  });
+  qRepBtn.addEventListener('click', async () => {
+    try {
+      const r = await ctx.invoke('queueRepertoire', []);
+      say((r && r.text) || '已排入拿手歌会');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  });
+  qNextBtn.addEventListener('click', async () => {
+    try {
+      const r = await ctx.invoke('queueNext', []);
+      say((r && r.text) || '已切下一首');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  });
+  qClearBtn.addEventListener('click', async () => {
+    try {
+      const r = await ctx.invoke('queueClear', []);
+      say((r && r.text) || '已清空队列');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  });
   stopBtn.addEventListener('click', async () => {
     try {
       const r = await ctx.invoke('stop', []);
@@ -2454,6 +2885,22 @@ function mountSing(ctx) {
       pMsg.textContent = (e && e.message) || String(e);
     } finally {
       pRunBtn.disabled = false;
+      void refreshStatus();
+    }
+  });
+
+  autoFixBtn.addEventListener('click', async () => {
+    autoFixBtn.disabled = true;
+    pMsg.classList.remove('bad');
+    pMsg.textContent = '正在按声学体检报告自动修补问题段（逐段切 fcpe / 调参贴回）…';
+    try {
+      const r = await ctx.invoke('autoFix', []);
+      pMsg.textContent = (r && r.text) || '自动修补完成';
+    } catch (e) {
+      pMsg.classList.add('bad');
+      pMsg.textContent = (e && e.message) || String(e);
+    } finally {
+      autoFixBtn.disabled = false;
       void refreshStatus();
     }
   });

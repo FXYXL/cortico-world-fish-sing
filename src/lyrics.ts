@@ -23,6 +23,10 @@ export interface LyricsSheet {
   source: 'local-lrc' | 'netease' | 'lrclib' | 'bili-subtitle' | 'phrases';
   sourceLabel: string;
   lines: LyricLine[];
+  /** 当前累计时间轴偏移（秒，正数=延后，负数=提前） */
+  offsetSec?: number;
+  /** 首次基于干声人声开口自动估算的偏移（秒） */
+  autoOffsetSec?: number;
 }
 
 export interface TimeSpan {
@@ -98,6 +102,12 @@ export function extractSongQueries(rawTitle: string, hintQuery = ''): string[] {
   }
 
   const s = String(rawTitle || '').trim();
+  // 先剥掉引号里的长段文案/歌词引用（如 “退守的爱情还剩下回忆…”），防止拖垮歌名检索
+  const noQuotes = s
+    .replace(/[“"‘'][^”"’']{4,}[”"’']/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   // 2) 书名号《歌名》
   for (const m of s.matchAll(/《([^》]{1,36})》/g)) {
     const t = cleanSongQuery(m[1]);
@@ -111,15 +121,23 @@ export function extractSongQueries(rawTitle: string, hintQuery = ''): string[] {
       if (t) push(t);
     }
   }
-  const firstPipe = s.split(/[|｜]/)[0] || '';
-  if (firstPipe && firstPipe !== s) {
+  const firstPipe = noQuotes.split(/[|｜]/)[0] || '';
+  if (firstPipe && firstPipe !== noQuotes) {
     const t = cleanSongQuery(firstPipe);
     if (t) push(t);
   }
-  // 4) 整体清洗后的标题
-  const full = cleanSongQuery(s);
+  // 4) 去掉引号后的「歌名(含副标题)」、「歌名 歌手」与纯「歌名」（如「【无损音质】潮汐 (Natural) - 傅梦彤“...”」→「潮汐 Natural」「潮汐 傅梦彤」「潮汐」）
+  const dashHeadFull = cleanSongQuery(noQuotes.split(/\s*[-—–]\s*/)[0] || '');
+  if (dashHeadFull && dashHeadFull.length <= 30) push(dashHeadFull);
+  const noParenSub = noQuotes.replace(/[（(][A-Za-z0-9\s.'\-]{2,30}[)）]/g, ' ');
+  const cleanShort = cleanSongQuery(noParenSub);
+  if (cleanShort) push(cleanShort);
+  const dashHead = cleanSongQuery(noParenSub.split(/\s*[-—–]\s*/)[0] || '');
+  if (dashHead && dashHead.length <= 24) push(dashHead);
+  // 5) 整体清洗后的标题兜底
+  const full = cleanSongQuery(noQuotes || s);
   if (full) push(full);
-  return out.slice(0, 3);
+  return out.slice(0, 4);
 }
 
 /** 计算候选歌名与查询词的相关度（0~1），用于拦截毫无关系的错配结果。 */
@@ -129,6 +147,11 @@ function titleRelevance(query: string, trackName: string, artistName = ''): numb
   const ta = normCore(`${trackName} ${artistName}`);
   if (!q || !t) return 0;
   if (t === q || ta === q) return 1.0;
+  // 多词查询（如「潮汐 傅梦彤」）：若每个词都分别命中在歌名+歌手里，直接高置信命中（避免被英文副标题隔开误杀）
+  const tokens = String(query || '').trim().split(/\s+/).map(normCore).filter((x) => x.length >= 2);
+  if (tokens.length >= 2 && tokens.every((tok) => ta.includes(tok))) {
+    return 0.95;
+  }
   if (t.includes(q) || q.includes(t)) {
     const ratio = Math.min(q.length, t.length) / Math.max(q.length, t.length);
     return 0.65 + 0.35 * ratio;
@@ -176,8 +199,8 @@ export function parseLrc(text: string, durationSec = 0): LyricLine[] {
     if (!times.length) continue;
     const lyric = rawLine.replace(timeRe, '').trim();
     if (!lyric) continue;
-    // 跳过常见作词/作曲/编曲/制作人/版权声明等元信息头
-    if (/^(?:中文填词|填词|作词|作曲|编曲|制作人|混音|和声|吉他|贝斯|鼓|录音|母带|监制|出品|统筹|文案|企划|发行|词|曲|op|sp|ti|ar|al|by)\s*(?:[（(][^）)]*[）)])?\s*[:：]/i.test(lyric)) continue;
+    // 跳过常见作词/作曲/编曲/制作人/演职员/版权声明等元信息行
+    if (/^(?:中文填词|填词|作词|作曲|编曲|制作人|配唱制作人|配唱|混音师?|母带工程师?|母带|和声编写|和声|吉他|贝斯|贝司|弦乐编写|弦乐|鼓|录音师?|录音棚|监制|出品|统筹|文案|企划|发行|词|曲|op|sp|ti|ar|al|by)\s*(?:[（(][^）)]*[）)])?\s*[:：]/i.test(lyric)) continue;
     if (/^本作品经过.*授权/.test(lyric)) continue;
     for (const t of times) {
       rows.push({ start: t, text: lyric });
@@ -422,6 +445,77 @@ export function tagLyricsSections(sheet: LyricsSheet, chorusRanges: TimeSpan[]):
   return { ...sheet, lines };
 }
 
+/** 对整份歌词时间轴平移指定秒数（正数延后、负数提前），同步更新累计偏移与主/副歌标签。 */
+export function shiftLyrics(
+  sheet: LyricsSheet,
+  deltaSec: number,
+  chorusRanges?: TimeSpan[],
+): LyricsSheet {
+  const delta = Math.round((Number(deltaSec) || 0) * 100) / 100;
+  if (!sheet?.lines?.length || Math.abs(delta) < 0.01) return sheet;
+  const lines = sheet.lines.map((ln) => {
+    const start = Math.max(0, Math.round((ln.start + delta) * 100) / 100);
+    const end = Math.max(Math.round((start + 0.5) * 100) / 100, Math.round((ln.end + delta) * 100) / 100);
+    return { ...ln, start, end };
+  });
+  const nextOffset = Math.round(((sheet.offsetSec ?? 0) + delta) * 100) / 100;
+  const shifted: LyricsSheet = { ...sheet, lines, offsetSec: nextOffset };
+  return chorusRanges?.length ? tagLyricsSections(shifted, chorusRanges) : shifted;
+}
+
+/** 计算歌词前若干句在偏移 shift 后落入真实人声乐句区间的命中分（用于防呆校验）。 */
+function alignmentScore(lines: LyricLine[], phrases: PhraseSpan[], shift: number): number {
+  const sample = lines.slice(0, 18);
+  let score = 0;
+  for (const ln of sample) {
+    const s = ln.start + shift;
+    const mid = (ln.start + ln.end) / 2 + shift;
+    if (s < -0.5) continue;
+    const hitMid = phrases.some((p) => mid >= p.start - 0.6 && mid <= p.end + 0.6);
+    const hitStart = phrases.some((p) => s >= p.start - 1.0 && s <= p.end + 0.5);
+    if (hitMid && hitStart) score += 2;
+    else if (hitMid || hitStart) score += 1;
+  }
+  return score;
+}
+
+/**
+ * 自动校准 LRC 前奏偏移：
+ * B 站视频经常比官方音源多出 3~15 秒片头/说话/加长前奏，导致 LRC 整体偏早或偏晚。
+ * 做法：用分离干声切出的前 3 段真实人声开口位置去对齐 LRC 首句，对比偏移前后的覆盖命中分，
+ * 仅在偏移幅度合理（0.8~25 秒）且人声重合度确有提升时才应用，避免片头独白把正常歌词推歪。
+ */
+export function autoAlignLyrics(
+  sheet: LyricsSheet,
+  phrases?: PhraseSpan[],
+  chorusRanges?: TimeSpan[],
+): LyricsSheet {
+  if (!sheet || sheet.source === 'phrases' || sheet.lines.length < 3 || !phrases || phrases.length < 2) {
+    return sheet;
+  }
+  const lrcStart = sheet.lines[0].start;
+  // 过滤极短气口/杂音碎片，优先取真实唱段作为候选开口
+  const validPhrases = phrases.filter((p) => p.end - p.start >= 1.2);
+  const candidates = (validPhrases.length ? validPhrases : phrases).slice(0, 3);
+  const baseScore = alignmentScore(sheet.lines, phrases, 0);
+
+  let bestShift = 0;
+  let bestScore = baseScore;
+  for (const p of candidates) {
+    const cand = Math.round((p.start - lrcStart) * 100) / 100;
+    if (Math.abs(cand) < 0.8 || Math.abs(cand) > 25) continue;
+    const sc = alignmentScore(sheet.lines, phrases, cand);
+    // 要求覆盖分显著提升，或首句落差 >= 1.5s 且覆盖分至少不下降
+    if (sc > bestScore || (bestShift === 0 && sc >= baseScore && Math.abs(cand) >= 1.5 && p === candidates[0])) {
+      bestScore = sc;
+      bestShift = cand;
+    }
+  }
+  if (Math.abs(bestShift) < 0.8) return sheet;
+  const aligned = shiftLyrics(sheet, bestShift, chorusRanges);
+  return { ...aligned, autoOffsetSec: bestShift };
+}
+
 /** 统一入口：多级获取歌词表，永远返回一个可用结果。 */
 export async function resolveLyrics(opts: {
   title: string;
@@ -433,6 +527,7 @@ export async function resolveLyrics(opts: {
   cutDuration?: number;
   phrases?: PhraseSpan[];
   chorusRanges?: TimeSpan[];
+  skipAutoAlign?: boolean;
 }): Promise<LyricsSheet> {
   const local = opts.localPath ? tryLocalLrc(opts.localPath, opts.fullDurationSec) : null;
   const queries = extractSongQueries(opts.title, opts.hintQuery);
@@ -449,7 +544,11 @@ export async function resolveLyrics(opts: {
   if (sheet) {
     const sliced = sliceLyricsForCut(sheet.lines, opts.cutStart ?? 0, opts.cutDuration ?? 0);
     if (sliced.length >= 2) {
-      return tagLyricsSections({ ...sheet, lines: sliced }, opts.chorusRanges ?? []);
+      let out = tagLyricsSections({ ...sheet, lines: sliced }, opts.chorusRanges ?? []);
+      if (!opts.skipAutoAlign && opts.phrases?.length) {
+        out = autoAlignLyrics(out, opts.phrases, opts.chorusRanges);
+      }
+      return out;
     }
   }
   return buildPhraseLyrics(opts.phrases ?? []);
@@ -554,5 +653,9 @@ export function formatLyricsTable(sheet: LyricsSheet, opts?: { fromLine?: number
   const tail = from - 1 + slice.length < sheet.lines.length
     ? `\n…共 ${sheet.lines.length} 句（可传 fromLine=${from + slice.length} 继续看）`
     : '';
-  return `来源：${sheet.sourceLabel}（共 ${sheet.lines.length} 句）\n${rows.join('\n')}${tail}`;
+  const off = Number(sheet.offsetSec ?? 0);
+  const offNote = Math.abs(off) >= 0.05
+    ? ` · 偏移 ${off > 0 ? '+' : ''}${off.toFixed(1)}s${sheet.autoOffsetSec && Math.abs(sheet.autoOffsetSec - off) < 0.05 ? '（自动校准）' : ''}`
+    : '';
+  return `来源：${sheet.sourceLabel}（共 ${sheet.lines.length} 句${offNote}）\n${rows.join('\n')}${tail}`;
 }

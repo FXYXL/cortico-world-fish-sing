@@ -33,6 +33,10 @@ _DEFAULT_DEREVERB_MODEL = os.environ.get(
     "FISHSING_DEREVERB_MODEL",
     "UVR-DeEcho-DeReverb.pth",
 )
+_DEFAULT_KARAOKE_MODEL = os.environ.get(
+    "FISHSING_KARAOKE_MODEL",
+    "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+)
 
 
 def _ckpt_dir():
@@ -115,6 +119,44 @@ def _pick_stem(paths, positive_keys, negative_keys=()):
     return paths[0] if paths else None
 
 
+def _run_karaoke(vocal_path, out_dir, device="auto", say=None):
+    """使用 audio-separator 的 MelBand RoFormer Karaoke 模型剥离原唱伴唱和声/垫音，只保留纯净主唱。"""
+    from audio_separator.separator import Separator
+
+    model_dir = _uvr_model_dir()
+    os.makedirs(model_dir, exist_ok=True)
+    use_cuda = device != "cpu" and torch.cuda.is_available()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="fishsing-karaoke-", dir=str(out_dir)))
+    try:
+        if say:
+            say(f"去伴唱和声 72%（{_DEFAULT_KARAOKE_MODEL}）")
+        sep = Separator(
+            output_dir=str(tmp_dir),
+            output_format="WAV",
+            model_file_dir=model_dir,
+            use_autocast=use_cuda,
+        )
+        sep.load_model(model_filename=_DEFAULT_KARAOKE_MODEL)
+        files = _resolve_sep_outputs(sep.separate(str(vocal_path)), tmp_dir)
+        lead = _pick_stem(
+            files,
+            positive_keys=("(vocals)", "_vocals", "lead", "karaoke"),
+            negative_keys=("instrumental", "backing", "no_vocals"),
+        )
+        if not lead or not lead.is_file():
+            if say:
+                say("去伴唱和声未匹配到主唱输出，保留原始分离人声")
+            return False
+        _write_44100_pcm24(lead, vocal_path)
+        if say:
+            say("去伴唱和声完成 84%")
+        return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def _run_dereverb(vocal_path, out_dir, device="auto", say=None):
     """使用 audio-separator 的轻量 De-Reverb 模型净化干声混响。"""
     from audio_separator.separator import Separator
@@ -153,7 +195,7 @@ def _run_dereverb(vocal_path, out_dir, device="auto", say=None):
             torch.cuda.empty_cache()
 
 
-def _separate_roformer(src, out_dir, device="auto", dereverb=False, say=None):
+def _separate_roformer(src, out_dir, device="auto", dereverb=False, karaoke=False, say=None):
     """使用 UVR5 内核（audio-separator + BS-RoFormer）分离人声与伴奏，可选串联去混响。"""
     from audio_separator.separator import Separator
 
@@ -216,6 +258,13 @@ def _separate_roformer(src, out_dir, device="auto", dereverb=False, say=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        if karaoke:
+            try:
+                _run_karaoke(vpath, out_dir, device=device, say=say)
+            except Exception as e:  # noqa: BLE001
+                if say:
+                    say(f"去伴唱和声跳过：{str(e)[:160]}")
+
         if dereverb:
             _run_dereverb(vpath, out_dir, device=device, say=say)
 
@@ -227,7 +276,7 @@ def _separate_roformer(src, out_dir, device="auto", dereverb=False, say=None):
 
 
 def _separate_htdemucs(src, out_dir, device="auto", model_name="htdemucs", overlap=0.25,
-                       dereverb=False, say=None, quiet=False):
+                       dereverb=False, karaoke=False, say=None, quiet=False):
     """使用 demucs htdemucs 快速分离。"""
     from demucs.apply import apply_model
     from demucs.pretrained import get_model
@@ -296,6 +345,16 @@ def _separate_htdemucs(src, out_dir, device="auto", model_name="htdemucs", overl
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    if karaoke:
+        try:
+            _run_karaoke(vpath, out_dir, device=device, say=say)
+        except ImportError:
+            if say:
+                say("未安装 audio-separator，跳过额外去伴唱和声")
+        except Exception as e:  # noqa: BLE001
+            if say:
+                say(f"去伴唱和声跳过：{str(e)[:160]}")
+
     if dereverb:
         try:
             _run_dereverb(vpath, out_dir, device=device, say=say)
@@ -312,7 +371,7 @@ def _separate_htdemucs(src, out_dir, device="auto", model_name="htdemucs", overl
 
 
 def separate_file(src, out_dir, device="auto", model_name="htdemucs", overlap=0.25,
-                  quiet=False, engine="htdemucs", dereverb=False, fallback=True):
+                  quiet=False, engine="htdemucs", dereverb=False, karaoke=False, fallback=True):
     """把 src 分离成 <out_dir>/vocals.wav 与 inst.wav，返回 (vocals_path, inst_path, sr)。"""
     def say(msg):
         if not quiet:
@@ -321,7 +380,7 @@ def separate_file(src, out_dir, device="auto", model_name="htdemucs", overlap=0.
     eng = str(engine or "htdemucs").strip().lower()
     if eng in ("roformer", "uvr", "uvr5"):
         try:
-            return _separate_roformer(src, out_dir, device=device, dereverb=bool(dereverb), say=say)
+            return _separate_roformer(src, out_dir, device=device, dereverb=bool(dereverb), karaoke=bool(karaoke), say=say)
         except ImportError as e:
             if not fallback:
                 raise RuntimeError(
@@ -336,7 +395,7 @@ def separate_file(src, out_dir, device="auto", model_name="htdemucs", overlap=0.
 
     return _separate_htdemucs(
         src, out_dir, device=device, model_name=model_name, overlap=overlap,
-        dereverb=bool(dereverb), say=say, quiet=quiet,
+        dereverb=bool(dereverb), karaoke=bool(karaoke), say=say, quiet=quiet,
     )
 
 
@@ -349,6 +408,7 @@ def main() -> int:
     ap.add_argument("--overlap", type=float, default=0.25)
     ap.add_argument("--engine", default="htdemucs", choices=["htdemucs", "roformer"])
     ap.add_argument("--dereverb", action="store_true")
+    ap.add_argument("--karaoke", action="store_true")
     ap.add_argument("--no-fallback", action="store_true")
     args = ap.parse_args()
     try:
@@ -359,6 +419,7 @@ def main() -> int:
             overlap=args.overlap,
             engine=args.engine,
             dereverb=args.dereverb,
+            karaoke=args.karaoke,
             fallback=not args.no_fallback,
         )
     except RuntimeError as e:

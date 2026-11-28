@@ -154,7 +154,10 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             f0_method=str(params.get("f0_method", "rmvpe")),
             separator=str(params.get("separator", "htdemucs")),
             dereverb=bool(params.get("dereverb", False)),
+            karaoke=bool(params.get("karaoke", False)),
             model=str(params.get("model") or ""),
+            duet_model=str(params.get("duet_model") or ""),
+            duet_mode=str(params.get("duet_mode") or "alternate"),
             dynamic_style=str(params.get("dynamic_style", "off")),
             segments=params.get("segments") or None,
             snap_cut=params.get("snap_cut") or None,
@@ -192,6 +195,14 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             session_dir=Path(params["session_dir"]) if params.get("session_dir") else None,
             progress=progress,
             cancel=cancel,
+        )
+
+    if kind == "fuse":
+        return ENGINE.fuse_models(
+            model_a=str(params.get("model_a") or ""),
+            model_b=str(params.get("model_b") or ""),
+            out_name=str(params.get("out_name") or ""),
+            alpha=float(params.get("alpha", 0.5)),
         )
 
     if kind == "convert":
@@ -405,7 +416,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/job"):
                 body = self._body()
                 kind = str(body.pop("kind", "song"))
-                if kind not in ("song", "convert", "dataset", "train", "ab", "patch"):
+                if kind not in ("song", "convert", "dataset", "train", "ab", "patch", "fuse"):
                     self._json(400, {"ok": False, "message": f"未知任务类型：{kind}"})
                     return
                 job = new_job(kind, body)
