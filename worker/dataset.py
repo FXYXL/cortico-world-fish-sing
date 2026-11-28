@@ -205,6 +205,19 @@ def load_mono(path, sr=16000) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
+def read_mono_fast(path, target_sr=16000) -> np.ndarray:
+    """优先用 soundfile 内存直读 wav/flac/ogg 并重采样，读不了的格式再回退 ffmpeg。"""
+    try:
+        y, sr = sf.read(str(path), dtype="float32", always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        if y.size == 0:
+            return np.empty(0, dtype=np.float32)
+        return resample_to(y, int(sr), int(target_sr))
+    except Exception:  # noqa: BLE001
+        return load_mono(path, target_sr)
+
+
 def frame_db(y: np.ndarray, sr: int, win=0.04, hop=0.01):
     n, h = int(win * sr), int(hop * sr)
     if y.size < n:
@@ -353,6 +366,8 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
     max_len = target_len if mode == "fixed" else float(params.get("maxLen") or MAX_LEN)
     min_voiced = float(params.get("minVoiced") or 0.25)
     skip_sep = bool(params.get("skipSeparate", False))
+    sep_engine = "roformer" if str(params.get("separator") or "htdemucs").strip().lower() in ("roformer", "uvr", "uvr5") else "htdemucs"
+    sep_dereverb = bool(params.get("dereverb", False))
 
     usable = [s for s in sources if not s.get("error")]
     if not usable:
@@ -381,7 +396,10 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
         if need_sep:
             try:
                 from separate import separate_file
-                vpath, ipath, _sr = separate_file(str(src_path), str(sep_dir), device="auto", quiet=True)
+                vpath, ipath, _sr = separate_file(
+                    str(src_path), str(sep_dir), device="auto", quiet=True,
+                    engine=sep_engine, dereverb=sep_dereverb, fallback=True,
+                )
                 vocal_wav = Path(vpath)
                 # 伴奏要它没用（训练只用干声），但一首歌 40 MB，十几首就是 500 MB。
                 # 干声留着：换切片参数时可以不用重新分离。
@@ -390,11 +408,11 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
                         os.remove(ipath)
                     except OSError:
                         pass
-                log(f"分离完成：{label} → {vpath}")
+                log(f"分离完成（{sep_engine}{'+去混响' if sep_dereverb else ''}）：{label} → {vpath}")
             except Exception as e:  # noqa: BLE001
                 # 不退回原文件：混音里伴奏会被当成"人声"切进去，训出来的模型会把钢琴当元音。
                 # 宁可在这一步停下来告诉她缺什么。
-                raise RuntimeError(f"分离失败（{label}）：{e}。检查运行时里有没有 demucs") from e
+                raise RuntimeError(f"分离失败（{label}）：{e}。检查运行时里有没有 demucs / audio-separator") from e
 
         src_meta.append({
             "index": i,
@@ -402,25 +420,23 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
             "name": label,
             "duration": s.get("duration", 0),
             "separated": need_sep,
+            "separator": sep_engine if need_sep else "",
+            "dereverb": sep_dereverb if need_sep else False,
             "vocalFile": str(vocal_wav),
         })
 
-        # 解码成 16k 单声道做分析（切片时再按 40k 重读，保证音质）
-        y16 = load_mono(vocal_wav, 16000)
-        if y16.size == 0:
+        # 只解码一次 40k 单声道，再内存降采样到 16k 做分析（避免同一首干声跑两遍 ffmpeg）
+        y40 = read_mono_fast(vocal_wav, OUT_SR)
+        if y40.size == 0:
             log(f"空文件，跳过：{label}")
             continue
+        y16 = resample_to(y40, OUT_SR, 16000)
 
         segs = (adaptive_segments(y16, 16000, min_len=min_len, max_len=max_len) if mode == "auto"
                 else fixed_segments(y16, 16000, target_len))
         if not segs:
             log(f"没找到有效人声段：{label}")
             continue
-
-        # 40k 版本用于写盘，按时间片取（与 16k 分析结果对齐）。
-        # 段边界是「秒」，换算成 40k 域的样本必须乘 OUT_SR——
-        # 之前写成 ×(OUT_SR/16000)=2.5，2.87 秒的段只切出 7 帧（0.4.0 事故）。
-        y40 = load_mono(vocal_wav, OUT_SR)
 
         for j, (t0, t1) in enumerate(segs):
             if cancel.is_set():
@@ -480,12 +496,12 @@ def build(sources, out_dir, params, progress, cancel) -> dict:
 
         progress(0.02 + 0.5 * ((i0 + 1) / n), f"已处理 {i0 + 1}/{n}：{label[:28]}")
 
-    # ---- 写盘自检：PCM_24 单声道 40k ≈ 120 KB/秒，明显小于预期就是坏片。
+    # ---- 写盘自检：FLOAT 单声道 40k ≈ 160 KB/秒（4 字节/样本），明显小于预期就是坏片。
     # 没有这道闸，空壳切片会流进训练，到特征提取阶段以"没有可用的训练样本"
     # 这种更隐晦的方式爆炸（0.4.0 夜里 ds-20261102-0035 的真实事故）。
     bad = []
     for path, dur in written:
-        expect = int(dur * OUT_SR * 3)  # PCM_24 单声道字节数
+        expect = int(dur * OUT_SR * 4)
         try:
             actual = path.stat().st_size
         except OSError:
@@ -610,7 +626,7 @@ def import_experiment(gt_dir, out_dir, label, progress, cancel, append=False) ->
     for i, f in enumerate(files):
         if cancel.is_set():
             raise RuntimeError("已取消")
-        y16 = load_mono(f, 16000)
+        y16 = read_mono_fast(f, 16000)
         dur = y16.size / 16000 if y16.size else 0.0
         f0, p90, vratio = f0_stats(y16, 16000)
         peak = float(np.abs(y16).max()) if y16.size else 0.0

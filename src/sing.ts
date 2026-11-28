@@ -21,9 +21,41 @@ import { audioUrlOf, download, extractBvid, isBvid, rankHits, searchBili, type S
 import { cut, duration, split, toMp3, type FfmpegDeps } from './audio.ts';
 import { parseTarget, sendRecord, type OneBotOptions, type Player } from './deliver.ts';
 import {
-  addToLibrary, cacheGet, cacheKey, cachePut, type LibraryOptions, type SingParams,
+  addToLibrary,
+  cacheGet,
+  cacheKey,
+  cachePut,
+  loadSession,
+  saveSession,
+  sepCacheDir,
+  sessionDir,
+  type LibraryOptions,
+  type SingParams,
+  type SingSessionSnapshot,
+  type VocalReport,
 } from './library.ts';
+import { fmtTime, locatePatchRange, resolveLyrics, type LyricsSheet } from './lyrics.ts';
 import type { LoggerLike, WorkerClient } from './worker.ts';
+
+export interface PlaybackEndInfo {
+  id: string;
+  title: string;
+  reason: 'ended' | 'stopped' | 'error';
+  elapsedSec: number;
+  durationSec: number;
+  report?: VocalReport;
+}
+
+export interface SingSegmentSpec {
+  start: number;
+  end: number;
+  model?: string;
+  indexRate?: number;
+  protect?: number;
+  pitch?: number;
+  rmsMixRate?: number;
+  f0Method?: 'rmvpe' | 'fcpe';
+}
 
 export interface SingDeps {
   log: LoggerLike;
@@ -46,6 +78,8 @@ export interface SingDeps {
   minScore: number;
   excludeWords: string;
   voice: SingParams;
+  /** 本机自然播完 / 被打断时的回调（用于 pushEvent 通知桌宠接话） */
+  onPlaybackEnd?: (info: PlaybackEndInfo) => void;
 }
 
 /** 把 0~1 之间的参数夹住：非法/越界一律退回配置值，别把 NaN 传到 worker。 */
@@ -64,8 +98,22 @@ export interface SingRequest {
   protect?: number;
   /** 音量跟随原唱的程度 0~1（0 = 完全跟随，轻唱不会被唱满） */
   rmsMixRate?: number;
-  /** 和声堆叠：off / third / third+fifth */
-  harmony?: 'off' | 'third' | 'third+fifth';
+  /** 和声堆叠：off / double / double+third / third / third+fifth */
+  harmony?: 'off' | 'double' | 'double+third' | 'third' | 'third+fifth';
+  /** 人声混响：off / light */
+  reverb?: 'off' | 'light';
+  /** 人声润色（默认开） */
+  polish?: boolean;
+  /** F0 音高提取算法 */
+  f0Method?: 'rmvpe' | 'fcpe';
+  /** 人声分离档位：htdemucs（快速） / roformer（UVR5 精唱） */
+  separator?: 'htdemucs' | 'roformer';
+  /** 分离后额外去混响 */
+  dereverb?: boolean;
+  /** 动态主副歌演绎：off / soft-verse-bright-chorus */
+  dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
+  /** 显式分段换音色/换参数 */
+  segments?: SingSegmentSpec[];
   start?: number;
   duration?: number;
   /** 跳过缓存（想重唱一遍时用） */
@@ -76,6 +124,37 @@ export interface SingRequest {
   pick?: string;
   /** B 站排序：default 综合 / click 播放多 / pubdate 最新 */
   order?: SearchOrder;
+}
+
+export interface PatchRequest {
+  /** 要返工的会话 ID；不填默认最近一次唱过的歌 */
+  sessionId?: string;
+  /** 按秒数指定起止 */
+  start?: number;
+  end?: number;
+  /** 按句号指定，如 "7" 或 "7-9" */
+  lines?: string | number;
+  /** 按歌词关键词匹配定位 */
+  lyric?: string;
+  /** 按段落定位（如 "chorus"） */
+  section?: 'chorus';
+  /** 第几段副歌（从 1 开始，配合 section="chorus"） */
+  chorusIndex?: number;
+  /** 按当前正在播放的位置自动取「这一句」 */
+  atCurrent?: boolean;
+  /** 是否自动吸附换气静音谷底（默认 true） */
+  snap?: boolean;
+  /** 返工新参数（不填则沿用原曲参数） */
+  pitch?: number;
+  indexRate?: number;
+  protect?: number;
+  rmsMixRate?: number;
+  f0Method?: 'rmvpe' | 'fcpe';
+  /** 临时更换该句所用模型名（如 dfy2.pth） */
+  model?: string;
+  /** true = 仅生成前后各带 2 秒上下文的短预览轨试听，不改整首；false = 贴回整首并更新作品库 */
+  previewOnly?: boolean;
+  to?: string;
 }
 
 export interface SingResult {
@@ -273,9 +352,19 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     // 0 = 完全跟随原唱音量；1 = 完全用模型自己的（轻唱被唱满）。越界/NaN 一律退回配置值。
     rmsMixRate: clamp01(req.rmsMixRate ?? deps.voice.rmsMixRate),
     harmony: (req.harmony ?? deps.voice.harmony) === 'third+fifth' ? 'third+fifth'
-      : (req.harmony ?? deps.voice.harmony) === 'third' ? 'third' : 'off',
+      : (req.harmony ?? deps.voice.harmony) === 'double+third' ? 'double+third'
+        : (req.harmony ?? deps.voice.harmony) === 'third' ? 'third'
+          : (req.harmony ?? deps.voice.harmony) === 'double' ? 'double' : 'off',
     harmonyGain: Math.min(0.6, Math.max(0, Number(deps.voice.harmonyGain ?? 0.22))),
     harmonyScope: deps.voice.harmonyScope === 'all' ? 'all' : 'chorus',
+    reverb: (req.reverb ?? deps.voice.reverb) === 'light' ? 'light' : 'off',
+    polish: (req.polish ?? deps.voice.polish) !== false,
+    f0Method: (req.f0Method ?? deps.voice.f0Method) === 'fcpe' ? 'fcpe' : 'rmvpe',
+    separator: (req.separator ?? deps.voice.separator) === 'roformer' ? 'roformer' : 'htdemucs',
+    dereverb: Boolean(req.dereverb ?? deps.voice.dereverb),
+    dynamicStyle: (req.dynamicStyle ?? deps.voice.dynamicStyle) === 'soft-verse-bright-chorus'
+      ? 'soft-verse-bright-chorus' : 'off',
+    segmentsKey: Array.isArray(req.segments) && req.segments.length ? JSON.stringify(req.segments) : '',
     // 不传 pitch = 按配置默认（配置默认 'auto' = 按音域自动推荐）
     pitch: req.pitch === undefined || req.pitch === 'auto'
       ? (deps.voice.pitch ?? 'auto')
@@ -297,22 +386,59 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     deps.log.info(`唱歌：${src.title}（${src.note}，${human(src.durationSec)}）`);
 
     // ---- 2. 缓存
-    const wantCut = (req.start ?? 0) > 0 || (req.duration ?? 0) > 0;
-    const key = cacheKey(`${src.sourceId}|cut:${req.start ?? 0}/${req.duration ?? 0}`, params);
+    const cutStart = Math.max(0, Number(req.start ?? 0) || 0);
+    const cutDuration = Math.max(0, Number(req.duration ?? 0) || 0);
+    const wantCut = cutStart > 0 || cutDuration > 0;
+    const fullSourceKey = `${src.sourceId}|cut:0/0`;
+    const sourceCutKey = `${src.sourceId}|cut:${cutStart}/${cutDuration}`;
+    const key = cacheKey(sourceCutKey, params);
     let mp3 = req.refresh ? null : cacheGet(deps.data, key);
     let cached = Boolean(mp3);
     let info: Record<string, unknown> = {};
+    let report: VocalReport | undefined;
+    let lyrics: LyricsSheet | undefined;
+    const requestedAutoPitch = params.pitch === 'auto';
+    const sessDir = sessionDir(deps.data, key);
 
     if (mp3) {
       deps.log.info(`命中缓存（${key}）`);
+      const prevSnap = loadSession(deps.data, key);
+      if (prevSnap) {
+        report = prevSnap.report;
+        lyrics = prevSnap.lyrics as LyricsSheet | undefined;
+      }
+      if (!lyrics) {
+        lyrics = await resolveLyrics({
+          title: src.title,
+          hintQuery: songText,
+          localPath: src.kind === 'file' ? src.input : undefined,
+          bvid: src.bvid || undefined,
+          fullDurationSec: src.durationSec,
+          cutStart,
+          cutDuration,
+          phrases: report?.phrases,
+          chorusRanges: report?.chorusRanges,
+        }).catch(() => undefined);
+      }
     } else {
-      // ---- 3. 截取（省算力：分离前就切）
+      // ---- 3. 截取（若整首已有分离缓存，则交给 worker 在干声上做换气静音边界吸附再切，既免重复分离又不劈字）
+      const fullSepDir = sepCacheDir(deps.data, fullSourceKey, {
+        separator: params.separator,
+        dereverb: params.dereverb,
+      });
+      const hasFullSep = !src.alreadyVocal && existsSync(join(fullSepDir, 'vocals.wav'));
       let feed = src.input;
+      let useSnapCut = false;
       if (wantCut) {
-        const cutFile = join(root, 'cut.wav');
-        await cut(src.input, cutFile, Number(req.start ?? 0), Number(req.duration ?? 0), deps.ffmpeg);
-        feed = cutFile;
-        deps.log.info(`截取 ${Math.round(req.start ?? 0)}s 起 ${Math.round(req.duration ?? 0) || '到结尾'}s`);
+        if (hasFullSep) {
+          useSnapCut = true;
+          deps.log.info(`复用整首分离缓存并按静音边界吸附截取：${Math.round(cutStart)}s 起 ${Math.round(cutDuration) || '到结尾'}s`);
+        } else {
+          const cutFile = join(root, 'cut.wav');
+          await cut(src.input, cutFile, cutStart, cutDuration, deps.ffmpeg);
+          feed = cutFile;
+          deps.log.info(`截取 ${Math.round(cutStart)}s 起 ${Math.round(cutDuration) || '到结尾'}s`);
+        }
       }
 
       // ---- 4. 换声
@@ -320,13 +446,29 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         input: feed,
         work: join(root, 'work'),
         separate: !src.alreadyVocal,
+        sep_cache: src.alreadyVocal ? '' : (useSnapCut ? fullSepDir : sepCacheDir(deps.data, sourceCutKey, {
+          separator: params.separator,
+          dereverb: params.dereverb,
+        })),
+        snap_cut: useSnapCut ? { start: cutStart, duration: cutDuration } : null,
+        session_dir: sessDir,
         mode: params.mode,
         pitch: params.pitch,
         index_rate: params.indexRate,
         protect: params.protect,
         rms_mix_rate: params.rmsMixRate,
+        f0_method: params.f0Method,
+        separator: params.separator,
+        dereverb: params.dereverb,
+        dynamic_style: params.dynamicStyle ?? 'off',
+        segments: Array.isArray(req.segments) && req.segments.length ? req.segments : null,
+        reverb: params.reverb,
+        polish: params.polish !== false,
         harmony: params.harmony === 'off' ? null : {
-          semis: params.harmony === 'third+fifth' ? [3, 7] : [3],
+          mode: params.harmony === 'double' ? 'double'
+            : params.harmony === 'double+third' ? 'double+third' : 'pitch',
+          semis: params.harmony === 'third+fifth' ? [3, 7]
+            : (params.harmony === 'third' || params.harmony === 'double+third') ? [3] : [],
           gain: params.harmonyGain,
           scope: params.harmonyScope,
         },
@@ -339,6 +481,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         }
       });
       info = job.result ?? {};
+      report = info.report as VocalReport | undefined;
       const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
       if (suggest?.reason) deps.log.info(`变调推荐：${suggest.reason}`);
       // 库里记实际用的半音数（'auto' 已在 worker 里落成具体值）
@@ -350,6 +493,24 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       mp3 = join(root, 'result.mp3');
       await toMp3(raw, mp3, deps.ffmpeg, '192k');
       cachePut(deps.data, key, mp3);
+
+      // ---- 5b. 多级时间轴歌词（LRC / B站字幕 / 静音切分乐句兜底）
+      const snapRange = info.snappedRange as { start?: number; end?: number } | undefined;
+      const effStart = snapRange?.start ?? cutStart;
+      const effDur = snapRange?.end !== undefined && snapRange?.start !== undefined
+        ? Math.max(0, snapRange.end - snapRange.start)
+        : cutDuration;
+      lyrics = await resolveLyrics({
+        title: src.title,
+        hintQuery: songText,
+        localPath: src.kind === 'file' ? src.input : undefined,
+        bvid: src.bvid || undefined,
+        fullDurationSec: src.durationSec,
+        cutStart: effStart,
+        cutDuration: effDur,
+        phrases: report?.phrases,
+        chorusRanges: report?.chorusRanges,
+      }).catch(() => undefined);
     }
 
     const totalSec = await duration(mp3, deps.ffmpeg);
@@ -379,13 +540,45 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       target: '',
     }, mp3);
 
+    // 持久化本次会话快照（干声路径 + 体检 + 时间轴歌词），供局部返工与唱中查句使用
+    const prevSnap = loadSession(deps.data, id);
+    const snapshot: SingSessionSnapshot = {
+      id,
+      title: src.title,
+      bvid: src.bvid,
+      source: src.bvid || src.input,
+      mp3: libEntry.file,
+      vocalSrc: String(info.vocalSrc || prevSnap?.vocalSrc || ''),
+      convVocal: String(info.convVocal || prevSnap?.convVocal || ''),
+      inst: String(info.inst || prevSnap?.inst || ''),
+      durationSec: totalSec,
+      pitchApplied: Number(info.pitchApplied ?? (typeof params.pitch === 'number' ? params.pitch : prevSnap?.pitchApplied ?? 0)),
+      cutStart,
+      cutDuration,
+      params,
+      report,
+      lyrics,
+      at: Date.now(),
+    };
+    try {
+      saveSession(deps.data, snapshot);
+    } catch {
+      /* 快照保存失败不影响出声 */
+    }
+
     const doLocal = lower === 'local' || isBoth || (!toRaw && deps.defaultTarget === 'local');
     if (doLocal) {
       if (!deps.playEnabled) {
         problems.push('本机播放被关掉了（配置 → 播放与发送）');
       } else {
         deps.player.play(libEntry.file, {
-          dir: deps.ffmpeg.dir, playerPath: deps.playerPath, volume: deps.volume,
+          dir: deps.ffmpeg.dir,
+          playerPath: deps.playerPath,
+          volume: deps.volume,
+          meta: { id, title: src.title, durationSec: totalSec, lyrics },
+          onEnd: (reason, elapsedSec) => {
+            deps.onPlaybackEnd?.({ id, title: src.title, reason, elapsedSec, durationSec: totalSec, report });
+          },
           log: (m: string) => deps.log.warn(m),
         });
         delivered.push('本机在放');
@@ -417,19 +610,33 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
     const elapsed = Math.round((Date.now() - t0) / 1000);
     done = true;  // 走到这里任务已落终态，finally 里可以安全清理
     const suggest = info.pitchSuggest as { pitch: number; reason: string } | undefined;
-    const autoNote = params.pitch === 'auto' && suggest
+    const autoNote = requestedAutoPitch && suggest
       ? `；变调 ${suggest.pitch >= 0 ? '+' : ''}${suggest.pitch}（${suggest.reason}）`
       : '';
+    const reportNote = report?.summary ? `；体检：${report.summary}` : '';
+    const lyricsNote = lyrics?.lines?.length ? `；已备时间轴（${lyrics.sourceLabel}，${lyrics.lines.length} 句）` : '';
     const head = `唱完了《${src.title}》，${human(totalSec)}${cached ? '（走缓存）' : `，用了 ${elapsed} 秒`}${autoNote}`;
     const tail = delivered.length ? `；${delivered.join('，')}` : '；没投递（文件进了作品库，可以用 fish_sing_library 回放）';
     const warn = problems.length ? `；但${problems.join('；')}` : '';
     return {
       ok: true,
-      message: `${head}${tail}${warn}`,
+      message: `${head}${tail}${reportNote}${lyricsNote}${warn}`,
       detail: {
-        title: src.title, bvid: src.bvid, duration: totalSec, segments: Math.ceil(totalSec / deps.maxSegmentSec),
-        cached, elapsed, file: mp3, params, delivered, problems,
+        id,
+        title: src.title,
+        bvid: src.bvid,
+        duration: totalSec,
+        segments: Math.ceil(totalSec / deps.maxSegmentSec),
+        cached,
+        elapsed,
+        file: libEntry.file,
+        params,
+        delivered,
+        problems,
         pitchSuggest: info.pitchSuggest,
+        report,
+        lyricsSource: lyrics?.sourceLabel ?? '',
+        lyricsCount: lyrics?.lines?.length ?? 0,
       },
     };
   } catch (e) {
@@ -446,6 +653,205 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
       }
     } else {
       // 失败/超时：worker 里的任务可能还在写这个目录，等它落终态再删
+      scheduleTmpCleanup(deps.worker, jobId, root);
+    }
+  }
+}
+
+/** 局部返工重唱 / 补录：复用分离干声与上一版换声干声，只重跑目标句并无缝贴回原位。 */
+export async function patchSong(req: PatchRequest, deps: SingDeps): Promise<SingResult> {
+  const t0 = Date.now();
+  const snap = loadSession(deps.data, req.sessionId);
+  if (!snap) return { ok: false, message: '还没有可返工的最近演唱记录，先唱一首歌吧。' };
+  if (!snap.vocalSrc || !existsSync(snap.vocalSrc) || !snap.convVocal || !existsSync(snap.convVocal)) {
+    return {
+      ok: false,
+      message: `《${snap.title}》的干声快照已不存在（可能被清理过或之前走旧缓存），请先带 refresh=true 重唱一次再局部返工。`,
+    };
+  }
+
+  let startSec: number | undefined = req.start !== undefined ? Number(req.start) : undefined;
+  let endSec: number | undefined = req.end !== undefined ? Number(req.end) : undefined;
+  let locLabel = '';
+
+  if (startSec === undefined || endSec === undefined) {
+    if (req.atCurrent) {
+      const pb = deps.player.playbackState();
+      if (pb.playing && pb.currentLine) {
+        startSec = pb.currentLine.start;
+        endSec = pb.currentLine.end;
+        locLabel = `当前第 ${pb.currentLine.index} 句「${pb.currentLine.text.slice(0, 18)}」`;
+      } else if (pb.playing) {
+        startSec = Math.max(0, pb.elapsedSec - 3);
+        endSec = Math.min(snap.durationSec, pb.elapsedSec + 3);
+        locLabel = `当前位置 ${fmtTime(startSec)}–${fmtTime(endSec)}`;
+      }
+    }
+    if (startSec === undefined || endSec === undefined) {
+      const hit = locatePatchRange(
+        snap.lyrics as LyricsSheet | undefined,
+        snap.report?.chorusRanges,
+        {
+          lines: req.lines,
+          lyric: req.lyric,
+          section: req.section,
+          chorusIndex: req.chorusIndex,
+        },
+      );
+      if (hit) {
+        startSec = hit.start;
+        endSec = hit.end;
+        locLabel = hit.label;
+      }
+    }
+  }
+
+  if (startSec === undefined || endSec === undefined || !Number.isFinite(startSec) || !Number.isFinite(endSec) || endSec <= startSec) {
+    return {
+      ok: false,
+      message: '没定位到要返工的段落：请给句号（lines，如 "7" 或 "7-9"）、歌词关键词（lyric）、section="chorus" 或起止秒数（start/end）。',
+    };
+  }
+  if (!locLabel) locLabel = `${fmtTime(startSec)}–${fmtTime(endSec)}`;
+
+  const root = join(deps.data.dataDir, 'tmp', `patch-${stamp()}-${Math.random().toString(36).slice(2, 6)}`);
+  mkdirSync(root, { recursive: true });
+  let jobId: string | null = null;
+  let done = false;
+
+  try {
+    const p = snap.params;
+    const previewOnly = req.previewOnly === true;
+    const sessDir = sessionDir(deps.data, snap.id);
+    const harmony = p.harmony && p.harmony !== 'off' ? {
+      mode: p.harmony === 'double' ? 'double' : p.harmony === 'double+third' ? 'double+third' : 'pitch',
+      semis: p.harmony === 'third+fifth' ? [3, 7] : (p.harmony === 'third' || p.harmony === 'double+third') ? [3] : [],
+      gain: p.harmonyGain ?? 0.22,
+      scope: p.harmonyScope ?? 'chorus',
+    } : null;
+
+    jobId = await deps.worker.submit('patch', {
+      vocal_src: snap.vocalSrc,
+      base_conv: snap.convVocal,
+      inst: snap.inst || '',
+      work: join(root, 'work'),
+      session_dir: sessDir,
+      start: startSec,
+      end: endSec,
+      snap: req.snap !== false,
+      base_pitch: snap.pitchApplied,
+      pitch: req.pitch !== undefined ? Number(req.pitch) : undefined,
+      index_rate: req.indexRate !== undefined ? Number(req.indexRate) : p.indexRate,
+      protect: req.protect !== undefined ? Number(req.protect) : p.protect,
+      rms_mix_rate: req.rmsMixRate !== undefined ? clamp01(req.rmsMixRate) : (p.rmsMixRate ?? 0),
+      f0_method: req.f0Method ?? p.f0Method ?? 'rmvpe',
+      model: req.model ? String(req.model).trim() : '',
+      harmony,
+      reverb: p.reverb ?? 'off',
+      polish: p.polish !== false,
+      mode: p.mode,
+      preview_only: previewOnly,
+    });
+    const job = await deps.worker.wait(jobId);
+    const info = job.result ?? {};
+    const raw = String(info.output ?? '');
+    if (!raw) throw new Error('worker 没给出返工输出文件');
+
+    const mp3 = join(root, 'patched.mp3');
+    await toMp3(raw, mp3, deps.ffmpeg, '192k');
+    const sec = await duration(mp3, deps.ffmpeg);
+
+    let playFile = mp3;
+    if (!previewOnly) {
+      cachePut(deps.data, snap.id, mp3);
+      const updated = addToLibrary(deps.data, {
+        id: snap.id,
+        title: snap.title,
+        source: snap.source,
+        bvid: snap.bvid,
+        file: mp3,
+        durationSec: sec,
+        at: Date.now(),
+        params: snap.params,
+        target: '本机在放（已返工）',
+      }, mp3);
+      playFile = updated.file;
+      saveSession(deps.data, {
+        ...snap,
+        mp3: updated.file,
+        convVocal: String(info.convVocal || snap.convVocal),
+        durationSec: sec,
+        at: Date.now(),
+      });
+    } else {
+      // 预览文件落到 session 目录持久一份，防止 tmp 删除导致 ffplay 读不到
+      const previewDst = join(sessDir, 'last_preview.mp3');
+      mkdirSync(sessDir, { recursive: true });
+      await toMp3(raw, previewDst, deps.ffmpeg, '192k');
+      playFile = previewDst;
+    }
+
+    const toRaw = String(req.to ?? '').trim();
+    const lower = toRaw.toLowerCase();
+    const obTarget = parseTarget(toRaw);
+    const delivered: string[] = [];
+    const doLocal = lower === 'local' || lower === 'both' || (!toRaw && deps.defaultTarget === 'local');
+    if (doLocal && deps.playEnabled) {
+      deps.player.play(playFile, {
+        dir: deps.ffmpeg.dir,
+        playerPath: deps.playerPath,
+        volume: deps.volume,
+        meta: {
+          id: snap.id,
+          title: previewOnly ? `${snap.title}（返工预览）` : snap.title,
+          durationSec: sec,
+          lyrics: previewOnly ? undefined : (snap.lyrics as LyricsSheet | undefined),
+        },
+        onEnd: previewOnly ? undefined : (reason, elapsedSec) => {
+          deps.onPlaybackEnd?.({ id: snap.id, title: snap.title, reason, elapsedSec, durationSec: sec, report: snap.report });
+        },
+        log: (m: string) => deps.log.warn(m),
+      });
+      delivered.push(previewOnly ? '本机试听返工句' : '本机播放新版全曲');
+    }
+    if (obTarget && deps.onebot.httpUrl) {
+      const segs = await split(playFile, join(root, 'segs'), deps.maxSegmentSec, deps.ffmpeg);
+      for (let i = 0; i < segs.length; i += 1) {
+        if (i > 0 && deps.gapMs > 0) await new Promise((r) => setTimeout(r, deps.gapMs));
+        await sendRecord(deps.onebot, obTarget, segs[i]);
+      }
+      delivered.push(`发到${obTarget.label}`);
+    }
+
+    done = true;
+    const elapsed = Math.round((Date.now() - t0) / 1000);
+    const sOut = Number(info.start ?? startSec);
+    const eOut = Number(info.end ?? endSec);
+    return {
+      ok: true,
+      message: `已返工《${snap.title}》${locLabel}（吸附区间 ${fmtTime(sOut)}–${fmtTime(eOut)}，用时 ${elapsed} 秒）${delivered.length ? `；${delivered.join('，')}` : ''}。`,
+      detail: {
+        id: snap.id,
+        title: snap.title,
+        start: sOut,
+        end: eOut,
+        previewOnly,
+        elapsed,
+        file: playFile,
+      },
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    deps.log.warn(`局部返工失败：${msg}`);
+    return { ok: false, message: `局部返工失败：${msg}` };
+  } finally {
+    if (done) {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        /* 忽略 */
+      }
+    } else {
       scheduleTmpCleanup(deps.worker, jobId, root);
     }
   }

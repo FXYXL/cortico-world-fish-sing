@@ -11,6 +11,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -488,11 +489,76 @@ export async function installRuntime(
   report(100, '运行时装好了');
 }
 
+/** 锁定版本的 UVR5（audio-separator）纯辅助包清单：严格 --no-deps，绝不触碰 torch+cu118 与 numpy 1.x。 */
+export const UVR_LOCKED_PACKAGES = [
+  'audio-separator==0.30.2',
+  'beartype==0.18.5',
+  'ml_collections',
+  'pydub',
+  'resampy',
+  'rotary-embedding-torch==0.6.5',
+  'samplerate==0.1.0',
+  'onnxruntime',
+];
+
+/** 探测运行时的可选增强依赖（UVR5 audio-separator 与 FCPE）。 */
+export function detectOptionalDeps(pythonPath: string): { uvr: boolean; fcpe: boolean } {
+  if (!existsSync(pythonPath)) return { uvr: false, fcpe: false };
+  try {
+    const r = spawnSync(
+      pythonPath,
+      [
+        '-c',
+        'import importlib.util as u; print("1" if u.find_spec("audio_separator") else "0", "1" if u.find_spec("torchfcpe") else "0")',
+      ],
+      { timeout: 10_000, encoding: 'utf8', windowsHide: true },
+    );
+    const parts = (r.stdout || '').trim().split(/\s+/);
+    return { uvr: parts[0] === '1', fcpe: parts[1] === '1' };
+  } catch {
+    return { uvr: false, fcpe: false };
+  }
+}
+
+/**
+ * 在已有运行时 venv 中安全安装 UVR5 精唱/去混响内核（audio-separator）。
+ * 采用锁定版本 + `--no-deps`，避免新版 audio-separator 自动把 numpy 升到 2.x 或用 CPU 版 torch 覆写 cu118。
+ */
+export async function installUvrDeps(
+  paths: WorkerPaths,
+  report: Progress,
+  signal: AbortSignal,
+): Promise<void> {
+  const py = paths.pythonPath;
+  if (!existsSync(py)) {
+    throw new Error('请先安装 Python 运行时（GPU 或 CPU 版），再安装 UVR5 精唱内核。');
+  }
+  const pipIndex = 'https://mirrors.pku.edu.cn/pypi/simple';
+  report(10, '正在安全安装 UVR5 精唱内核（锁定版本，不覆盖 torch / numpy）…');
+  await run(
+    py,
+    ['-m', 'pip', 'install', '--no-deps', ...UVR_LOCKED_PACKAGES, '-i', pipIndex],
+    (line) => report(55, line.slice(0, 120)),
+    signal,
+  );
+  report(90, '校验 audio-separator 与原有 PyTorch / NumPy 兼容性');
+  await run(
+    py,
+    [
+      '-c',
+      'import numpy, torch; from audio_separator.separator import Separator; print("ok", numpy.__version__, torch.__version__, torch.cuda.is_available())',
+    ],
+    (line) => report(96, line.slice(0, 120)),
+    signal,
+  );
+  report(100, 'UVR5 精唱/去混响内核安装完成（首次精唱将自动缓存 RoFormer 与 De-Reverb 权重）');
+}
+
 /** 用运行时的 python 跑一段检测，返回可读的结论。 */
 export async function probeRuntime(pythonPath: string): Promise<string> {
   if (!existsSync(pythonPath)) return '还没有 python';
   const code = `
-import sys
+import sys, importlib.util as u
 print('python', sys.version.split()[0])
 mods = ['torch','torchaudio','faiss','soundfile','librosa','demucs']
 miss = []
@@ -508,6 +574,11 @@ else:
     print('cuda', 'yes' if torch.cuda.is_available() else 'no')
     if torch.cuda.is_available():
         print('gpu', torch.cuda.get_device_name(0))
+    opt = []
+    if u.find_spec('audio_separator'): opt.append('UVR5已装')
+    else: opt.append('UVR5未装(可选)')
+    if u.find_spec('torchfcpe'): opt.append('FCPE已装')
+    print('扩展', ' / '.join(opt))
     print('ok')
 `;
   return new Promise((resolve) => {
@@ -520,7 +591,7 @@ else:
       out += c.toString('utf8');
     });
     child.once('error', () => resolve('python 跑不起来'));
-    child.once('exit', () => resolve(out.trim().split('\n').slice(0, 4).join(' · ')));
+    child.once('exit', () => resolve(out.trim().split('\n').slice(0, 5).join(' · ')));
     setTimeout(() => {
       try {
         child.kill();

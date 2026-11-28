@@ -10,20 +10,68 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { lineAtTime, type LyricLine, type LyricsSheet } from './lyrics.ts';
+
+export interface PlayMeta {
+  id?: string;
+  title?: string;
+  durationSec?: number;
+  lyrics?: LyricsSheet;
+}
+
 export interface PlayOptions {
   dir: string;
   playerPath: string;
   volume: number;
+  /** 曲目元信息（用于唱中实时追踪播到第几秒/第几句） */
+  meta?: PlayMeta;
+  /** 播放结束回调：ended=自然播完，stopped=被主动打断，error=异常退出 */
+  onEnd?: (reason: 'ended' | 'stopped' | 'error', elapsedSec: number) => void;
   /** 出问题时用它留痕：ffplay 静默失败最坑，不报就永远查不到 */
   log?: (msg: string) => void;
+}
+
+export interface PlaybackState {
+  playing: boolean;
+  file: string;
+  title: string;
+  id: string;
+  elapsedSec: number;
+  durationSec: number;
+  currentLine?: LyricLine;
+  nextLine?: LyricLine;
 }
 
 export class Player {
   private proc: ChildProcess | null = null;
   private current = '';
+  private startedAt = 0;
+  private meta: PlayMeta = {};
+  private stopFlag = false;
+  private activeOnEnd: PlayOptions['onEnd'];
 
   get playing(): string {
     return this.current;
+  }
+
+  /** 查询当前实时播放进度与正唱到哪一句歌词（支持唱到一半插话定位「这句」）。 */
+  playbackState(): PlaybackState {
+    const active = Boolean(this.proc && this.current);
+    const elapsedSec = active && this.startedAt > 0
+      ? Math.max(0, Math.round(((Date.now() - this.startedAt) / 1000) * 10) / 10)
+      : 0;
+    const durationSec = Number(this.meta.durationSec ?? 0);
+    const pos = active ? lineAtTime(this.meta.lyrics, elapsedSec) : {};
+    return {
+      playing: active,
+      file: this.current,
+      title: String(this.meta.title ?? ''),
+      id: String(this.meta.id ?? ''),
+      elapsedSec,
+      durationSec,
+      currentLine: pos.current,
+      nextLine: pos.next,
+    };
   }
 
   /** 放一首；新的一来就把旧的掐掉（同时放两首只会互相盖住）。 */
@@ -40,39 +88,61 @@ export class Player {
       stdio: ['ignore', 'ignore', 'pipe'],
     });
     let err = '';
+    const started = Date.now();
+    let settled = false;
+    const finish = (reason: 'ended' | 'stopped' | 'error') => {
+      if (settled) return;
+      settled = true;
+      const elapsed = Math.max(0, Math.round(((Date.now() - started) / 1000) * 10) / 10);
+      if (this.proc === child) {
+        this.proc = null;
+        this.current = '';
+        this.startedAt = 0;
+        this.activeOnEnd = undefined;
+      }
+      opts.onEnd?.(reason, elapsed);
+    };
+
     child.stderr?.on('data', (c: Buffer) => {
       err += c.toString('utf8');
       if (err.length > 2000) err = err.slice(-2000);
     });
     child.once('error', (e) => {
       opts.log?.(`ffplay 起不来：${e.message}`);
-      if (this.proc === child) {
-        this.proc = null;
-        this.current = '';
-      }
+      finish('error');
     });
     child.once('exit', (code) => {
-      if (code !== 0 && code !== null) {
+      const wasStopped = this.stopFlag && this.proc === child;
+      if (!wasStopped && code !== 0 && code !== null) {
         opts.log?.(`ffplay 退出码 ${code}：${err.trim().split('\n').slice(-2).join(' ') || '无输出'}`);
       }
-      if (this.proc === child) {
-        this.proc = null;
-        this.current = '';
-      }
+      finish(wasStopped ? 'stopped' : code === 0 ? 'ended' : 'error');
     });
+    this.stopFlag = false;
     this.proc = child;
     this.current = file;
+    this.startedAt = started;
+    this.meta = opts.meta ?? {};
+    this.activeOnEnd = opts.onEnd;
   }
 
   stop(): void {
     if (!this.proc) return;
+    const child = this.proc;
+    const started = this.startedAt;
+    const onEnd = this.activeOnEnd;
+    this.stopFlag = true;
+    this.proc = null;
+    this.current = '';
+    this.startedAt = 0;
+    this.activeOnEnd = undefined;
     try {
-      this.proc.kill();
+      child.kill();
     } catch {
       /* ignore */
     }
-    this.proc = null;
-    this.current = '';
+    const elapsed = started > 0 ? Math.max(0, Math.round(((Date.now() - started) / 1000) * 10) / 10) : 0;
+    onEnd?.('stopped', elapsed);
   }
 }
 

@@ -20,6 +20,26 @@ from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
 
+def _deglitch_f0(f0, max_jump_semis=8.0):
+    """过滤孤立 1~3 帧的极端八度跳变毛刺，保留正常颤音与滑音。"""
+    if os.environ.get("RVC_F0_DEGLITCH", "1") == "0":
+        return f0
+    arr = np.asarray(f0, dtype=np.float64)
+    voiced = np.where(arr > 0)[0]
+    if voiced.size < 9:
+        return f0
+    log_v = 12.0 * np.log2(np.maximum(arr[voiced], 1e-6))
+    med = signal.medfilt(log_v, kernel_size=7)
+    bad = np.abs(log_v - med) > max_jump_semis
+    bad[:3] = False
+    bad[-3:] = False
+    if not np.any(bad):
+        return f0
+    out = arr.copy()
+    out[voiced[bad]] = np.power(2.0, med[bad] / 12.0)
+    return out.astype(np.asarray(f0).dtype, copy=False)
+
+
 def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出音频,rate是2的占比
     # print(data1.max(),data2.max())
     rms1 = librosa.feature.rms(
@@ -122,6 +142,7 @@ class Pipeline(object):
                 threshold=0.006,
             ).squeeze().detach().cpu().numpy()
 
+        f0 = _deglitch_f0(f0)
         try:
             uv = f0 == 0
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])

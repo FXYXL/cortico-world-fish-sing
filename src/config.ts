@@ -34,12 +34,24 @@ export interface FishSingConfigSection {
      * 0 = 完全跟随原唱（轻唱就是轻唱）；1 = 完全用模型自己的音量（轻唱会被唱满）。
      */
     rmsMixRate: number;
-    /** 和声堆叠：同一音色再唱几条叠上去（单轨再干净也薄） */
-    harmony: 'off' | 'third' | 'third+fifth';
+    /** 和声堆叠：double=副歌双轨厚声；double+third=双轨+轻三度；third/third+fifth=移调和声 */
+    harmony: 'off' | 'double' | 'double+third' | 'third' | 'third+fifth';
     /** 和声音量（主轨=1.0 的倍数），0.15~0.30 比较自然 */
     harmonyGain: number;
     /** 和声只叠在唱得响的段落（副歌），免得整段都在叠显得电子味 */
     harmonyScope: 'chorus' | 'all';
+    /** 人声混响：off = 干声直出；light = 轻度空间感，更容易融进伴奏 */
+    reverb?: 'off' | 'light';
+    /** RVC 人声润色（去低噪、轻压齿音、温和压缩与伴奏让位），默认开 */
+    polish?: boolean;
+    /** 音高提取算法：rmvpe（默认，综合最稳） / fcpe（高音气声偶发更稳） */
+    f0Method?: 'rmvpe' | 'fcpe';
+    /** 人声分离档位：htdemucs（快速） / roformer（UVR5 精唱，更干净但首跑更慢） */
+    separator?: 'htdemucs' | 'roformer';
+    /** 分离后额外去混响（依赖 audio-separator，去掉原唱混响减少电音） */
+    dereverb?: boolean;
+    /** 动态主副歌演绎：off / soft-verse-bright-chorus（主歌轻柔、副歌明亮） */
+    dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
     /** full = 带伴奏；vocals = 只要人声 */
     mode: 'full' | 'vocals';
   };
@@ -50,6 +62,8 @@ export interface FishSingConfigSection {
     volume: number;
     /** 她主动唱歌时默认发到哪：local / none（问她） */
     defaultTarget: 'local' | 'none';
+    /** 异步后台准备并开唱（默认开）：点歌后不阻塞聊天，开唱与唱完自动回调通知她 */
+    asyncSing?: boolean;
   };
   send: {
     /** SnowLuma OneBot HTTP，例如 http://127.0.0.1:3002 */
@@ -94,6 +108,8 @@ export interface FishSingConfigSection {
     autoStart: boolean;
     /** 首次调用允许等多久（毫秒），要覆盖模型加载 */
     startTimeoutMs: number;
+    /** 空闲多久后自动卸载 GPU 模型释放显存（分钟）；0 = 常驻不自动卸载，默认 10 */
+    idleUnloadMin?: number;
   };
 }
 
@@ -118,6 +134,12 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     harmony: 'off',
     harmonyGain: 0.22,
     harmonyScope: 'chorus',
+    reverb: 'off',
+    polish: true,
+    f0Method: 'rmvpe',
+    separator: 'htdemucs',
+    dereverb: false,
+    dynamicStyle: 'off',
     mode: 'full',
   },
   play: {
@@ -125,6 +147,7 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     playerPath: '',
     volume: 1,
     defaultTarget: 'local',
+    asyncSing: true,
   },
   send: {
     httpUrl: '',
@@ -144,6 +167,7 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     token: '',
     autoStart: true,
     startTimeoutMs: 240000,
+    idleUnloadMin: 10,
   },
   notify: {
     enabled: true,
@@ -221,10 +245,11 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             type: 'string',
             title: '和声堆叠',
             description:
-              '同一音色再唱几条叠在一起，副歌立刻有"后面有人在唱"的厚度（唱片里的主唱都这么做）。'
-              + 'off = 关；third = 叠一条三度；third+fifth = 三度 + 五度（更满，也更容易显电子味）。'
-              + '注意：每多一条，转换时间就多一倍左右。',
-            enum: ['off', 'third', 'third+fifth'],
+              '给副歌增加厚度与立体声场。off = 关；'
+              + 'double = 副歌双轨厚声（±12 cents 真微失谐，不跑调、无电子味、几乎不增加耗时）；'
+              + 'double+third = 双轨厚声 + 背景轻三度（唱片感最强）；'
+              + 'third = 叠一条三度；third+fifth = 三度 + 五度。',
+            enum: ['off', 'double', 'double+third', 'third', 'third+fifth'],
             'x-hot': true,
           },
           [at('voice.harmonyGain')]: {
@@ -241,6 +266,46 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             description:
               'chorus = 只叠在唱得响的段落（按响度自动判断，推荐）；all = 整首都在叠（容易电子味重）。',
             enum: ['chorus', 'all'],
+            'x-hot': true,
+          },
+          [at('voice.reverb')]: {
+            type: 'string',
+            title: '人声混响',
+            description: 'off = 不加混响；light = 干湿分离自然短房间混响，和伴奏融合更自然且不糊字头（仅带伴奏生效）。',
+            enum: ['off', 'light'],
+            'x-hot': true,
+          },
+          [at('voice.polish')]: {
+            type: 'boolean',
+            title: '人声润色（母带微调）',
+            description: '默认开启：去低频底噪、轻压 6.8kHz 齿音毛刺、补暖与空气感、温和压缩，并让伴奏在 2.5kHz 轻微让人声。',
+            'x-hot': true,
+          },
+          [at('voice.f0Method')]: {
+            type: 'string',
+            title: '音高提取 F0',
+            description: 'rmvpe = 综合最稳（默认，已内置孤立八度毛刺抑制）；fcpe = 极高音或气声重时可切换对比。',
+            enum: ['rmvpe', 'fcpe'],
+            'x-hot': true,
+          },
+          [at('voice.separator')]: {
+            type: 'string',
+            title: '人声分离档位',
+            description: 'htdemucs = 快速档（默认，约 15 秒）；roformer = UVR5 精唱档（干声更干净、电音更少，首跑约 40~60 秒，有缓存后续 0 秒复用；未装 audio-separator 自动回落 htdemucs）。',
+            enum: ['htdemucs', 'roformer'],
+            'x-hot': true,
+          },
+          [at('voice.dereverb')]: {
+            type: 'boolean',
+            title: '分离后去混响（De-Reverb）',
+            description: '开启后在分离人声后再做一次去混响，可减少原唱自带混响引起的电音发糊（需 audio-separator，首跑多耗时约 10~20 秒）。',
+            'x-hot': true,
+          },
+          [at('voice.dynamicStyle')]: {
+            type: 'string',
+            title: '主副歌动态演绎',
+            description: 'off = 整首统一音色；soft-verse-bright-chorus = 自动识别副歌并在静音边界分段，主歌更轻柔克制、副歌更明亮饱满。',
+            enum: ['off', 'soft-verse-bright-chorus'],
             'x-hot': true,
           },
           [at('voice.mode')]: {
@@ -317,6 +382,12 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             title: '她主动唱时发到哪',
             description: 'local=只在本机放；none=不自动发，等她判断要不要发群/私聊。',
             enum: ['local', 'none'],
+            'x-hot': true,
+          },
+          [at('play.asyncSing')]: {
+            type: 'boolean',
+            title: '异步后台唱播（推荐）',
+            description: '开启后点歌不阻塞聊天：后台准备完自动开唱，并在开唱与自然唱完时回调通知她（支持唱中插话、随时打断和局部返工）。',
             'x-hot': true,
           },
           [at('play.volume')]: {
@@ -460,6 +531,14 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             description: '要盖住模型加载时间，默认 240000（4 分钟）。',
             minimum: 30000,
             maximum: 900000,
+            'x-hot': false,
+          },
+          [at('worker.idleUnloadMin')]: {
+            type: 'number',
+            title: '空闲自动释放显存（分钟）',
+            description: '空闲超过该时长自动卸载 GPU 模型归还约 1.5~2GB 显存（8G 显卡推荐默认 10）；填 0 表示常驻不卸载。下次点歌约 4~5 秒自动拉回。',
+            minimum: 0,
+            maximum: 240,
             'x-hot': false,
           },
         },

@@ -18,12 +18,14 @@ import type { ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/typ
 import { FISHSING_ID, fishsingConfigGroups, type FishSingConfigSection } from './config.ts';
 import {
   BAND_LABEL,
+  DROP_LABEL,
   datasetDirName,
   findActiveExperiment,
   f0Histogram,
   listDatasets,
   listExperiments,
   readDatasetState,
+  readEvaluationPaths,
   readManifest,
   checkpointStats,
   planPruneCheckpoints,
@@ -32,7 +34,9 @@ import {
   logAgeSec,
   readTrainState,
   readWeights,
+  saveEvaluationPaths,
   saveWeights,
+  sourceQualityReport,
   suggestTrainParams,
   scanSources,
   summarize,
@@ -57,20 +61,34 @@ import {
 import { BUNDLED_SEPARATE, LEGACY_RVC_ROOTS, MODELS_MANIFEST, PKG_ROOT, resolvePaths, VENDORED_RVC, type WorkerPaths } from './paths.ts';
 import {
   copyRvcCode,
+  detectOptionalDeps,
   downloadModels,
   resolveSystemPython,
   inspect,
   installRuntime,
+  installUvrDeps,
   loadManifest,
   probeRuntime,
   type RuntimeMode,
   type SetupStatus,
   missingRequiredCount,
 } from './setup.ts';
-import { duration, toMp3, type FfmpegDeps } from './audio.ts';
+import { duration, split, toMp3, type FfmpegDeps } from './audio.ts';
+import { rankHits, searchBili, type SearchOrder } from './bili.ts';
 import { parseTarget, Player, sendRecord } from './deliver.ts';
-import { addToLibrary, dropFromLibrary, listLibrary, loadLibrary, pruneCache, renameInLibrary, type LibraryOptions } from './library.ts';
-import { singSong, type SingDeps } from './sing.ts';
+import {
+  addToLibrary,
+  dropFromLibrary,
+  listLibrary,
+  loadLibrary,
+  loadSession,
+  pruneCache,
+  renameInLibrary,
+  saveSession,
+  type LibraryOptions,
+} from './library.ts';
+import { fmtTime, formatLyricsTable, resolveLyrics, type LyricsSheet } from './lyrics.ts';
+import { patchSong, singSong, type PlaybackEndInfo, type SingDeps, type SingSegmentSpec } from './sing.ts';
 import { notify } from './notify.ts';
 import { WorkerClient } from './worker.ts';
 
@@ -107,7 +125,7 @@ export class FishSingWorld implements World {
    * 不做队列：装运行时和唱一首歌抢同一张卡，同时来两个只会互相拖死。
    */
   private setupJob: {
-    kind: 'models' | 'runtime';
+    kind: 'models' | 'runtime' | 'uvr';
     state: 'running' | 'done' | 'error';
     pct: number;
     msg: string;
@@ -191,6 +209,8 @@ export class FishSingWorld implements World {
         workDir: join(opts.dataDir, 'work'),
         model: this.current.model,
         index: this.current.index,
+        idleUnloadSec: Math.max(0, Math.round(Number(cfg.worker?.idleUnloadMin ?? 10) * 60)),
+        uvrModelDir: join(this.routes.runtimeRoot, 'uvr_models'),
       },
       {
         info: (m: string) => this.host?.log.info(m),
@@ -211,17 +231,28 @@ export class FishSingWorld implements World {
       const cur = await this.worker.currentJob().catch(() => null);
       if (cur && cur.kind === 'train' && cur.state !== 'done' && cur.state !== 'error'
           && cur.state !== 'canceled') {
-        this.trainJob = {
+        const saved = readTrainState(this.opts.dataDir);
+        const exp = cur.exp || this.lastExp;
+        const epochs = cur.epochs || (saved.exp === exp ? saved.epochs : 0);
+        const job = {
           id: cur.id,
-          state: 'running',
+          state: 'running' as const,
           pct: Math.round((cur.progress ?? 0) * 100),
           msg: cur.message || '训练中',
-          exp: cur.exp || this.lastExp,
-          epochs: cur.epochs || 0,
-          startedAt: Date.now(),
+          exp,
+          epochs,
+          startedAt: saved.exp === exp && saved.startedAt ? saved.startedAt : Date.now(),
         };
+        this.trainJob = job;
         this.ownedJob = 'train';
-        host.log.info(`[fish-sing] 接管正在进行的训练：${this.trainJob.exp}（${this.trainJob.pct}%）`);
+        host.log.info(`[fish-sing] 接管正在进行的训练：${job.exp}（${job.pct}%）`);
+        // 重新挂上等待监听，确保重启后训练完成仍能正常落状态、发通知与执行收尾
+        this.attachTrainWait(job, {
+          pruneAfter: saved.exp === exp ? saved.pruneAfter === true : false,
+          abTest: saved.exp === exp ? saved.abTest === true : false,
+          keepEvery: saved.exp === exp ? saved.keepEvery : undefined,
+          evaluationPaths: saved.exp === exp ? saved.evaluationPaths : undefined,
+        });
       }
     }
 
@@ -388,10 +419,20 @@ export class FishSingWorld implements World {
     );
     const outputs = ((job.result?.outputs ?? []) as { label: string; file: string }[])
       .filter((o) => existsSync(o.file));
+    const compares = ((job.result?.compares ?? []) as { band: string; labels: string[]; file: string }[])
+      .filter((c) => existsSync(c.file));
     if (!outputs.length) throw new Error('选模任务未生成试听文件');
     const labels: string[] = [];
     const obTarget = parseTarget(String(this.opts.cfg.notify?.qqTarget ?? ''));
     const onebot = { httpUrl: String(this.opts.cfg.send?.httpUrl ?? ''), token: this.onebotToken() };
+    const canSendQQ = Boolean(obTarget && onebot.httpUrl);
+    if (!canSendQQ) {
+      // 缺配置只提示一次，避免循环里连刷多条告警
+      this.host?.log.warn(
+        `[fish-sing] 选模片段没发 QQ：${!obTarget ? 'qqTarget 没配或格式不对（要 group:/private: 前缀）' : 'OneBot HTTP 地址没配'}`,
+      );
+    }
+    const bandZh: Record<string, string> = { low: '低音', mid: '中音', high: '高音' };
     for (const o of outputs) {
       const mp3 = join(outDir, `${o.label}.mp3`);
       await toMp3(o.file, mp3, this.ffmpeg(), '192k');
@@ -406,23 +447,41 @@ export class FishSingWorld implements World {
         params: { model: o.label, index: '', indexRate: 0, protect: 0.33, pitch: 0, mode: 'vocals' },
         target: '',
       }, mp3);
-      if (obTarget && onebot.httpUrl) {
+      // 没有串联轨时才逐条发单段，避免 QQ 一次刷 9 条语音
+      if (canSendQQ && obTarget && !compares.length) {
         try {
           await sendRecord(onebot, obTarget, mp3);
         } catch (e) {
           this.host?.log.warn(`[fish-sing] 选模片段发 QQ 失败：${e instanceof Error ? e.message : String(e)}`);
         }
-      } else {
-        // 别静默：用户会以为"QQ 渠道坏了"，实际是配置缺一半
-        this.host?.log.warn(
-          `[fish-sing] 选模片段没发 QQ：${!obTarget ? 'qqTarget 没配或格式不对（要 group:/private: 前缀）' : 'OneBot HTTP 地址没配'}`,
-        );
+      }
+    }
+    for (const c of compares) {
+      const mp3 = join(outDir, `compare_${c.band}.mp3`);
+      await toMp3(c.file, mp3, this.ffmpeg(), '192k');
+      const seq = c.labels.join(' → ');
+      addToLibrary(this.data(), {
+        id: `ab-${exp}-cmp-${c.band}`,
+        title: `${exp} 选模串联·${bandZh[c.band] ?? c.band}（${seq}）`,
+        source: 'ab-test-compare', bvid: '',
+        file: mp3,
+        durationSec: await duration(mp3, this.ffmpeg()).catch(() => 0),
+        at: Date.now(),
+        params: { model: seq, index: '', indexRate: 0, protect: 0.33, pitch: 0, mode: 'vocals' },
+        target: '',
+      }, mp3);
+      if (canSendQQ && obTarget) {
+        try {
+          await sendRecord(onebot, obTarget, mp3);
+        } catch (e) {
+          this.host?.log.warn(`[fish-sing] 选模串联轨发 QQ 失败：${e instanceof Error ? e.message : String(e)}`);
+        }
       }
     }
     this.host?.log.info(`[fish-sing] 选模对比已生成：${labels.join(' / ')}（${outDir}）`);
     void this.notifyEvent(
       `选模试听已生成：${exp}`,
-      `独立低、中、高音干声（关闭检索），用 ${labels.join('、')} 对比。在作品库里试听（fish_sing_library）${obTarget ? '，QQ 那边也各发了一条' : ''}。`,
+      `独立低、中、高音干声（关闭检索），用 ${labels.join('、')} 对比${compares.length ? `，并已合成 ${compares.length} 条串联对比轨` : ''}。在作品库里试听（fish_sing_library）${canSendQQ ? '，QQ 那边也已发送' : ''}。`,
     );
     return labels.join(' / ');
   }
@@ -457,13 +516,48 @@ export class FishSingWorld implements World {
         protect: Number(cfg.voice?.protect ?? 0.33),
         pitch: (cfg.voice?.pitch as number | 'auto' | undefined) ?? 'auto',
         rmsMixRate: cfg.voice?.rmsMixRate === undefined ? 0 : Number(cfg.voice.rmsMixRate),
-        harmony: (cfg.voice?.harmony === 'third' || cfg.voice?.harmony === 'third+fifth'
-          ? cfg.voice.harmony : 'off') as 'off' | 'third' | 'third+fifth',
+        harmony: (cfg.voice?.harmony === 'double' || cfg.voice?.harmony === 'double+third'
+          || cfg.voice?.harmony === 'third' || cfg.voice?.harmony === 'third+fifth'
+          ? cfg.voice.harmony : 'off') as 'off' | 'double' | 'double+third' | 'third' | 'third+fifth',
         harmonyGain: cfg.voice?.harmonyGain === undefined ? 0.22 : Number(cfg.voice.harmonyGain),
         harmonyScope: cfg.voice?.harmonyScope === 'all' ? 'all' : 'chorus',
+        reverb: cfg.voice?.reverb === 'light' ? 'light' : 'off',
+        polish: cfg.voice?.polish !== false,
+        f0Method: cfg.voice?.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe',
+        separator: cfg.voice?.separator === 'roformer' ? 'roformer' : 'htdemucs',
+        dereverb: cfg.voice?.dereverb === true,
+        dynamicStyle: cfg.voice?.dynamicStyle === 'soft-verse-bright-chorus' ? 'soft-verse-bright-chorus' : 'off',
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
+      onPlaybackEnd: (ev: PlaybackEndInfo) => {
+        if (ev.reason !== 'ended') return;
+        const issueHint = ev.report?.issues?.length
+          ? `（声学体检留意：${ev.report.issues[0].note}，如想重唱某句可调 fish_sing_patch）`
+          : '';
+        void this.pushSingEvent(
+          'fishsing.ended',
+          `《${ev.title}》刚刚自然唱完了（${fmtTime(ev.durationSec)}）${issueHint}。可以顺着气氛自然接话，问问要不要再来一首或重唱哪一句。`,
+          { id: ev.id, title: ev.title, durationSec: ev.durationSec, report: ev.report },
+        );
+      },
     };
+  }
+
+  private async pushSingEvent(type: string, text: string, meta?: Record<string, unknown>): Promise<void> {
+    if (!this.host?.pushEvent) return;
+    try {
+      await this.host.pushEvent({
+        type,
+        origin: 'internal',
+        source: FISHSING_ID,
+        senderKey: `${FISHSING_ID}:${type}`,
+        ts: new Date().toISOString(),
+        text,
+        meta,
+      });
+    } catch (e) {
+      this.host?.log.warn(`[fish-sing] 推送事件 ${type} 失败：${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // ------------------------------------------------------------ 环境提示词
@@ -483,8 +577,12 @@ export class FishSingWorld implements World {
       : cfg.play?.defaultTarget === 'both'
         ? '本机 + QQ 都发'
         : '本机（不打扰群里）';
+    const elapsedSec = this.lastSong
+      ? Math.max(0, Math.round((Date.now() - this.lastSong.at) / 1000))
+      : 0;
+    const ago = elapsedSec >= 60 ? `${Math.round(elapsedSec / 60)} 分钟前` : `${elapsedSec} 秒前`;
     const last = this.lastSong
-      ? `上一次唱的是《${this.lastSong.title}》（${Math.round(this.lastSong.duration)} 秒前）`
+      ? `上一次唱的是《${this.lastSong.title}》（${ago}）`
       : '还没唱过';
     // 装机状态：让她一眼知道现在能不能唱，而不是调了工具才发现缺权重
     const st = inspect(this.routes);
@@ -556,6 +654,45 @@ export class FishSingWorld implements World {
             enum: ['default', 'click', 'pubdate'],
             description: 'B 站排序：default 综合 / click 播放多 / pubdate 最新',
           },
+          f0Method: {
+            type: 'string',
+            enum: ['rmvpe', 'fcpe'],
+            description: '音高提取算法：rmvpe（默认）或 fcpe（高音气声偶发更稳）',
+          },
+          separator: {
+            type: 'string',
+            enum: ['htdemucs', 'roformer'],
+            description: '人声分离档位：htdemucs（快速）或 roformer（UVR5 精唱，更干净）',
+          },
+          dereverb: {
+            type: 'boolean',
+            description: '分离后是否额外去混响（减少原唱混响导致的电音）',
+          },
+          dynamicStyle: {
+            type: 'string',
+            enum: ['off', 'soft-verse-bright-chorus'],
+            description: '主副歌动态演绎：soft-verse-bright-chorus = 自动主歌轻柔、副歌明亮',
+          },
+          segments: {
+            type: 'array',
+            description: '显式分段换音色/换参数：每项 {start, end, model?, indexRate?, protect?, pitch?}',
+            items: {
+              type: 'object',
+              properties: {
+                start: { type: 'number' },
+                end: { type: 'number' },
+                model: { type: 'string' },
+                indexRate: { type: 'number' },
+                protect: { type: 'number' },
+                pitch: { type: 'number' },
+              },
+              required: ['start', 'end'],
+            },
+          },
+          async: {
+            type: 'boolean',
+            description: '是否异步后台准备并自动开唱（默认按配置开启；开唱和自然播完时会通过事件通知你）',
+          },
         },
         required: ['song'],
       },
@@ -565,25 +702,67 @@ export class FishSingWorld implements World {
           return '正在训练模型（显存被占着），这会儿唱不了。训练完再唱，或者在控制台「训练」页停掉训练。';
         }
         if (this.busy) return '上一首还在处理中（同一时刻只能处理一首，显卡就一张）。等她唱完再说，或者先 fish_sing_stop 停掉。';
+
+        const req = {
+          song: String(args.song ?? ''),
+          to: args.to === undefined ? undefined : String(args.to),
+          mode: args.mode === 'vocals' ? ('vocals' as const) : args.mode === 'full' ? ('full' as const) : undefined,
+          pitch: args.pitch === undefined ? undefined
+            : String(args.pitch).toLowerCase() === 'auto' ? ('auto' as const) : Number(args.pitch),
+          indexRate: args.indexRate === undefined ? undefined : Number(args.indexRate),
+          protect: args.protect === undefined ? undefined : Number(args.protect),
+          rmsMixRate: args.rmsMixRate === undefined ? undefined : Number(args.rmsMixRate),
+          harmony: args.harmony === 'double' || args.harmony === 'double+third'
+            || args.harmony === 'third' || args.harmony === 'third+fifth' || args.harmony === 'off'
+            ? (args.harmony as 'off' | 'double' | 'double+third' | 'third' | 'third+fifth') : undefined,
+          reverb: args.reverb === 'light' || args.reverb === 'off' ? (args.reverb as 'off' | 'light') : undefined,
+          polish: typeof args.polish === 'boolean' ? args.polish : undefined,
+          f0Method: args.f0Method === 'fcpe' || args.f0Method === 'rmvpe' ? (args.f0Method as 'rmvpe' | 'fcpe') : undefined,
+          separator: args.separator === 'roformer' || args.separator === 'htdemucs' ? (args.separator as 'htdemucs' | 'roformer') : undefined,
+          dereverb: typeof args.dereverb === 'boolean' ? args.dereverb : undefined,
+          dynamicStyle: args.dynamicStyle === 'soft-verse-bright-chorus' || args.dynamicStyle === 'off'
+            ? (args.dynamicStyle as 'off' | 'soft-verse-bright-chorus') : undefined,
+          segments: Array.isArray(args.segments) ? (args.segments as SingSegmentSpec[]) : undefined,
+          start: args.start === undefined ? undefined : Number(args.start),
+          duration: args.duration === undefined ? undefined : Number(args.duration),
+          refresh: args.refresh === true,
+          search: args.search === true,
+          pick: args.pick === undefined ? undefined : String(args.pick),
+          order: args.order === 'click' || args.order === 'pubdate' ? (args.order as 'click' | 'pubdate') : ('default' as const),
+        };
+
+        const wantAsync = req.search !== true && (
+          typeof args.async === 'boolean' ? args.async : cfg.play?.asyncSing !== false
+        );
+
         this.busy = true;
         this.ownedJob = 'song';
+
+        if (wantAsync) {
+          void (async () => {
+            try {
+              const r = await singSong(req, this.deps());
+              if (r.ok && r.detail) {
+                this.lastSong = {
+                  title: String(r.detail.title ?? ''),
+                  at: Date.now(),
+                  duration: Number(r.detail.duration ?? 0),
+                };
+                await this.pushSingEvent('fishsing.started', r.message, r.detail);
+              } else {
+                await this.pushSingEvent('fishsing.error', r.message);
+              }
+            } catch (e) {
+              await this.pushSingEvent('fishsing.error', `没唱成：${e instanceof Error ? e.message : String(e)}`);
+            } finally {
+              this.busy = false;
+            }
+          })();
+          return `已开始后台准备「${req.song}」，分离换声完成后会自动开唱并通知你（期间可以正常聊天，想停随时调用 fish_sing_stop）。`;
+        }
+
         try {
-          const r = await singSong({
-            song: String(args.song ?? ''),
-            to: args.to === undefined ? undefined : String(args.to),
-            mode: args.mode === 'vocals' ? 'vocals' : args.mode === 'full' ? 'full' : undefined,
-            pitch: args.pitch === undefined ? undefined
-              : String(args.pitch).toLowerCase() === 'auto' ? 'auto' : Number(args.pitch),
-            indexRate: args.indexRate === undefined ? undefined : Number(args.indexRate),
-            protect: args.protect === undefined ? undefined : Number(args.protect),
-            rmsMixRate: args.rmsMixRate === undefined ? undefined : Number(args.rmsMixRate),
-            start: args.start === undefined ? undefined : Number(args.start),
-            duration: args.duration === undefined ? undefined : Number(args.duration),
-            refresh: args.refresh === true,
-            search: args.search === true,
-            pick: args.pick === undefined ? undefined : String(args.pick),
-            order: args.order === 'click' || args.order === 'pubdate' ? args.order : 'default',
-          }, this.deps());
+          const r = await singSong(req, this.deps());
           if (r.ok && r.detail) {
             this.lastSong = {
               title: String(r.detail.title ?? ''),
@@ -595,6 +774,132 @@ export class FishSingWorld implements World {
         } finally {
           this.busy = false;
         }
+      },
+    });
+
+    list.push({
+      name: 'fish_sing_patch',
+      description: [
+        '局部返工重唱 / 补录：不重跑整首，复用刚唱过那首歌的分离干声与换声干声，只针对某一句、某段副歌或某几秒换参数或换模型重唱一遍，并自动吸附静音边界无缝贴回原位。',
+        '支持按句号（lines="7" 或 "7-9"）、歌词关键词（lyric）、section="chorus"、当前正在唱的那一句（atCurrent=true）或起止秒（start/end）定位。',
+      ].join(' '),
+      tags: ['music', 'voice'],
+      parameters: {
+        type: 'object',
+        properties: {
+          lines: { type: 'string', description: '按歌词句号定位，如 "7" 或 "7-9"（先用 fish_sing_lyrics 看句号）' },
+          lyric: { type: 'string', description: '按歌词关键词模糊匹配定位对应句子' },
+          section: { type: 'string', enum: ['chorus'], description: '直接返工副歌段' },
+          chorusIndex: { type: 'number', description: '第几段副歌（从 1 开始，配合 section="chorus"）' },
+          atCurrent: { type: 'boolean', description: 'true = 自动取本机当前正唱到的那一句' },
+          start: { type: 'number', description: '起始秒（秒数直定位）' },
+          end: { type: 'number', description: '结束秒（秒数直定位）' },
+          pitch: { type: 'number', description: '该句新移调半音数（不填沿用原曲）' },
+          indexRate: { type: 'number', description: '该句新检索强度 0~1' },
+          protect: { type: 'number', description: '该句新气声保护 0~0.5' },
+          rmsMixRate: { type: 'number', description: '该句新音量跟随 0~1' },
+          f0Method: { type: 'string', enum: ['rmvpe', 'fcpe'], description: '该句临时切换 F0 算法' },
+          model: { type: 'string', description: '临时换另一个音色模型来唱这一句（如 dfy2.pth）' },
+          previewOnly: { type: 'boolean', description: 'true = 只试听返工句（前后带 2 秒上下文），不改整首；false = 贴回整首并重放' },
+          to: { type: 'string', description: '投递目标，默认 local' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        if (cfg.enabled === false) return '唱歌功能被关掉了。';
+        if (this.trainJob?.state === 'running') return '正在训练模型（显存被占着），先等训练结束。';
+        if (this.busy) return '上一首或上一次返工还在处理中，稍等几秒。';
+        this.busy = true;
+        this.ownedJob = 'song';
+        try {
+          const r = await patchSong({
+            lines: args.lines === undefined ? undefined : String(args.lines),
+            lyric: args.lyric === undefined ? undefined : String(args.lyric),
+            section: args.section === 'chorus' ? 'chorus' : undefined,
+            chorusIndex: args.chorusIndex === undefined ? undefined : Number(args.chorusIndex),
+            atCurrent: args.atCurrent === true,
+            start: args.start === undefined ? undefined : Number(args.start),
+            end: args.end === undefined ? undefined : Number(args.end),
+            pitch: args.pitch === undefined ? undefined : Number(args.pitch),
+            indexRate: args.indexRate === undefined ? undefined : Number(args.indexRate),
+            protect: args.protect === undefined ? undefined : Number(args.protect),
+            rmsMixRate: args.rmsMixRate === undefined ? undefined : Number(args.rmsMixRate),
+            f0Method: args.f0Method === 'fcpe' || args.f0Method === 'rmvpe' ? args.f0Method : undefined,
+            model: args.model === undefined ? undefined : String(args.model),
+            previewOnly: args.previewOnly === true,
+            to: args.to === undefined ? undefined : String(args.to),
+          }, this.deps());
+          return r.message;
+        } finally {
+          this.busy = false;
+        }
+      },
+    });
+
+    list.push({
+      name: 'fish_sing_lyrics',
+      description: '查看当前或最近一首歌的时间轴歌词表（句号、起止秒、主/副歌标签）、当前播到第几句，以及声学体检明细。唱中插话、按句返工或顺着歌词情绪接话时调用。',
+      tags: ['music'],
+      parameters: {
+        type: 'object',
+        properties: {
+          fromLine: { type: 'number', description: '从第几句开始显示，默认 1' },
+          limit: { type: 'number', description: '最多返回几句，默认 45' },
+          refresh: { type: 'boolean', description: '强制重新联网匹配歌词并更新会话缓存' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        const snap = loadSession(this.data());
+        if (!snap) return '还没有最近唱过歌的记录。';
+        const needRetryLang = Boolean(
+          /[\u4e00-\u9fff]/.test(snap.title)
+          && snap.lyrics?.lines?.length
+          && snap.lyrics.source !== 'phrases'
+          && !/[\u4e00-\u9fff]/.test(snap.lyrics.lines.map((l) => l.text).join('')),
+        );
+        if (args.refresh === true || needRetryLang) {
+          const fresh = await resolveLyrics({
+            title: snap.title,
+            bvid: snap.bvid || undefined,
+            fullDurationSec: snap.durationSec,
+            cutStart: snap.cutStart,
+            cutDuration: snap.cutDuration,
+            phrases: snap.report?.phrases,
+            chorusRanges: snap.report?.chorusRanges,
+          }).catch(() => undefined);
+          if (fresh) {
+            snap.lyrics = fresh;
+            try {
+              saveSession(this.data(), snap);
+            } catch {
+              /* 忽略 */
+            }
+          }
+        }
+        const pb = this.player.playbackState();
+        const head: string[] = [`《${snap.title}》（${fmtTime(snap.durationSec)}）`];
+        if (pb.playing) {
+          const curTxt = pb.currentLine
+            ? `，正唱到第 ${pb.currentLine.index} 句「${pb.currentLine.text}」`
+            : '';
+          head.push(`当前播放进度：${fmtTime(pb.elapsedSec)} / ${fmtTime(pb.durationSec || snap.durationSec)}${curTxt}`);
+        }
+        if (snap.report?.summary) {
+          head.push(`声学体检：${snap.report.summary}`);
+          if (snap.report.issues?.length) {
+            head.push('风险时间段：\n' + snap.report.issues.map((it) => `  - ${it.note}`).join('\n'));
+          }
+        }
+        if (snap.lyrics?.lines?.length) {
+          head.push(formatLyricsTable(snap.lyrics as LyricsSheet, {
+            fromLine: args.fromLine === undefined ? 1 : Number(args.fromLine),
+            limit: args.limit === undefined ? 45 : Number(args.limit),
+          }));
+        } else {
+          head.push('（暂无歌词时间轴）');
+        }
+        return head.join('\n');
       },
     });
 
@@ -613,13 +918,14 @@ export class FishSingWorld implements World {
 
     list.push({
       name: 'fish_sing_library',
-      description: '她唱过的歌都在这里：列出、回放、删除。用户问「你都唱过什么」「再放一遍刚才那首」时用。',
+      description: '她唱过的歌都在这里：列出、回放、发到 QQ、删除。用户问「你都唱过什么」「再放一遍刚才那首」「把那首发到群里」时用。',
       tags: ['music'],
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'play', 'delete'], description: '默认 list' },
-          query: { type: 'string', description: 'play/delete 时按标题模糊匹配' },
+          action: { type: 'string', enum: ['list', 'play', 'send', 'delete'], description: '默认 list' },
+          query: { type: 'string', description: 'play/send/delete 时按标题模糊匹配' },
+          to: { type: 'string', description: '发到 QQ 的目标：group:<群号> 或 private:<QQ号>（配合 send 或 play 使用）' },
           limit: { type: 'number', description: 'list 时最多列几条，默认 10' },
         },
         required: [],
@@ -640,13 +946,41 @@ export class FishSingWorld implements World {
           return hit ? `删掉了《${hit.title}》。` : `作品库里没有「${q}」。`;
         }
         const rows = listLibrary(this.data(), 500);
-        const hit = rows.find((r) => r.title.toLowerCase().includes(q.toLowerCase()));
+        const hit = rows.find((r) => r.id === q || r.title.toLowerCase().includes(q.toLowerCase()));
         if (!hit) return `作品库里没有「${q}」。`;
         if (!existsSync(hit.file)) return `《${hit.title}》的文件不见了（可能被清过缓存）。`;
+        const toRaw = String(args.to ?? '').trim();
+        if (action === 'send' || toRaw) {
+          const target = toRaw || String(this.opts.cfg.notify?.qqTarget ?? '').trim();
+          const sent = await this.sendFileToQQ(hit.file, hit.title, target);
+          if (action === 'send') return sent;
+          this.player.play(hit.file, {
+            dir: this.ffmpeg().dir,
+            playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
+            volume: Number(this.opts.cfg.play?.volume ?? 1),
+            log: (m: string) => this.host?.log.warn(m),
+          });
+          return `放《${hit.title}》，并${sent}`;
+        }
+        const snap = loadSession(this.data(), hit.id);
         this.player.play(hit.file, {
           dir: this.ffmpeg().dir,
           playerPath: String(this.opts.cfg.play?.playerPath ?? ''),
           volume: Number(this.opts.cfg.play?.volume ?? 1),
+          meta: {
+            id: hit.id,
+            title: hit.title,
+            durationSec: hit.durationSec,
+            lyrics: snap?.lyrics as LyricsSheet | undefined,
+          },
+          onEnd: (reason, elapsedSec) => {
+            if (reason !== 'ended') return;
+            void this.pushSingEvent(
+              'fishsing.ended',
+              `《${hit.title}》刚刚自然唱完了（${fmtTime(hit.durationSec)}）。可以自然接话问问要不要再来一首。`,
+              { id: hit.id, title: hit.title, durationSec: hit.durationSec, elapsedSec },
+            );
+          },
           log: (m: string) => this.host?.log.warn(m),
         });
         return `放《${hit.title}》。`;
@@ -662,7 +996,15 @@ export class FishSingWorld implements World {
         const h = await this.worker.health(2000);
         if (!h?.engine) return 'worker 没在跑（下次唱歌会自动拉起来）。';
         const cur = h.current ? `正在：${h.current.message}（${Math.round(h.current.progress * 100)}%）；` : '当前空闲；';
-        return `模型 ${h.engine.model}${h.engine.index ? ` + 索引 ${h.engine.index}` : '（无索引）'}，采样率 ${h.engine.samplerate}；${cur}队列 ${h.queue ?? 0} 个。${this.player.playing ? '本机正在放歌。' : ''}`;
+        const gpuState = h.engine.ready ? '已预热在显存' : '已休眠省显存（下次点歌自动加载）';
+        const extras: string[] = [];
+        if (h.engine.uvrAvailable) extras.push('UVR5精唱可用');
+        if (h.engine.fcpeAvailable) extras.push('FCPE可用');
+        const pb = this.player.playbackState();
+        const playNote = pb.playing
+          ? `本机正在放《${pb.title || '歌曲'}》（${fmtTime(pb.elapsedSec)}/${fmtTime(pb.durationSec)}${pb.currentLine ? `，第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : ''}）。`
+          : '';
+        return `模型 ${h.engine.model}${h.engine.index ? ` + 索引 ${h.engine.index}` : '（无索引）'}（${gpuState}），采样率 ${h.engine.samplerate}${extras.length ? `，${extras.join('/')}` : ''}；${cur}队列 ${h.queue ?? 0} 个。${playNote}`;
       },
     });
 
@@ -671,12 +1013,39 @@ export class FishSingWorld implements World {
 
   // ------------------------------------------------------------ 控制台
 
+  /** 把已有音频切条发送到 QQ 群或私聊（工具与作品库面板共用）。 */
+  private async sendFileToQQ(file: string, title: string, rawTarget: string): Promise<string> {
+    const httpUrl = String(this.opts.cfg.send?.httpUrl ?? '').trim();
+    if (!httpUrl) throw new Error('没配 OneBot HTTP 地址（配置 → 播放与发送）');
+    const target = parseTarget(rawTarget);
+    if (!target) throw new Error('QQ 目标格式不对：请写 group:<群号> 或 private:<QQ号>（或裸 QQ 号）');
+    const tmpSegDir = join(this.opts.dataDir, 'tmp', `qqsend-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+    try {
+      const maxSeg = Math.max(10, Number(this.opts.cfg.send?.maxSegmentSec ?? 55));
+      const gapMs = Math.max(0, Number(this.opts.cfg.send?.gapMs ?? 1500));
+      const segs = await split(file, tmpSegDir, maxSeg, this.ffmpeg());
+      const onebot = { httpUrl, token: this.onebotToken() };
+      for (let i = 0; i < segs.length; i += 1) {
+        if (i > 0 && gapMs > 0) await new Promise((r) => setTimeout(r, gapMs));
+        await sendRecord(onebot, target, segs[i]);
+      }
+      return `已将《${title}》发到${target.label}${segs.length > 1 ? `（${segs.length} 条）` : ''}`;
+    } finally {
+      try {
+        rmSync(tmpSegDir, { recursive: true, force: true });
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+
   /**
    * 作品库面板的数据面。方法名与 `dist/webui.js` 里的调用一一对应。
    * 面板走的是「服务端渲染数据 + 前端只管展示」，所以这里只返回纯 JSON。
    */
   private async panelInvoke(panel: string, method: string, args: unknown[]): Promise<unknown> {
     if (panel === 'setup') return this.setupInvoke(method, args);
+    if (panel === 'sing') return this.singInvoke(method, args);
     if (panel === 'models') return this.modelInvoke(method, args);
     if (panel === 'train') return this.trainInvoke(method, args);
     if (panel !== 'library') throw new Error(`未知面板：${panel}`);
@@ -699,9 +1068,11 @@ export class FishSingWorld implements World {
           at: r.at,
           sizeMb,
           bvid: r.bvid,
+          source: r.source,
           target: r.target,
           pitch: r.params?.pitch ?? 0,
           mode: r.params?.mode ?? 'full',
+          model: String(r.params?.model ?? ''),
           indexRate: r.params?.indexRate ?? 0,
           missing: sizeMb === 0,
         };
@@ -712,6 +1083,9 @@ export class FishSingWorld implements World {
         dir,
         totalMb: Math.round(rows.reduce((n, r) => n + r.sizeMb, 0) * 10) / 10,
         playingEnabled: this.opts.cfg.play?.enabled !== false,
+        qqEnabled: Boolean(String(this.opts.cfg.send?.httpUrl ?? '').trim()),
+        defaultQqTarget: String(this.opts.cfg.notify?.qqTarget ?? '').trim(),
+        currentModel: this.current.model,
       };
     }
 
@@ -749,6 +1123,233 @@ export class FishSingWorld implements World {
       const dir = join(this.opts.dataDir, 'library');
       spawn('explorer', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
       return { text: `已在资源管理器打开：${dir}` };
+    }
+
+    if (method === 'send') {
+      const rows = loadLibrary(this.data());
+      const hit = rows.find((r) => r.id === a0) ?? rows.find((r) => r.title.includes(a0));
+      if (!hit) throw new Error('作品库里没有这一首');
+      if (!existsSync(hit.file)) throw new Error('文件不见了（可能被清理过）');
+      const target = a1.trim() || String(this.opts.cfg.notify?.qqTarget ?? '').trim();
+      const text = await this.sendFileToQQ(hit.file, hit.title, target);
+      return { text };
+    }
+
+    if (method === 'resing') {
+      if (this.trainJob?.state === 'running') throw new Error('正在训练模型，等训练完再重唱');
+      if (this.busy) throw new Error('上一首还在处理中，稍等一下');
+      const rows = loadLibrary(this.data());
+      const hit = rows.find((r) => r.id === a0);
+      if (!hit) throw new Error('作品库里没有这一首');
+      const src = hit.bvid || (hit.source && existsSync(hit.source) ? hit.source : '');
+      if (!src) throw new Error('这条作品没有记录 BV 号或可用的本机源文件，无法直接重唱');
+      this.busy = true;
+      this.ownedJob = 'song';
+      try {
+        const r = await singSong({
+          song: src,
+          mode: hit.params?.mode === 'vocals' ? 'vocals' : 'full',
+          pitch: hit.params?.pitch ?? 'auto',
+          to: 'local',
+          refresh: true,
+        }, this.deps());
+        if (!r.ok) throw new Error(r.message);
+        if (r.detail) {
+          this.lastSong = {
+            title: String(r.detail.title ?? hit.title),
+            at: Date.now(),
+            duration: Number(r.detail.duration ?? 0),
+          };
+        }
+        return { text: `已用当前模型 ${this.current.model} 重唱：${r.message}` };
+      } finally {
+        this.busy = false;
+      }
+    }
+
+    throw new Error(`未知方法：${method}`);
+  }
+
+  /** 正式「试唱 / 点歌」面板数据面：搜歌、调参试唱、进度轮询、歌词体检与局部返工。 */
+  private async singInvoke(method: string, args: unknown[]): Promise<unknown> {
+    if (method === 'status') {
+      const h = await this.worker.health(2000);
+      const pb = this.player.playbackState();
+      const snap = loadSession(this.data());
+      const v = this.opts.cfg.voice;
+      return {
+        busy: this.busy,
+        training: this.trainJob?.state === 'running',
+        model: this.current.model,
+        index: this.current.index ? basename(this.current.index) : '',
+        worker: h,
+        playback: pb,
+        defaults: {
+          mode: v?.mode === 'vocals' ? 'vocals' : 'full',
+          pitch: v?.pitch ?? 'auto',
+          indexRate: Number(v?.indexRate ?? 0.75),
+          protect: Number(v?.protect ?? 0.33),
+          rmsMixRate: Number(v?.rmsMixRate ?? 0),
+          harmony: v?.harmony ?? 'off',
+          reverb: v?.reverb ?? 'off',
+          polish: v?.polish !== false,
+          f0Method: v?.f0Method ?? 'rmvpe',
+          separator: v?.separator ?? 'htdemucs',
+          dereverb: v?.dereverb === true,
+          dynamicStyle: v?.dynamicStyle ?? 'off',
+          qqEnabled: Boolean(String(this.opts.cfg.send?.httpUrl ?? '').trim()),
+          defaultQqTarget: String(this.opts.cfg.notify?.qqTarget ?? '').trim(),
+        },
+        lastSession: snap ? {
+          id: snap.id,
+          title: snap.title,
+          durationSec: snap.durationSec,
+          summary: snap.report?.summary ?? '',
+          issues: snap.report?.issues ?? [],
+          lyricsSource: snap.lyrics?.sourceLabel ?? '',
+          lyricsCount: snap.lyrics?.lines?.length ?? 0,
+        } : null,
+      };
+    }
+
+    if (method === 'search') {
+      const kw = String(args[0] ?? '').trim();
+      const order = (args[1] === 'click' || args[1] === 'pubdate' ? args[1] : 'default') as SearchOrder;
+      if (!kw) throw new Error('先输入要搜索的歌名或关键词');
+      if (this.opts.cfg.song?.enabled === false) throw new Error('配置里关掉了从 B 站搜歌');
+      const rawHits = await searchBili(kw, 20, order);
+      const maxDur = Number(this.opts.cfg.song?.maxDurationSec ?? 480);
+      const pool = rawHits.filter((h) => h.durationSec >= 20 && h.durationSec <= maxDur);
+      const hits = rankHits(pool.length ? pool : rawHits, kw, String(this.opts.cfg.song?.excludeWords ?? '')).slice(0, 12);
+      return { hits };
+    }
+
+    if (method === 'sing') {
+      if (this.trainJob?.state === 'running') throw new Error('正在训练模型，等训练完再试唱');
+      if (this.busy) throw new Error('上一首还在处理中，稍等一下或先点停止');
+      const raw = (args[0] as Record<string, unknown>) ?? {};
+      const song = String(raw.song ?? '').trim();
+      if (!song) throw new Error('先填歌名、BV 号或本机文件路径');
+      this.busy = true;
+      this.ownedJob = 'song';
+      try {
+        const r = await singSong({
+          song,
+          to: raw.to ? String(raw.to) : 'local',
+          mode: raw.mode === 'vocals' ? 'vocals' : 'full',
+          pitch: raw.pitch === undefined || raw.pitch === '' || String(raw.pitch).toLowerCase() === 'auto'
+            ? 'auto' : Number(raw.pitch),
+          indexRate: raw.indexRate === undefined || raw.indexRate === '' ? undefined : Number(raw.indexRate),
+          protect: raw.protect === undefined || raw.protect === '' ? undefined : Number(raw.protect),
+          rmsMixRate: raw.rmsMixRate === undefined || raw.rmsMixRate === '' ? undefined : Number(raw.rmsMixRate),
+          harmony: raw.harmony === 'double' || raw.harmony === 'double+third'
+            || raw.harmony === 'third' || raw.harmony === 'third+fifth' || raw.harmony === 'off'
+            ? raw.harmony : undefined,
+          reverb: raw.reverb === 'light' || raw.reverb === 'off' ? raw.reverb : undefined,
+          polish: typeof raw.polish === 'boolean' ? raw.polish : undefined,
+          f0Method: raw.f0Method === 'fcpe' || raw.f0Method === 'rmvpe' ? raw.f0Method : undefined,
+          separator: raw.separator === 'roformer' || raw.separator === 'htdemucs' ? raw.separator : undefined,
+          dereverb: typeof raw.dereverb === 'boolean' ? raw.dereverb : undefined,
+          dynamicStyle: raw.dynamicStyle === 'soft-verse-bright-chorus' || raw.dynamicStyle === 'off'
+            ? raw.dynamicStyle : undefined,
+          start: raw.start === undefined || raw.start === '' ? undefined : Number(raw.start),
+          duration: raw.duration === undefined || raw.duration === '' ? undefined : Number(raw.duration),
+          refresh: raw.refresh === true,
+          order: raw.order === 'click' || raw.order === 'pubdate' ? raw.order : 'default',
+        }, this.deps());
+        if (!r.ok) throw new Error(r.message);
+        if (r.detail) {
+          this.lastSong = {
+            title: String(r.detail.title ?? ''),
+            at: Date.now(),
+            duration: Number(r.detail.duration ?? 0),
+          };
+        }
+        return { text: r.message, detail: r.detail };
+      } finally {
+        this.busy = false;
+      }
+    }
+
+    if (method === 'stop') {
+      this.player.stop();
+      await this.worker.cancel().catch(() => undefined);
+      return { text: '已停止播放并取消当前任务' };
+    }
+
+    if (method === 'unload') {
+      const r = await this.worker.unload();
+      if (!r.ok) throw new Error(r.message);
+      return { text: r.message };
+    }
+
+    if (method === 'lyrics') {
+      const forceRefresh = args[0] === true;
+      const snap = loadSession(this.data());
+      if (!snap) return { text: '还没有最近唱过歌的记录', body: '' };
+      if (forceRefresh) {
+        const fresh = await resolveLyrics({
+          title: snap.title,
+          bvid: snap.bvid || undefined,
+          fullDurationSec: snap.durationSec,
+          cutStart: snap.cutStart,
+          cutDuration: snap.cutDuration,
+          phrases: snap.report?.phrases,
+          chorusRanges: snap.report?.chorusRanges,
+        }).catch(() => undefined);
+        if (fresh) {
+          snap.lyrics = fresh;
+          try {
+            saveSession(this.data(), snap);
+          } catch {
+            /* 忽略 */
+          }
+        }
+      }
+      const pb = this.player.playbackState();
+      const head: string[] = [`《${snap.title}》（${fmtTime(snap.durationSec)}）`];
+      if (pb.playing) {
+        head.push(`当前播放：${fmtTime(pb.elapsedSec)}/${fmtTime(pb.durationSec || snap.durationSec)}${pb.currentLine ? ` · 第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : ''}`);
+      }
+      if (snap.report?.summary) head.push(`声学体检：${snap.report.summary}`);
+      if (snap.report?.issues?.length) {
+        head.push('风险时间段：\n' + snap.report.issues.map((it) => `  - ${it.note}`).join('\n'));
+      }
+      if (snap.lyrics?.lines?.length) {
+        head.push(formatLyricsTable(snap.lyrics as LyricsSheet, { fromLine: 1, limit: 120 }));
+      }
+      return { body: head.join('\n') };
+    }
+
+    if (method === 'patch') {
+      if (this.trainJob?.state === 'running') throw new Error('正在训练模型，稍后再返工');
+      if (this.busy) throw new Error('当前有任务在进行，稍等几秒');
+      const raw = (args[0] as Record<string, unknown>) ?? {};
+      this.busy = true;
+      this.ownedJob = 'song';
+      try {
+        const r = await patchSong({
+          lines: raw.lines === undefined || raw.lines === '' ? undefined : String(raw.lines),
+          lyric: raw.lyric === undefined || raw.lyric === '' ? undefined : String(raw.lyric),
+          section: raw.section === 'chorus' ? 'chorus' : undefined,
+          chorusIndex: raw.chorusIndex === undefined ? undefined : Number(raw.chorusIndex),
+          atCurrent: raw.atCurrent === true,
+          start: raw.start === undefined || raw.start === '' ? undefined : Number(raw.start),
+          end: raw.end === undefined || raw.end === '' ? undefined : Number(raw.end),
+          pitch: raw.pitch === undefined || raw.pitch === '' ? undefined : Number(raw.pitch),
+          indexRate: raw.indexRate === undefined || raw.indexRate === '' ? undefined : Number(raw.indexRate),
+          protect: raw.protect === undefined || raw.protect === '' ? undefined : Number(raw.protect),
+          rmsMixRate: raw.rmsMixRate === undefined || raw.rmsMixRate === '' ? undefined : Number(raw.rmsMixRate),
+          f0Method: raw.f0Method === 'fcpe' || raw.f0Method === 'rmvpe' ? raw.f0Method : undefined,
+          model: raw.model ? String(raw.model) : undefined,
+          previewOnly: raw.previewOnly === true,
+          to: raw.to ? String(raw.to) : 'local',
+        }, this.deps());
+        if (!r.ok) throw new Error(r.message);
+        return { text: r.message, detail: r.detail };
+      } finally {
+        this.busy = false;
+      }
     }
 
     throw new Error(`未知方法：${method}`);
@@ -878,6 +1479,7 @@ export class FishSingWorld implements World {
     if (method === 'status') {
       const j = this.datasetJob;
       const manifest = j?.dir ? readManifest(j.dir) : null;
+      const qual = manifest ? sourceQualityReport(manifest) : null;
       return {
         job: j,
         dataset: manifest
@@ -887,6 +1489,9 @@ export class FishSingWorld implements World {
             summary: summarize(manifest),
             bands: manifest.bands,
             bandLabels: BAND_LABEL,
+            dropLabels: DROP_LABEL,
+            sourceQuality: qual?.rows ?? [],
+            f0Failed: qual?.f0Failed ?? [],
             histogram: f0Histogram(manifest.slices),
             weights: readWeights(j?.dir ?? ''),
             presets: WEIGHT_PRESETS,
@@ -1008,8 +1613,9 @@ export class FishSingWorld implements World {
       saveWeights(dir, cfg);
       const rows = weightedRows(m, cfg);
       const worst = rows.reduce((a, b) => (b.after > a.after ? b : a), rows[0]);
+      const modeLabel = cfg.mode === 'p90' ? '按最高音' : cfg.mode === 'mix' ? '两端兼顾' : '按主音域';
       return {
-        text: `已保存：${cfg.mode === 'p90' ? '按最高音' : '按主音域'}分档，${
+        text: `已保存：${modeLabel}分档，${
           rows.map((r) => `${r.label.split(' ')[0]} ${r.weight}x`).join(' / ')}（占比最大的是${worst.label.split(' ')[0]} ${(worst.after * 100).toFixed(0)}%）`,
         rows,
       };
@@ -1052,6 +1658,9 @@ export class FishSingWorld implements World {
         ...m.slices.filter(s => s.kept).map(s => join(dir, s.file)),
         ...m.sources.flatMap(s => [String(s.path ?? ''), String(s.vocalFile ?? '')]),
       ]) : undefined;
+      if (evaluationPaths) {
+        saveEvaluationPaths(this.opts.dataDir, evaluationPaths);
+      }
 
       // 同名实验的日志刚刚还在写 → 可能有训练在跑（包括重启 Coo 后留下的孤儿进程，
       // 那种情况 worker 已经不认识它了，光靠状态拦不住）。撞上去就是两个训练抢一张卡。
@@ -1114,63 +1723,26 @@ export class FishSingWorld implements World {
         job.id = id;
         this.ownedJob = 'train';
         this.lastExp = exp;
-        writeTrainState(this.opts.dataDir, { exp, epochs, startedAt: Date.now() });
+        writeTrainState(this.opts.dataDir, {
+          exp,
+          epochs,
+          startedAt: job.startedAt,
+          pruneAfter: cfg.pruneAfter === true,
+          abTest: cfg.abTest === true,
+          keepEvery: cfg.keepEvery,
+          evaluationPaths,
+        });
       } catch (e) {
         job.state = 'error';
         job.error = e instanceof Error ? e.message : String(e);
         throw e;
       }
-      void this.worker
-        .wait(
-          job.id,
-          (p, msg) => {
-            job.pct = Math.round(p * 100);
-            job.msg = msg;
-          },
-          // 训练要几小时，不能设绝对上限；30 分钟没有任何进展（连轮次都没动）才算真卡住
-          { stallMs: 30 * 60_000, timeoutMs: 10 * 3600_000 },
-        )
-        .then(() => {
-          job.state = 'done';
-          job.pct = 100;
-          job.msg = '完成';
-          this.host?.log.info(`[fish-sing] 训练完成：${exp}`);
-          // 勾了「训练完自动清理」才动文件：中间档删了只能重训才拿得回来，
-          // 默认不自动删，宁可让用户自己点那一下。
-          if (cfg.pruneAfter === true && cfg.abTest !== true) {
-            const step = Math.max(1, Number(cfg.keepEvery) || 50);
-            const done = pruneCheckpoints(
-              join(this.routes.rvcRoot, 'assets', 'weights'),
-              exp, step, join(this.routes.rvcRoot, 'logs'),
-            );
-            if (done.remove.length) {
-              job.msg = `完成（自动清理 ${done.remove.length} 个中间档，释放 ${done.freedMb} MB）`;
-              this.host?.log.info(`[fish-sing] 已清理中间档：${done.remove.length} 个 / ${done.freedMb} MB`);
-            }
-          }
-          void this.notifyEvent(`训练完成：${exp}`, `${epochs} 轮全部完成。${job.msg}`);
-          void this.runAbTest(exp, cfg.abTest === true, evaluationPaths).then(() => {
-            if (cfg.pruneAfter === true && cfg.abTest === true) {
-              pruneCheckpoints(join(this.routes.rvcRoot, 'assets', 'weights'), exp,
-                Math.max(1, Number(cfg.keepEvery) || 50), join(this.routes.rvcRoot, 'logs'));
-            }
-          }).catch((e: unknown) => {
-            this.host?.log.warn(`[fish-sing] 选模对比失败：${e instanceof Error ? e.message : String(e)}`);
-          });
-        })
-        .catch((e: unknown) => {
-          job.state = 'error';
-          job.error = e instanceof Error ? e.message : String(e);
-          job.msg = job.error;
-          if (job.error === '已取消' || job.error === '已手动停止') {
-            // 用户自己点的停止不算"中断"，也用不着通知（0.4.14 之前点停止也会收到
-            // 一条"训练中断"推送，纯属噪音）
-            this.host?.log.info(`[fish-sing] 训练已停止（${job.error}）`);
-            return;
-          }
-          this.host?.log.warn(`[fish-sing] 训练中断：${job.error}`);
-          void this.notifyEvent(`训练中断：${exp}`, job.error);
-        });
+      this.attachTrainWait(job, {
+        pruneAfter: cfg.pruneAfter === true,
+        abTest: cfg.abTest === true,
+        keepEvery: cfg.keepEvery,
+        evaluationPaths,
+      });
       return {
         text: `开始训练「${exp}」：${epochs} 轮 / batch ${batch} / ${m.stats.kept} 片${
           weighted ? ` / 其中 ${weighted} 片带音域加权` : '（均匀采样）'}`,
@@ -1218,7 +1790,14 @@ export class FishSingWorld implements World {
         ckpt: exp ? checkpointStats(join(this.routes.rvcRoot, 'assets', 'weights'), exp) : { n: 0, totalMb: 0 },
         weights: exp && expDir ? readWeights(this.datasetJob?.dir ?? '') : null,
         sampling: expDir ? readSamplingReport(expDir) : null,
+        evaluationPaths: readEvaluationPaths(this.opts.dataDir),
       };
+    }
+
+    if (method === 'saveEvalPaths') {
+      const paths = Array.isArray(args[0]) ? args[0].map((x) => String(x ?? '')) : [];
+      const saved = saveEvaluationPaths(this.opts.dataDir, paths);
+      return { paths: saved };
     }
 
     if (method === 'prune') {
@@ -1244,7 +1823,11 @@ export class FishSingWorld implements World {
     if (method === 'trainAbTest') {
       const exp = String(args[0]?.exp ?? '').trim() || this.trainJob?.exp || '';
       if (!exp) throw new Error('没有实验名：先在「训练」页填实验名，或跑一次训练');
-      const text = await this.runAbTest(exp, true, args[0]?.evaluationPaths);
+      const evalPaths = Array.isArray(args[0]?.evaluationPaths) ? args[0].evaluationPaths.map(String) : undefined;
+      if (evalPaths && evalPaths.some((p: string) => p.trim())) {
+        saveEvaluationPaths(this.opts.dataDir, evalPaths);
+      }
+      const text = await this.runAbTest(exp, true, evalPaths);
       return { text: text || `没生成：${exp} 只找到一个可用存档（中间档可能已被清理）` };
     }
 
@@ -1347,6 +1930,25 @@ export class FishSingWorld implements World {
       return { text: `删掉了 ${a0}` };
     }
 
+    if (method === 'prune') {
+      const exp = a0;
+      if (!exp) throw new Error('先在筛选框选择一个具体实验');
+      const step = Math.max(1, Number(args[1]) || 50);
+      const plan = planPruneCheckpoints(dir, exp, step);
+      if (!plan.remove.length) {
+        return { text: `「${exp}」没有可清理的中间档（现有 ${plan.keep.length} 个 / ${plan.totalMb} MB）`, removed: 0 };
+      }
+      const done = pruneCheckpoints(dir, exp, step, join(this.routes.rvcRoot, 'logs'));
+      const gone = done.remove.includes(basename(this.current.model));
+      return {
+        text: `已清理「${exp}」${done.remove.length} 个中间档${done.scratch.length ? ` + ${done.scratch.join('/')}` : ''}，`
+          + `释放 ${done.freedMb} MB（保留 ${done.keep.length} 个）`
+          + (gone ? '；注意：正在用的中间档被删了，请切到其他模型' : ''),
+        removed: done.remove.length,
+        freedMb: done.freedMb,
+      };
+    }
+
     if (method === 'import') {
       const r = importModel(this.routes, a0);
       return {
@@ -1370,9 +1972,13 @@ export class FishSingWorld implements World {
       this.refreshRoutes();
       const st: SetupStatus = inspect(this.routes);
       const runtime = existsSync(this.routes.pythonPath) ? await probeRuntime(this.routes.pythonPath) : '';
+      const optionalDeps = existsSync(this.routes.pythonPath)
+        ? detectOptionalDeps(this.routes.pythonPath)
+        : { uvr: false, fcpe: false };
       return {
         ...st,
         runtime,
+        optionalDeps,
         job: this.setupJob,
         tag: loadManifest().tag,
         separateScript: existsSync(this.routes.separateScript),
@@ -1408,6 +2014,13 @@ export class FishSingWorld implements World {
         };
       }
 
+      if (what === 'uvr') {
+        this.startSetupJob('uvr', async (signal, report) => {
+          await installUvrDeps(this.routes, report, signal);
+        });
+        return { text: '开始安全安装 UVR5 精唱/去混响内核（约 25 MB，锁定版本不覆盖 torch / numpy）' };
+      }
+
       if (what === 'code') {
         copyRvcCode(this.routes, VENDORED_RVC);
         return { text: `代码已复制到 ${this.routes.rvcRoot}` };
@@ -1428,14 +2041,100 @@ export class FishSingWorld implements World {
       return { text: '已停止' };
     }
 
+    if (method === 'trainNotifyTest') {
+      const out = (await this.notifyEvent(
+        '测试通知（唱歌插件）',
+        '这是一条测试消息：收到就说明通知渠道通了。',
+      )) as { via?: string; note?: string };
+      return { via: out?.via ?? '', note: out?.note ?? '' };
+    }
+
     throw new Error(`未知方法：${method}`);
+  }
+
+  /**
+   * 监听训练任务直至终态并执行收尾（通知、选模对比、可选中间档清理）。
+   * 抽出来供新开训练与重启接管训练共用。
+   */
+  private attachTrainWait(
+    job: {
+      id: string;
+      state: 'running' | 'done' | 'error';
+      pct: number;
+      msg: string;
+      exp: string;
+      epochs: number;
+      startedAt: number;
+      error?: string;
+    },
+    opts: {
+      pruneAfter?: boolean;
+      abTest?: boolean;
+      keepEvery?: number;
+      evaluationPaths?: string[];
+    },
+  ): void {
+    const exp = job.exp;
+    const epochs = job.epochs;
+    void this.worker
+      .wait(
+        job.id,
+        (p, msg) => {
+          job.pct = Math.round(p * 100);
+          job.msg = msg;
+        },
+        // 训练要几小时，不能设绝对上限；30 分钟没有任何进展（连轮次都没动）才算真卡住
+        { stallMs: 30 * 60_000, timeoutMs: 10 * 3600_000 },
+      )
+      .then(() => {
+        job.state = 'done';
+        job.pct = 100;
+        job.msg = '完成';
+        this.host?.log.info(`[fish-sing] 训练完成：${exp}`);
+        // 勾了「训练完自动清理」才动文件：中间档删了只能重训才拿得回来，
+        // 默认不自动删，宁可让用户自己点那一下。
+        if (opts.pruneAfter === true && opts.abTest !== true) {
+          const step = Math.max(1, Number(opts.keepEvery) || 50);
+          const done = pruneCheckpoints(
+            join(this.routes.rvcRoot, 'assets', 'weights'),
+            exp, step, join(this.routes.rvcRoot, 'logs'),
+          );
+          if (done.remove.length) {
+            job.msg = `完成（自动清理 ${done.remove.length} 个中间档，释放 ${done.freedMb} MB）`;
+            this.host?.log.info(`[fish-sing] 已清理中间档：${done.remove.length} 个 / ${done.freedMb} MB`);
+          }
+        }
+        const roundText = epochs ? `${epochs} 轮全部完成。` : '训练全部完成。';
+        void this.notifyEvent(`训练完成：${exp}`, `${roundText}${job.msg}`);
+        void this.runAbTest(exp, opts.abTest === true, opts.evaluationPaths).then(() => {
+          if (opts.pruneAfter === true && opts.abTest === true) {
+            pruneCheckpoints(join(this.routes.rvcRoot, 'assets', 'weights'), exp,
+              Math.max(1, Number(opts.keepEvery) || 50), join(this.routes.rvcRoot, 'logs'));
+          }
+        }).catch((e: unknown) => {
+          this.host?.log.warn(`[fish-sing] 选模对比失败：${e instanceof Error ? e.message : String(e)}`);
+        });
+      })
+      .catch((e: unknown) => {
+        job.state = 'error';
+        job.error = e instanceof Error ? e.message : String(e);
+        job.msg = job.error;
+        if (job.error === '已取消' || job.error === '已手动停止') {
+          // 用户自己点的停止不算"中断"，也用不着通知（0.4.14 之前点停止也会收到
+          // 一条"训练中断"推送，纯属噪音）
+          this.host?.log.info(`[fish-sing] 训练已停止（${job.error}）`);
+          return;
+        }
+        this.host?.log.warn(`[fish-sing] 训练中断：${job.error}`);
+        void this.notifyEvent(`训练中断：${exp}`, job.error);
+      });
   }
 
   /**
    * 起一个后台安装任务。面板靠轮询 status 拿进度，所以这里不 await。
    * 只允许一个：装运行时和唱一首歌抢同一张卡，同时来两个会互相拖死。
    */
-  private startSetupJob(kind: 'models' | 'runtime', task: (signal: AbortSignal, report: (pct: number, msg: string) => void) => Promise<unknown>): void {
+  private startSetupJob(kind: 'models' | 'runtime' | 'uvr', task: (signal: AbortSignal, report: (pct: number, msg: string) => void) => Promise<unknown>): void {
     const abort = new AbortController();
     const job = { kind, state: 'running' as const, pct: 0, msg: '准备中…', startedAt: Date.now() };
     this.setupJob = job;
@@ -1498,6 +2197,12 @@ export class FishSingWorld implements World {
           id: 'setup',
           title: '安装与运行时',
           description: '装 Python 运行时、下载模型权重、看当前状态。装完就能唱歌，不用敲命令。',
+          getMethods: ['status'],
+        },
+        {
+          id: 'sing',
+          title: '试唱 / 点歌',
+          description: '搜 B 站、填 BV 号或本地文件，调参试唱、查看歌词体检与局部返工补录。',
           getMethods: ['status'],
         },
         {

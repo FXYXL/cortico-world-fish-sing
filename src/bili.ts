@@ -132,7 +132,7 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
 
-/** 视频信息 + 音频流地址（dash 里码率最低那轨：够听、省流量、下得快）。 */
+/** 视频信息 + 音频流地址（优先挑 ≤256kbps 的高码率普通轨，兼顾换声音质与体积）。 */
 export async function audioUrlOf(bvid: string): Promise<{ url: string; mime: string; title: string; author: string; durationSec: number }> {
   const view = await jsonGet<{
     code: number;
@@ -146,9 +146,13 @@ export async function audioUrlOf(bvid: string): Promise<{ url: string; mime: str
     data?: { dash?: { audio?: { baseUrl?: string; mimeType?: string; bandwidth?: number }[] } };
   }>(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&fnval=16&fnver=0&fourk=1`);
   if (play.code !== 0) throw new Error(`取播放地址失败 code=${play.code} ${play.message ?? ''}`.trim());
-  const list = play.data?.dash?.audio ?? [];
+  const list = (play.data?.dash?.audio ?? []).filter((a) => Boolean(a.baseUrl));
   if (!list.length) throw new Error('这个视频没有独立音频轨（可能是直播/番剧，需要登录）');
-  const best = [...list].sort((a, b) => (a.bandwidth ?? 0) - (b.bandwidth ?? 0))[0];
+  // 优先挑 ≤256kbps 的最高码率普通音轨，避免 64kbps 低码率放大分离和换声失真
+  const normal = list.filter((a) => (a.bandwidth ?? 0) <= 260_000);
+  const best = normal.length
+    ? [...normal].sort((a, b) => (b.bandwidth ?? 0) - (a.bandwidth ?? 0))[0]
+    : [...list].sort((a, b) => (a.bandwidth ?? 0) - (b.bandwidth ?? 0))[0];
   if (!best?.baseUrl) throw new Error('音频地址为空');
   return {
     url: best.baseUrl,

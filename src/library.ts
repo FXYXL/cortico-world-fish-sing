@@ -8,7 +8,7 @@
  * 作品库是她的"歌单"：每一首都留一份 mp3 + 元数据，能回放、能列出来。
  */
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface SingParams {
@@ -21,10 +21,63 @@ export interface SingParams {
   /** 音量跟随原唱的程度 0~1（0 = 完全跟随，轻唱不会被唱满） */
   rmsMixRate?: number;
   /** 和声堆叠档位 */
-  harmony?: 'off' | 'third' | 'third+fifth';
+  harmony?: 'off' | 'double' | 'double+third' | 'third' | 'third+fifth';
   harmonyGain?: number;
   harmonyScope?: 'chorus' | 'all';
+  /** 人声混响档位 */
+  reverb?: 'off' | 'light';
+  /** RVC 人声润色 */
+  polish?: boolean;
+  /** F0 音高提取算法 */
+  f0Method?: 'rmvpe' | 'fcpe';
+  /** 人声分离档位 */
+  separator?: 'htdemucs' | 'roformer';
+  /** 分离后额外去混响 */
+  dereverb?: boolean;
+  /** 动态演绎风格：off / soft-verse-bright-chorus（主歌柔、副歌亮） */
+  dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
+  /** 显式分段换音色描述（用于缓存键隔离） */
+  segmentsKey?: string;
   mode: string;
+}
+
+export interface VocalIssue {
+  start: number;
+  end: number;
+  kind: 'too_high' | 'too_low' | 'unstable';
+  note: string;
+}
+
+export interface VocalReport {
+  summary: string;
+  chorusRanges: Array<{ start: number; end: number }>;
+  phrases: Array<{ index: number; start: number; end: number; section?: 'verse' | 'chorus' }>;
+  issues: VocalIssue[];
+  vocalRange?: { p5: number; median: number; p95: number } | null;
+  modelRange?: { p5: number; median: number; p95: number } | null;
+}
+
+export interface SingSessionSnapshot {
+  id: string;
+  title: string;
+  bvid: string;
+  source: string;
+  mp3: string;
+  vocalSrc: string;
+  convVocal: string;
+  inst: string;
+  durationSec: number;
+  pitchApplied: number;
+  cutStart: number;
+  cutDuration: number;
+  params: SingParams;
+  report?: VocalReport;
+  lyrics?: {
+    source: 'local-lrc' | 'netease' | 'lrclib' | 'bili-subtitle' | 'phrases';
+    sourceLabel: string;
+    lines: Array<{ index: number; start: number; end: number; text: string; section?: 'verse' | 'chorus' }>;
+  };
+  at: number;
 }
 
 export interface LibraryEntry {
@@ -47,7 +100,7 @@ export interface LibraryOptions {
  * 缓存格式版本。改了会**影响听感**的算法（削波修复、混音比例、编码前处理）就要 +1，
  * 否则用户点了同一首歌会命中旧缓存，听到的永远是修复前的坏音频。
  */
-const CACHE_SCHEMA = 2;
+const CACHE_SCHEMA = 6;
 
 function files(opts: LibraryOptions) {
   const cacheDir = join(opts.dataDir, 'cache');
@@ -59,6 +112,17 @@ function files(opts: LibraryOptions) {
 
 /** 缓存键：源标识 + 全部音色参数。 */
 export function cacheKey(sourceId: string, p: SingParams): string {
+  const rms = Number(p.rmsMixRate ?? 0);
+  const harmony = p.harmony ?? 'off';
+  const harmonyGain = Number(p.harmonyGain ?? 0);
+  const harmonyScope = p.harmonyScope ?? 'chorus';
+  const reverb = p.reverb ?? 'off';
+  const polish = p.polish === false ? '0' : '1';
+  const f0Method = p.f0Method === 'fcpe' ? 'fcpe' : 'rmvpe';
+  const separator = p.separator === 'roformer' ? 'roformer' : 'htdemucs';
+  const dereverb = p.dereverb ? '1' : '0';
+  const dyn = p.dynamicStyle === 'soft-verse-bright-chorus' ? 'svbc' : 'off';
+  const segs = p.segmentsKey ? `seg:${p.segmentsKey}` : '';
   const raw = [
     `v${CACHE_SCHEMA}`,
     sourceId,
@@ -68,8 +132,70 @@ export function cacheKey(sourceId: string, p: SingParams): string {
     p.protect.toFixed(3),
     String(p.pitch),
     p.mode,
+    rms.toFixed(3),
+    harmony,
+    harmony === 'off' ? '0' : harmonyGain.toFixed(3),
+    harmony === 'off' ? '' : harmonyScope,
+    reverb,
+    polish,
+    f0Method,
+    separator,
+    dereverb,
+    dyn,
+    segs,
   ].join('|');
   return createHash('sha1').update(raw).digest('hex').slice(0, 20);
+}
+
+/** 单次演唱会话快照目录（存 vocals_conv.wav 与 meta.json，支撑局部返工与歌词查表）。 */
+export function sessionDir(opts: LibraryOptions, id: string): string {
+  const { cacheDir } = files(opts);
+  return join(cacheDir, 'sessions', id);
+}
+
+export function saveSession(opts: LibraryOptions, snap: SingSessionSnapshot): void {
+  const dir = sessionDir(opts, snap.id);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify(snap, null, 2), 'utf8');
+  const { cacheDir } = files(opts);
+  writeFileSync(join(cacheDir, 'last-session.json'), JSON.stringify({ id: snap.id, at: snap.at }), 'utf8');
+}
+
+export function loadSession(opts: LibraryOptions, id?: string): SingSessionSnapshot | null {
+  const { cacheDir } = files(opts);
+  let targetId = String(id || '').trim();
+  if (!targetId) {
+    try {
+      const last = JSON.parse(readFileSync(join(cacheDir, 'last-session.json'), 'utf8')) as { id?: string };
+      targetId = String(last.id || '').trim();
+    } catch {
+      return null;
+    }
+  }
+  if (!targetId) return null;
+  try {
+    const raw = readFileSync(join(sessionDir(opts, targetId), 'meta.json'), 'utf8');
+    return JSON.parse(raw) as SingSessionSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+/** 分离产物（vocals.wav / inst.wav）缓存目录，按源、截取范围与分离档位隔离，不随模型或换声参数变化。 */
+export function sepCacheDir(
+  opts: LibraryOptions,
+  sourceCutKey: string,
+  sep?: { separator?: string; dereverb?: boolean },
+): string {
+  const { cacheDir } = files(opts);
+  const eng = sep?.separator === 'roformer' ? 'roformer' : 'htdemucs';
+  const drv = sep?.dereverb === true;
+  // 默认 htdemucs + 不去混响沿用旧版 key，保证已有分离缓存继续命中
+  const raw = eng === 'htdemucs' && !drv
+    ? `sep|${sourceCutKey}`
+    : `sep|${sourceCutKey}|${eng}|drv:${drv ? '1' : '0'}`;
+  const key = createHash('sha1').update(raw).digest('hex').slice(0, 16);
+  return join(cacheDir, 'sep', key);
 }
 
 export function cacheGet(opts: LibraryOptions, key: string): string | null {
@@ -148,13 +274,14 @@ export function dropFromLibrary(opts: LibraryOptions, query: string): LibraryEnt
   return hit;
 }
 
-/** 缓存清理：超过 maxAgeDays 的缓存文件删掉（作品库不动）。 */
+/** 缓存清理：超过 maxAgeDays 的缓存文件与分离缓存目录删掉（作品库不动）。 */
 export function pruneCache(opts: LibraryOptions, maxAgeDays = 14): number {
   const { cacheDir } = files(opts);
   const cut = Date.now() - maxAgeDays * 86400_000;
   let n = 0;
   try {
     for (const name of readdirSync(cacheDir)) {
+      if (name === 'sep' || name === 'sessions' || name === 'last-session.json') continue;
       const f = join(cacheDir, name);
       try {
         if (statSync(f).mtimeMs < cut) {
@@ -167,6 +294,27 @@ export function pruneCache(opts: LibraryOptions, maxAgeDays = 14): number {
     }
   } catch {
     /* 目录都没有就算了 */
+  }
+  for (const sub of ['sep', 'sessions']) {
+    const subRoot = join(cacheDir, sub);
+    const subCut = maxAgeDays === 0 ? Date.now() + 1000 : Date.now() - Math.min(maxAgeDays, 7) * 86400_000;
+    try {
+      if (existsSync(subRoot)) {
+        for (const name of readdirSync(subRoot)) {
+          const d = join(subRoot, name);
+          try {
+            if (statSync(d).mtimeMs < subCut) {
+              rmSync(d, { recursive: true, force: true });
+              n += 1;
+            }
+          } catch {
+            /* 单个目录失败不影响其它 */
+          }
+        }
+      }
+    } catch {
+      /* 忽略 */
+    }
   }
   return n;
 }

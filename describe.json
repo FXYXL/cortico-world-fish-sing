@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "cortico-world-fish-sing",
-  "version": "0.4.25",
+  "version": "0.5.0",
   "describe": {
     "tools": [
       {
@@ -35,8 +35,11 @@
               "description": "带伴奏 / 清唱"
             },
             "pitch": {
-              "type": "number",
-              "description": "移调半音"
+              "type": [
+                "number",
+                "string"
+              ],
+              "description": "移调半音，或传 auto 按模型音域自动推荐"
             },
             "indexRate": {
               "type": "number",
@@ -45,6 +48,10 @@
             "protect": {
               "type": "number",
               "description": "气声保护 0~0.5"
+            },
+            "rmsMixRate": {
+              "type": "number",
+              "description": "音量跟随原唱程度 0~1（0=完全跟随，1=不跟随）"
             },
             "start": {
               "type": "number",
@@ -74,11 +81,143 @@
                 "pubdate"
               ],
               "description": "B 站排序"
+            },
+            "f0Method": {
+              "type": "string",
+              "enum": [
+                "rmvpe",
+                "fcpe"
+              ],
+              "description": "音高提取算法（rmvpe / fcpe）"
+            },
+            "separator": {
+              "type": "string",
+              "enum": [
+                "htdemucs",
+                "roformer"
+              ],
+              "description": "人声分离档位（htdemucs 快速 / roformer UVR5精唱）"
+            },
+            "dereverb": {
+              "type": "boolean",
+              "description": "分离后是否额外去混响"
+            },
+            "dynamicStyle": {
+              "type": "string",
+              "enum": [
+                "off",
+                "soft-verse-bright-chorus"
+              ],
+              "description": "主副歌动态演绎（主歌柔、副歌亮）"
+            },
+            "segments": {
+              "type": "array",
+              "description": "显式分段换音色/参数"
+            },
+            "async": {
+              "type": "boolean",
+              "description": "异步后台准备并自动开唱"
             }
           },
           "required": [
             "song"
           ]
+        }
+      },
+      {
+        "name": "fish_sing_patch",
+        "description": "局部返工重唱/补录：只针对某一句、副歌或某几秒换参数或模型重跑，自动吸附静音边界无缝贴回原位。",
+        "summary": {
+          "zh": "局部返工补录",
+          "en": "Patch and re-sing a line or section"
+        },
+        "tags": [
+          "music",
+          "voice"
+        ],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "lines": {
+              "type": "string",
+              "description": "句号或范围，如 7 或 7-9"
+            },
+            "lyric": {
+              "type": "string",
+              "description": "歌词关键词"
+            },
+            "section": {
+              "type": "string",
+              "enum": [
+                "chorus"
+              ]
+            },
+            "chorusIndex": {
+              "type": "number"
+            },
+            "atCurrent": {
+              "type": "boolean",
+              "description": "自动取当前正在唱的那一句"
+            },
+            "start": {
+              "type": "number"
+            },
+            "end": {
+              "type": "number"
+            },
+            "pitch": {
+              "type": "number"
+            },
+            "indexRate": {
+              "type": "number"
+            },
+            "protect": {
+              "type": "number"
+            },
+            "rmsMixRate": {
+              "type": "number"
+            },
+            "f0Method": {
+              "type": "string",
+              "enum": [
+                "rmvpe",
+                "fcpe"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "previewOnly": {
+              "type": "boolean"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "fish_sing_lyrics",
+        "description": "查看最近一首歌的时间轴歌词表、当前播到第几句以及声学体检报告。",
+        "summary": {
+          "zh": "歌词与体检",
+          "en": "Lyrics timeline and vocal inspection"
+        },
+        "tags": [
+          "music"
+        ],
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "fromLine": {
+              "type": "number"
+            },
+            "limit": {
+              "type": "number"
+            }
+          },
+          "required": []
         }
       },
       {
@@ -115,11 +254,16 @@
               "enum": [
                 "list",
                 "play",
+                "send",
                 "delete"
               ]
             },
             "query": {
               "type": "string"
+            },
+            "to": {
+              "type": "string",
+              "description": "发到 QQ 的目标：group:<群号> 或 private:<QQ号>（配合 send 或 play 使用）"
             },
             "limit": {
               "type": "number"
@@ -145,7 +289,20 @@
         }
       }
     ],
-    "events": [],
+    "events": [
+      {
+        "type": "fishsing.started",
+        "description": "异步点歌准备完成并开始播放（含声学体检与歌词时间轴提示）"
+      },
+      {
+        "type": "fishsing.ended",
+        "description": "歌曲自然播放结束，可自然接话询问是否再来或返工"
+      },
+      {
+        "type": "fishsing.error",
+        "description": "异步点歌失败或需要挑选候选"
+      }
+    ],
     "prompts": [
       {
         "key": "fish-sing.envPrompt",

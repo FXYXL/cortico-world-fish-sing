@@ -9,6 +9,7 @@
  * 前端不碰文件系统，也不知道文件在哪。
  */
 
+const STYLE_ID = 'fish-sing-style';
 const CSS = `
 .fs-wrap{display:flex;flex-direction:column;gap:10px;width:100%;min-width:0;box-sizing:border-box;flex:1 1 auto;align-self:stretch;font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
 /* 宽度交给宿主：.panelslot > :where(...) 已经给了 width:100% + max-width:var(--content-width)=1120px。
@@ -21,7 +22,8 @@ const CSS = `
   border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 .fs-btn:hover{background:rgba(127,127,127,.12)}
 .fs-btn:disabled{opacity:.4;cursor:default}
-select.fs-btn{appearance:auto;-webkit-appearance:menulist;padding:4px 8px;max-width:560px}
+select.fs-btn{appearance:auto;-webkit-appearance:menulist;padding:4px 8px;max-width:560px;background-color:var(--bg-sub,Canvas);color:var(--fg,CanvasText)}
+.fs-wrap select option,.fs-wrap select optgroup{background-color:var(--bg-sub,Canvas);color:var(--fg,CanvasText)}
 .fs-btn.danger{border-color:rgba(220,80,80,.5);color:#d05555}
 .fs-input{flex:0 0 200px;padding:4px 8px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
   background:transparent;color:inherit;font-size:12px}
@@ -35,16 +37,117 @@ select.fs-btn{appearance:auto;-webkit-appearance:menulist;padding:4px 8px;max-wi
 .fs-table tbody tr:hover{background:rgba(127,127,127,.07)}
 .fs-table tr.playing{background:rgba(80,160,255,.12)}
 .fs-num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.fs-title{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-title{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fs-acts{display:flex;gap:6px;white-space:nowrap}
 .fs-empty{padding:24px;text-align:center;opacity:.6}
 .fs-tag{display:inline-block;padding:0 6px;border-radius:4px;background:rgba(127,127,127,.16);
   font-size:11px;margin-left:6px;opacity:.9}
 .fs-edit{width:100%;padding:2px 6px;border-radius:4px;border:1px solid rgba(127,127,127,.4);
   background:transparent;color:inherit;font-size:12.5px}
+.fs-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.fs-card{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px}
+.fs-card .k{font-size:11px;opacity:.6}
+.fs-card .v{font-size:13.5px;margin-top:2px;font-weight:600}
+.fs-card.ok .v{color:#3fae62}
+.fs-card.bad .v{color:#d05555}
+.fs-prog{height:8px;border-radius:5px;background:rgba(127,127,127,.2);overflow:hidden}
+.fs-prog>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4a90e2,#5ac8a8);transition:width .3s}
+.fs-list{display:flex;flex-direction:column;gap:2px}
+.fs-row{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;padding:4px 0;
+  border-bottom:1px solid rgba(127,127,127,.12)}
+.fs-row .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-row .r{white-space:nowrap;font-variant-numeric:tabular-nums}
+.fs-ok{color:#3fae62}
+.fs-bad{color:#d05555}
+.fs-warn{color:#c9962f}
+.fs-hint{font-size:12px;opacity:.65;line-height:1.7;white-space:pre-line}
+.fs-mhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fs-impbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;
+  border:1px solid rgba(127,127,127,.22);border-radius:8px;background:rgba(127,127,127,.04)}
+.fs-mtable{width:100%;border-collapse:collapse;font-size:12.5px}
+.fs-mtable th,.fs-mtable td{padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.18);
+  text-align:left;vertical-align:middle}
+.fs-mtable th{font-weight:600;opacity:.75;white-space:nowrap}
+.fs-mtable tbody tr:hover{background:rgba(127,127,127,.07)}
+.fs-mtable tr.on{background:rgba(80,160,255,.12)}
+.fs-dot{color:#3fae62;font-weight:700}
+.fs-mname{font-family:ui-monospace,Consolas,monospace;font-size:12px;max-width:180px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
+.fs-tagx{display:inline-block;padding:0 5px;border-radius:4px;background:rgba(127,127,127,.16);
+  font-size:11px;margin-left:6px}
+/* 分步折叠：新用户只看得到当前该做什么，老手展开就有全部东西。
+   注意：这三块是 .panelslot 的直接子元素，宿主靠 margin-right/left:auto 把它们居中；
+   这里只能写 margin-block，写 margin:10px 0 会把左右 auto 覆盖成 0，整块就贴左了
+   （0.4.19 之前的真实症状：进度条居中、三块贴左）。 */
+.fs-sec{margin-block:6px;border:1px solid rgba(127,127,127,.22);border-radius:10px;
+  background:rgba(127,127,127,.035);overflow:hidden}
+.fs-sec>summary{cursor:pointer;padding:9px 12px;font-size:13px;font-weight:600;
+  display:flex;align-items:center;gap:8px;list-style:none;user-select:none}
+.fs-sec>summary::-webkit-details-marker{display:none}
+.fs-sec>summary::before{content:"▸";opacity:.55;font-size:11px;transition:transform .12s}
+.fs-sec[open]>summary::before{transform:rotate(90deg)}
+.fs-sec>summary:hover{background:rgba(127,127,127,.07)}
+.fs-sec-hint{font-weight:400;font-size:11.5px;opacity:.55}
+.fs-sec-body{display:flex;flex-direction:column;gap:8px;padding:6px 12px 12px}
+.fs-tpath{flex:1;min-width:260px;padding:5px 8px;border-radius:6px;
+  border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12.5px}
+.fs-tsum{font-size:12.5px;line-height:1.7}
+.fs-hist{display:flex;align-items:flex-end;gap:2px;height:96px;padding:4px 0;
+  border-bottom:1px solid rgba(127,127,127,.25)}
+.fs-hist .bar{flex:1;min-width:3px;background:#5b8dd6;border-radius:2px 2px 0 0;position:relative}
+.fs-hist .bar.peak{background:#1D9E75}
+.fs-haxis{display:flex;justify-content:space-between;font-size:11px;opacity:.6;margin-top:3px}
+.fs-bandrow{display:flex;gap:6px;flex-wrap:wrap;font-size:12px}
+.fs-band{padding:3px 8px;border-radius:5px;background:rgba(127,127,127,.14)}
+.fs-file{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-ck{width:14px;height:14px;cursor:pointer;vertical-align:middle;margin-right:4px}
+.fs-card2{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px;font-size:12px}
+.fs-wtitle{font-size:13px;font-weight:600;opacity:.85}
+.fs-wmodes{display:flex;gap:4px}
+.fs-btn.on{border-color:#378ADD;color:#378ADD;background:rgba(55,138,221,.10)}
+.fs-wpresets{display:flex;gap:6px;flex-wrap:wrap}
+.fs-wrow{display:grid;grid-template-columns:110px 96px 108px 1fr 44px;align-items:center;gap:10px;
+  font-size:12.5px;padding:5px 0;border-bottom:1px solid rgba(127,127,127,.12)}
+.fs-wname{opacity:.85}
+.fs-wmeta{opacity:.55;font-size:11.5px}
+.fs-wshift{font-variant-numeric:tabular-nums;font-size:12px}
+.fs-wshift.up{color:#1D9E75}
+.fs-wshift.down{color:#c9962f}
+.fs-wshift.same{opacity:.55}
+.fs-wrange{width:100%;accent-color:#378ADD}
+.fs-wtimes{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.fs-tform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.fs-field{display:flex;flex-direction:column;gap:3px}
+.fs-flabel{font-size:11px;opacity:.6}
+.fs-tin{padding:4px 7px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
+  background:transparent;color:inherit;font-size:12.5px;width:110px}
+.fs-eval{display:flex;flex-direction:column;gap:6px;padding:8px 10px;
+  border:1px solid rgba(127,127,127,.2);border-radius:8px;background:rgba(127,127,127,.03)}
+.fs-eval-row{display:grid;grid-template-columns:44px 1fr;align-items:center;gap:8px}
+.fs-eval-in{width:100%;min-width:0;padding:4px 8px;border-radius:6px;
+  border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12px}
+.fs-augbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:8px;
+  border-bottom:1px solid rgba(127,127,127,.16)}
+.fs-loss{display:flex;align-items:flex-end;gap:1px;height:60px;padding-top:6px}
+.fs-lbar{flex:1;min-width:2px;background:#5b8dd6;border-radius:1px 1px 0 0;opacity:.85}
+.fs-card2 .k{opacity:.6;font-size:11px}
+.fs-card2 .v{font-size:15px;font-weight:600;margin-top:1px}
+.fs-pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Consolas,monospace;
+  max-height:260px;overflow:auto;padding:8px;border-radius:6px;background:rgba(127,127,127,.08)}
+.fs-sgrid{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}
+.fs-sin-sm{width:76px;padding:4px 7px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
+  background:transparent;color:inherit;font-size:12px}
+.fs-qual-low{color:#d05555;font-weight:600}
 `;
 
-const STYLE_ID = 'fish-sing-library-style';
+function ensureStyle() {
+  if (!document.getElementById(STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = CSS;
+    document.head.append(style);
+  }
+}
 
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -65,12 +168,7 @@ function fmtTime(ms) {
 }
 
 function mount(ctx) {
-  if (!document.getElementById(STYLE_ID)) {
-    const style = document.createElement('style');
-    style.id = STYLE_ID;
-    style.textContent = CSS;
-    document.head.append(style);
-  }
+  ensureStyle();
 
   const root = ctx.root;
   root.classList.add('fs-wrap');
@@ -81,20 +179,33 @@ function mount(ctx) {
   const stop = el('button', 'fs-btn', '停止播放');
   const reveal = el('button', 'fs-btn', '打开目录');
   const search = el('input', 'fs-input');
-  search.placeholder = '按标题过滤…';
+  search.placeholder = '按标题或模型过滤…';
   const meta = el('span', 'fs-meta');
   bar.append(refresh, stop, reveal, el('span', 'fs-grow'), search, meta);
 
   const msg = el('div', 'fs-msg');
+  const qqBar = el('div', 'fs-impbar');
+  qqBar.style.display = 'none';
+  const qqTitle = el('span', 'fs-meta', '');
+  const qqIn = el('input', 'fs-eval-in');
+  qqIn.style.maxWidth = '240px';
+  qqIn.placeholder = 'group:群号 或 private:QQ号';
+  const qqSendOk = el('button', 'fs-btn', '确认发送');
+  const qqSendCancel = el('button', 'fs-btn', '取消');
+  qqBar.append(qqTitle, qqIn, qqSendOk, qqSendCancel);
   const box = el('div', '');
 
-  root.append(bar, msg, box);
+  root.append(bar, qqBar, msg, box);
 
   let items = [];
   let sortKey = 'at';
   let sortAsc = false;
   let filter = '';
   let playingId = '';
+  let qqEnabled = false;
+  let defaultQqTarget = '';
+  let currentModel = '';
+  let pendingQqItem = null;
   let timer = null;
 
   const say = (text, bad) => {
@@ -118,6 +229,9 @@ function mount(ctx) {
       const data = await ctx.invoke('list', []);
       items = Array.isArray(data && data.items) ? data.items : [];
       playingId = (data && data.playing) || '';
+      qqEnabled = Boolean(data && data.qqEnabled);
+      defaultQqTarget = String((data && data.defaultQqTarget) || '');
+      currentModel = String((data && data.currentModel) || '');
       stop.disabled = !playingId;
       const n = items.length;
       meta.textContent = n
@@ -138,7 +252,8 @@ function mount(ctx) {
 
   const sorted = () => {
     const rows = filter
-      ? items.filter((r) => String(r.title).toLowerCase().includes(filter))
+      ? items.filter((r) => String(r.title).toLowerCase().includes(filter)
+        || String(r.model || '').toLowerCase().includes(filter))
       : items.slice();
     rows.sort((a, b) => {
       const va = a[sortKey];
@@ -158,6 +273,7 @@ function mount(ctx) {
       ['durationSec', '时长'],
       ['pitch', '音高'],
       ['mode', '模式'],
+      ['model', '模型'],
       ['sizeMb', '大小'],
       ['at', '时间'],
       ['', '操作'],
@@ -193,11 +309,17 @@ function mount(ctx) {
     if (r.missing) tdTitle.append(el('span', 'fs-tag', '文件缺失'));
     if (r.target) tdTitle.append(el('span', 'fs-tag', r.target));
 
+    const modelTd = el('td', '');
+    const modelSpan = el('span', 'fs-mname', r.model || '—');
+    if (r.model) modelSpan.title = r.model;
+    modelTd.append(modelSpan);
+
     tr.append(
       tdTitle,
       el('td', 'fs-num', fmtDur(r.durationSec)),
       el('td', 'fs-num', r.pitch ? `${r.pitch > 0 ? '+' : ''}${r.pitch}` : '0'),
       el('td', '', r.mode === 'vocals' ? '清唱' : '带伴奏'),
+      modelTd,
       el('td', 'fs-num', `${r.sizeMb} MB`),
       el('td', '', fmtTime(r.at)),
     );
@@ -256,7 +378,34 @@ function mount(ctx) {
       await load();
     });
 
-    acts.append(play, rename, del);
+    const sendQq = el('button', 'fs-btn', '发 QQ');
+    sendQq.disabled = !qqEnabled || r.missing;
+    sendQq.title = qqEnabled ? '将这条成品切条发送到 QQ 群或私聊' : '未配置 OneBot HTTP 地址';
+    sendQq.addEventListener('click', () => {
+      pendingQqItem = r;
+      qqTitle.textContent = `发《${r.title}》到 QQ：`;
+      if (!qqIn.value && defaultQqTarget) qqIn.value = defaultQqTarget;
+      qqBar.style.display = 'flex';
+      qqIn.focus();
+    });
+
+    const resing = el('button', 'fs-btn', '重唱');
+    resing.disabled = !r.bvid && !r.source;
+    resing.title = currentModel
+      ? `用当前模型（${currentModel}）和当前配置重唱这首歌`
+      : '用当前模型重唱这首歌';
+    resing.addEventListener('click', async () => {
+      resing.disabled = true;
+      say(`正在用当前模型 ${currentModel || ''} 重唱《${r.title}》…`);
+      try {
+        await call('resing', [r.id]);
+        await load();
+      } finally {
+        resing.disabled = false;
+      }
+    });
+
+    acts.append(play, sendQq, resing, rename, del);
     const tdActs = el('td');
     tdActs.append(acts);
     tr.append(tdActs);
@@ -277,6 +426,37 @@ function mount(ctx) {
     table.append(tbody);
     box.append(table);
   }
+
+  const submitSendQq = async () => {
+    if (!pendingQqItem) return;
+    const target = String(qqIn.value || '').trim();
+    if (!target) {
+      say('请先填写 QQ 目标（group:群号 或 private:QQ号）', true);
+      qqIn.focus();
+      return;
+    }
+    qqSendOk.disabled = true;
+    say(`正在将《${pendingQqItem.title}》发到 ${target}…`);
+    try {
+      await call('send', [pendingQqItem.id, target]);
+      qqBar.style.display = 'none';
+      pendingQqItem = null;
+    } finally {
+      qqSendOk.disabled = false;
+    }
+  };
+  qqSendOk.addEventListener('click', () => void submitSendQq());
+  qqSendCancel.addEventListener('click', () => {
+    qqBar.style.display = 'none';
+    pendingQqItem = null;
+  });
+  qqIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') void submitSendQq();
+    if (e.key === 'Escape') {
+      qqBar.style.display = 'none';
+      pendingQqItem = null;
+    }
+  });
 
   refresh.addEventListener('click', () => {
     say('');
@@ -309,27 +489,6 @@ function mount(ctx) {
 
 /* ------------------------------------------------------------------ 安装与运行时 */
 
-const SETUP_STYLE_ID = 'fish-sing-setup-style';
-const SETUP_CSS = `
-.fs-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
-.fs-card{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px}
-.fs-card .k{font-size:11px;opacity:.6}
-.fs-card .v{font-size:13.5px;margin-top:2px;font-weight:600}
-.fs-card.ok .v{color:#3fae62}
-.fs-card.bad .v{color:#d05555}
-.fs-prog{height:8px;border-radius:5px;background:rgba(127,127,127,.2);overflow:hidden}
-.fs-prog>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4a90e2,#5ac8a8);transition:width .3s}
-.fs-list{display:flex;flex-direction:column;gap:2px}
-.fs-row{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;padding:4px 0;
-  border-bottom:1px solid rgba(127,127,127,.12)}
-.fs-row .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fs-row .r{white-space:nowrap;font-variant-numeric:tabular-nums}
-.fs-ok{color:#3fae62}
-.fs-bad{color:#d05555}
-.fs-warn{color:#c9962f}
-.fs-hint{font-size:12px;opacity:.65;line-height:1.7}
-`;
-
 function mb(n) {
   const v = Number(n) || 0;
   if (v >= 1073741824) return `${(v / 1073741824).toFixed(2)} GB`;
@@ -337,13 +496,7 @@ function mb(n) {
 }
 
 function mountSetup(ctx) {
-  if (!document.getElementById(SETUP_STYLE_ID)) {
-    const style = document.createElement('style');
-    style.id = SETUP_STYLE_ID;
-    // 前置共享底座（fs-bar/fs-btn/fs-meta…原本只在作品库样式里，导致别的页首进无样式）
-    style.textContent = CSS + SETUP_CSS;
-    document.head.append(style);
-  }
+  ensureStyle();
 
   const root = ctx.root;
   root.classList.add('fs-wrap');
@@ -353,9 +506,11 @@ function mountSetup(ctx) {
   const dl = el('button', 'fs-btn', '下载模型权重');
   const gpu = el('button', 'fs-btn', '安装 GPU 运行时');
   const cpu = el('button', 'fs-btn', '安装 CPU 运行时');
+  const uvr = el('button', 'fs-btn', '安装 UVR5 精唱内核');
+  uvr.title = '安全安装锁定版 audio-separator（--no-deps，不覆盖 torch 与 numpy），用于精唱分离和训练素材去混响';
   const stopBtn = el('button', 'fs-btn danger', '停止');
   const refresh = el('button', 'fs-btn', '刷新');
-  bar.append(dl, gpu, cpu, stopBtn, el('span', 'fs-grow'), refresh);
+  bar.append(dl, gpu, cpu, uvr, stopBtn, el('span', 'fs-grow'), refresh);
 
   const prog = el('div', 'fs-prog');
   const fill = el('i');
@@ -369,7 +524,9 @@ function mountSetup(ctx) {
     + '出厂默认模型（dfy2 + 检索索引，约 349 MB）是可选的示例；换过模型之后删掉它完全没问题，'
     + '自检只会显示「默认模型未装」，点按钮可补。\n'
     + '运行时是 Python 环境：GPU 版下载约 2.5 GB、装完约 6 GB（55 秒的歌约 8 秒换完）；'
-    + 'CPU 版只要约 200 MB，但慢 6~8 倍。已经装好 torch 的不会被覆盖。';
+    + 'CPU 版只要约 200 MB，但慢 6~8 倍。已经装好 torch 的不会被覆盖。\n'
+    + 'UVR5 精唱内核（audio-separator，可选，约 25 MB）：支持 BS-RoFormer 精唱分离与 De-Reverb 去混响；'
+    + '点击按钮会用锁定版本 + --no-deps 安全安装，绝不覆盖 GPU 版 torch 与 numpy；未安装时自动回落 htdemucs。';
 
   // ---- 通知渠道测试（配置页的「完成通知」里填目标，这里一键验证）
   const nbar = el('div', 'fs-bar');
@@ -434,10 +591,12 @@ function mountSetup(ctx) {
     const weightsText = weightsOk
       ? (optMissing ? '就绪 · 默认模型未装' : `就绪 · ${needReady}/${need.length}`)
       : `缺 ${need.length - needReady} 项 · ${needReady}/${need.length}`;
+    const optDeps = st.optionalDeps || {};
     cards.replaceChildren(
       card('RVC 代码', st.rvc && st.rvc.ready ? '已就绪' : '缺失', st.rvc && st.rvc.ready ? 'ok' : 'bad'),
       card('模型权重', weightsText, weightsOk ? 'ok' : needReady ? 'warn' : 'bad'),
       card('Python 运行时', st.python && st.python.ok ? '已就绪' : '未安装', st.python && st.python.ok ? 'ok' : 'bad'),
+      card('UVR5 精唱内核', optDeps.uvr ? '已安装' : '未安装（可选）', optDeps.uvr ? 'ok' : ''),
       card('ffmpeg', st.ffmpeg && st.ffmpeg.ok ? '已就绪' : '没找到', st.ffmpeg && st.ffmpeg.ok ? 'ok' : 'bad'),
     );
 
@@ -456,12 +615,14 @@ function mountSetup(ctx) {
     dl.disabled = running;
     gpu.disabled = running;
     cpu.disabled = running;
+    uvr.disabled = running || !(st.python && st.python.ok);
     stopBtn.disabled = !running;
     fill.style.width = `${running ? job.pct : job && job.state === 'done' ? 100 : 0}%`;
 
     if (job) {
+      const kindLbl = job.kind === 'models' ? '权重下载' : job.kind === 'uvr' ? 'UVR5 精唱内核安装' : '运行时安装';
       const head = job.state === 'running' ? `${job.pct}% · ${job.msg}`
-        : job.state === 'done' ? `✓ 完成：${job.kind === 'models' ? '权重下载' : '运行时安装'}`
+        : job.state === 'done' ? `✓ 完成：${kindLbl}`
           : `✗ ${job.error || job.msg}`;
       say(head, job.state === 'error');
       lastJob = `${job.state}${job.pct}${job.msg}`;
@@ -471,6 +632,7 @@ function mountSetup(ctx) {
     dl.textContent = weightsOk
       ? (optMissing ? `补下默认模型（${mb(optMissingBytes)}）` : '校验权重')
       : `下载必需组件（${mb(st.totalBytes - st.doneBytes)}）`;
+    uvr.textContent = optDeps.uvr ? '重装 UVR5 精唱内核' : '安装 UVR5 精唱内核（推荐）';
     if (st.python && st.python.ok) {
       gpu.textContent = '重装 GPU 运行时';
       cpu.textContent = '重装 CPU 运行时';
@@ -509,6 +671,9 @@ function mountSetup(ctx) {
   cpu.addEventListener('click', () =>
     void startJob('runtime-cpu', '安装 CPU 运行时：只要约 200 MB，但换声慢 6~8 倍。现在开始？'),
   );
+  uvr.addEventListener('click', () =>
+    void startJob('uvr', '安全安装 UVR5 精唱/去混响内核（audio-separator 锁定版，约 25 MB，绝不覆盖现有 torch 与 numpy）。现在开始？'),
+  );
   stopBtn.addEventListener('click', () => {
     stopBtn.disabled = true;
     void call('cancel', []).then(() => setTimeout(() => void load(), 300));
@@ -527,21 +692,6 @@ function mountSetup(ctx) {
 
 /* ------------------------------------------------------------------ 模型 */
 
-const MODELS_STYLE_ID = 'fish-sing-models-style';
-const MODELS_CSS = `
-.fs-mhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.fs-mtable{width:100%;border-collapse:collapse;font-size:12.5px}
-.fs-mtable th,.fs-mtable td{padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.18);
-  text-align:left;vertical-align:middle}
-.fs-mtable th{font-weight:600;opacity:.75;white-space:nowrap}
-.fs-mtable tbody tr:hover{background:rgba(127,127,127,.07)}
-.fs-mtable tr.on{background:rgba(80,160,255,.12)}
-.fs-dot{color:#3fae62;font-weight:700}
-.fs-mname{font-family:ui-monospace,Consolas,monospace;font-size:12px}
-.fs-tagx{display:inline-block;padding:0 5px;border-radius:4px;background:rgba(127,127,127,.16);
-  font-size:11px;margin-left:6px}
-`;
-
 function fmtDate(ms) {
   const d = new Date(Number(ms) || 0);
   const p = (n) => String(n).padStart(2, '0');
@@ -549,12 +699,7 @@ function fmtDate(ms) {
 }
 
 function mountModels(ctx) {
-  if (!document.getElementById(MODELS_STYLE_ID)) {
-    const style = document.createElement('style');
-    style.id = MODELS_STYLE_ID;
-    style.textContent = CSS + MODELS_CSS;
-    document.head.append(style);
-  }
+  ensureStyle();
 
   const root = ctx.root;
   root.classList.add('fs-wrap');
@@ -563,15 +708,31 @@ function mountModels(ctx) {
   const refresh = el('button', 'fs-btn', '刷新');
   const imp = el('button', 'fs-btn', '导入 .pth');
   const reveal = el('button', 'fs-btn', '打开目录');
+  const expFilter = el('select', 'fs-btn');
+  expFilter.title = '按实验名筛选模型';
+  const pruneBtn = el('button', 'fs-btn', '清理中间档');
+  pruneBtn.disabled = true;
+  pruneBtn.title = '先在左侧选一个具体实验，按每 50 轮留一个清理其导出的中间档';
   const meta = el('span', 'fs-meta');
-  bar.append(refresh, imp, reveal, el('span', 'fs-meta', ' '), el('span', 'fs-grow'), meta);
+  bar.append(refresh, imp, reveal, expFilter, pruneBtn, el('span', 'fs-grow'), meta);
+
+  // 内联导入栏，替代在 Electron 中可能被禁用的 window.prompt
+  const impBar = el('div', 'fs-impbar');
+  impBar.style.display = 'none';
+  const impIn = el('input', 'fs-tpath');
+  impIn.placeholder = '粘贴 .pth 的完整路径（会复制到 assets/weights，并自动尝试匹配同名实验索引）';
+  const impOk = el('button', 'fs-btn', '确认导入');
+  const impCancel = el('button', 'fs-btn', '取消');
+  impBar.append(impIn, impOk, impCancel);
 
   const msg = el('div', 'fs-msg');
   const box = el('div', '');
-  root.append(bar, msg, box);
+  root.append(bar, impBar, msg, box);
 
   let rows = [];
+  let selectedExp = '';
   let pendingDelete = '';
+  let pendingPruneExp = '';
 
   const say = (t, bad) => {
     msg.textContent = t || '';
@@ -589,29 +750,70 @@ function mountModels(ctx) {
     }
   };
 
+  const syncExpFilter = () => {
+    const counts = new Map();
+    for (const r of rows) {
+      const k = r.exp || r.name;
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    if (selectedExp && !counts.has(selectedExp)) selectedExp = '';
+    expFilter.replaceChildren();
+    const allOpt = el('option', '', `全部实验（${rows.length}）`);
+    allOpt.value = '';
+    expFilter.append(allOpt);
+    for (const [exp, n] of counts.entries()) {
+      const o = el('option', '', `${exp}（${n}）`);
+      o.value = exp;
+      if (exp === selectedExp) o.selected = true;
+      expFilter.append(o);
+    }
+    const ckptCount = selectedExp
+      ? rows.filter((r) => r.exp === selectedExp && r.epoch !== null).length
+      : 0;
+    pruneBtn.disabled = !selectedExp || ckptCount === 0;
+    if (pendingPruneExp !== selectedExp) {
+      pendingPruneExp = '';
+      pruneBtn.textContent = ckptCount ? `清理中间档（${ckptCount}）` : '清理中间档';
+    }
+  };
+
   const render = () => {
     box.replaceChildren();
-    if (!rows.length) {
-      box.append(el('div', 'fs-empty', '还没有模型。下载权重或训练一个之后会出现在这里。'));
+    const visible = selectedExp ? rows.filter((r) => r.exp === selectedExp) : rows;
+    if (!visible.length) {
+      box.append(el('div', 'fs-empty', rows.length ? '当前筛选下没有模型' : '还没有模型。下载权重或训练一个之后会出现在这里。'));
       return;
     }
     const table = el('table', 'fs-mtable');
     const thead = el('thead');
     const htr = el('tr');
-    for (const h of ['', '模型', '轮次', '大小', '时间', '索引', '操作']) htr.append(el('th', '', h));
+    for (const h of ['', '模型', '实验', '轮次', '音域 (Hz)', '大小', '时间', '索引', '操作']) htr.append(el('th', '', h));
     thead.append(htr);
     const tbody = el('tbody');
 
-    for (const r of rows) {
+    for (const r of visible) {
       const tr = el('tr', r.current ? 'on' : '');
       tr.append(el('td', 'fs-dot', r.current ? '●' : ''));
 
       const nameTd = el('td');
-      nameTd.append(el('span', 'fs-mname', r.name));
+      const nameSpan = el('span', 'fs-mname', r.name);
+      nameSpan.title = r.name;
+      nameTd.append(nameSpan);
       if (r.current) nameTd.append(el('span', 'fs-tagx', '使用中'));
       tr.append(nameTd);
 
+      tr.append(el('td', 'fs-meta', r.exp || '—'));
       tr.append(el('td', 'fs-num', r.epoch !== null ? `e${r.epoch}` : '最终'));
+      const rgTd = el('td', 'fs-num');
+      if (r.range && r.range.p5 && r.range.p95) {
+        rgTd.textContent = `${r.range.p5}–${r.range.median}–${r.range.p95}`;
+        rgTd.title = `低音(P5) ${r.range.p5} Hz · 中位 ${r.range.median} Hz · 高音(P95) ${r.range.p95} Hz（样本帧 ${r.range.frames || 0}）`;
+      } else {
+        rgTd.textContent = '—';
+        rgTd.classList.add('fs-meta');
+        rgTd.title = '尚未生成 logs/<exp>/range.json（首次用该模型自动变调或试唱时会自动测算）';
+      }
+      tr.append(rgTd);
       tr.append(el('td', 'fs-num', `${r.sizeMb} MB`));
       tr.append(el('td', 'fs-num', fmtDate(r.mtime)));
 
@@ -677,23 +879,78 @@ function mountModels(ctx) {
       meta.textContent = rows.length
         ? `共 ${rows.length} 个 · 当前 ${data.current.model}${data.busy ? ' · 正在唱' : ''}`
         : '还没有模型';
+      syncExpFilter();
       render();
     } catch (e) {
       say((e && e.message) || String(e), true);
     }
   };
 
-  refresh.addEventListener('click', () => void load());
-  reveal.addEventListener('click', () => void call('reveal', []));
-  imp.addEventListener('click', async () => {
-    const path = window.prompt('粘贴 .pth 的完整路径（会复制到 assets/weights）');
-    if (!path) return;
+  expFilter.addEventListener('change', () => {
+    selectedExp = String(expFilter.value || '');
+    pendingPruneExp = '';
+    syncExpFilter();
+    render();
+  });
+
+  pruneBtn.addEventListener('click', async () => {
+    if (!selectedExp) return;
+    if (pendingPruneExp !== selectedExp) {
+      pendingPruneExp = selectedExp;
+      pruneBtn.textContent = `确认清理 ${selectedExp}？每 50 轮留一个`;
+      setTimeout(() => {
+        if (pendingPruneExp === selectedExp) {
+          pendingPruneExp = '';
+          syncExpFilter();
+        }
+      }, 5000);
+      return;
+    }
+    pendingPruneExp = '';
+    pruneBtn.disabled = true;
+    pruneBtn.textContent = '清理中…';
     try {
-      await call('import', [path.trim()]);
+      await call('prune', [selectedExp, 50]);
+      await load();
+    } catch {
+      syncExpFilter();
+    }
+  });
+
+  const submitImport = async () => {
+    const path = String(impIn.value || '').trim().replace(/^["']|["']$/g, '');
+    if (!path) {
+      say('请先粘贴 .pth 的完整路径', true);
+      impIn.focus();
+      return;
+    }
+    impOk.disabled = true;
+    try {
+      await call('import', [path]);
+      impIn.value = '';
+      impBar.style.display = 'none';
       await load();
     } catch {
       /* 错误已经显示在消息行 */
+    } finally {
+      impOk.disabled = false;
     }
+  };
+
+  refresh.addEventListener('click', () => void load());
+  reveal.addEventListener('click', () => void call('reveal', []));
+  imp.addEventListener('click', () => {
+    const show = impBar.style.display === 'none';
+    impBar.style.display = show ? 'flex' : 'none';
+    if (show) impIn.focus();
+  });
+  impOk.addEventListener('click', () => void submitImport());
+  impCancel.addEventListener('click', () => {
+    impBar.style.display = 'none';
+  });
+  impIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') void submitImport();
+    if (e.key === 'Escape') impBar.style.display = 'none';
   });
 
   void load();
@@ -704,72 +961,13 @@ function mountModels(ctx) {
 
 /* ------------------------------------------------------------------ 训练数据 */
 
-const TRAIN_STYLE_ID = 'fish-sing-train-style';
-const TRAIN_CSS = `
-/* 分步折叠：新用户只看得到当前该做什么，老手展开就有全部东西。
-   注意：这三块是 .panelslot 的直接子元素，宿主靠 margin-right/left:auto 把它们居中；
-   这里只能写 margin-block，写 margin:10px 0 会把左右 auto 覆盖成 0，整块就贴左了
-   （0.4.19 之前的真实症状：进度条居中、三块贴左）。 */
-.fs-sec{margin-block:10px;border:1px solid rgba(127,127,127,.22);border-radius:10px;
-  background:rgba(127,127,127,.035);overflow:hidden}
-.fs-sec>summary{cursor:pointer;padding:9px 12px;font-size:13px;font-weight:600;
-  display:flex;align-items:center;gap:8px;list-style:none;user-select:none}
-.fs-sec>summary::-webkit-details-marker{display:none}
-.fs-sec>summary::before{content:"▸";opacity:.55;font-size:11px;transition:transform .12s}
-.fs-sec[open]>summary::before{transform:rotate(90deg)}
-.fs-sec>summary:hover{background:rgba(127,127,127,.07)}
-.fs-sec-hint{font-weight:400;font-size:11.5px;opacity:.55}
-.fs-sec-body{padding:2px 12px 12px}
-.fs-tpath{flex:1;min-width:280px;padding:5px 8px;border-radius:6px;
-  border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12.5px}
-.fs-tsum{font-size:12.5px;line-height:1.7}
-.fs-hist{display:flex;align-items:flex-end;gap:2px;height:96px;padding:4px 0;
-  border-bottom:1px solid rgba(127,127,127,.25)}
-.fs-hist .bar{flex:1;min-width:3px;background:#5b8dd6;border-radius:2px 2px 0 0;position:relative}
-.fs-hist .bar.peak{background:#1D9E75}
-.fs-haxis{display:flex;justify-content:space-between;font-size:11px;opacity:.6;margin-top:3px}
-.fs-bandrow{display:flex;gap:6px;flex-wrap:wrap;font-size:12px}
-.fs-band{padding:3px 8px;border-radius:5px;background:rgba(127,127,127,.14)}
-.fs-file{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fs-ck{width:14px;height:14px;cursor:pointer}
-.fs-card2{border:1px solid rgba(127,127,127,.22);border-radius:8px;padding:8px 10px;font-size:12px}
-.fs-wtitle{font-size:13px;font-weight:600;opacity:.85}
-.fs-wmodes{display:flex;gap:4px}
-.fs-btn.on{border-color:#378ADD;color:#378ADD;background:rgba(55,138,221,.10)}
-.fs-wpresets{display:flex;gap:6px;flex-wrap:wrap}
-.fs-wrow{display:grid;grid-template-columns:110px 96px 108px 1fr 44px;align-items:center;gap:10px;
-  font-size:12.5px;padding:5px 0;border-bottom:1px solid rgba(127,127,127,.12)}
-.fs-wname{opacity:.85}
-.fs-wmeta{opacity:.55;font-size:11.5px}
-.fs-wshift{font-variant-numeric:tabular-nums;font-size:12px}
-.fs-wshift.up{color:#1D9E75}
-.fs-wshift.down{color:#c9962f}
-.fs-wshift.same{opacity:.55}
-.fs-wrange{width:100%;accent-color:#378ADD}
-.fs-wtimes{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
-.fs-tform{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.fs-field{display:flex;flex-direction:column;gap:3px}
-.fs-flabel{font-size:11px;opacity:.6}
-.fs-tin{padding:4px 7px;border-radius:6px;border:1px solid rgba(127,127,127,.35);
-  background:transparent;color:inherit;font-size:12.5px;width:110px}
-.fs-loss{display:flex;align-items:flex-end;gap:1px;height:60px;padding-top:6px}
-.fs-lbar{flex:1;min-width:2px;background:#5b8dd6;border-radius:1px 1px 0 0;opacity:.85}
-.fs-card2 .k{opacity:.6;font-size:11px}
-.fs-card2 .v{font-size:15px;font-weight:600;margin-top:1px}
-`;
-
 function fmtSec(v) {
   const s = Math.max(0, Math.round(Number(v) || 0));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 function mountTrain(ctx) {
-  if (!document.getElementById(TRAIN_STYLE_ID)) {
-    const style = document.createElement('style');
-    style.id = TRAIN_STYLE_ID;
-    style.textContent = CSS + TRAIN_CSS;
-    document.head.append(style);
-  }
+  ensureStyle();
 
   const root = ctx.root;
   root.classList.add('fs-wrap');
@@ -808,6 +1006,22 @@ function mountTrain(ctx) {
   const lenIn = el('input', 'fs-input');
   lenIn.placeholder = '固定秒数（如 3.7）';
   lenIn.style.display = 'none';
+  const sepSel = el('select', 'fs-btn');
+  sepSel.title = '训练素材分离引擎：UVR5 RoFormer 干声更干净（未装 audio-separator 自动回落 htdemucs）';
+  for (const [v, t] of [
+    ['roformer', 'UVR5 RoFormer 精分（推荐）'],
+    ['htdemucs', 'htdemucs 快速分离'],
+  ]) {
+    const o = el('option', '', t);
+    o.value = v;
+    sepSel.append(o);
+  }
+  const derevChk = el('input', 'fs-ck');
+  derevChk.type = 'checkbox';
+  derevChk.checked = true;
+  const derevLabel = el('label', 'fs-meta', '去混响');
+  derevLabel.title = '分离后再用 UVR5 De-Reverb 净化原唱混响，推荐训练时开启';
+  derevLabel.prepend(derevChk);
   const startBtn = el('button', 'fs-btn', '开始处理');
   startBtn.disabled = true;
   const stopBtn = el('button', 'fs-btn danger', '停止');
@@ -819,7 +1033,7 @@ function mountTrain(ctx) {
   const appendLabel = el('label', 'fs-meta', '追加到当前数据集');
   appendLabel.style.display = 'none';
 
-  bar2.append(modeSel, lenIn, startBtn, stopBtn, appendChk, appendLabel, el('span', 'fs-grow'));
+  bar2.append(modeSel, lenIn, sepSel, derevLabel, startBtn, stopBtn, appendChk, appendLabel, el('span', 'fs-grow'));
 
   const msg = el('div', 'fs-msg');
   const prog = el('div', 'fs-prog');
@@ -850,8 +1064,17 @@ function mountTrain(ctx) {
   const secB = mkSec('② 训练', '一般只需要改「轮次」，其余都在展开项里', false);
   secB.body.append(trainBox);
 
+  const lowChk = el('input', 'fs-ck');
+  lowChk.type = 'checkbox';
+  lowChk.checked = false;
+  const lowLbl = el('label', 'fs-meta', '低音增强（合成 -2 / -4 半音副本）');
+  lowLbl.prepend(lowChk);
+  lowLbl.title = '有限改善：把每个切片合成 -2/-4 半音的副本一起训练。实测只能缓解、不能根治"低音不像"，且 F0/特征提取时间约 ×3';
+  const augBar = el('div', 'fs-augbar');
+  augBar.append(lowLbl, el('span', 'fs-meta', '仅在缺少真实低音素材时尝试，特征提取时间约 ×3'));
+
   const secC = mkSec('③ 高级：低音增强 / 音域加权', '给数据加降调副本、按音域调采样权重（有效但有限）', false);
-  secC.body.append(weightBox);
+  secC.body.append(augBar, weightBox);
 
   root.append(prog, msg, secA.d, secB.d, secC.d);
 
@@ -860,7 +1083,8 @@ function mountTrain(ctx) {
   let timer = null;
   let lastDir = '';
   let lastSecState = '';
-  let lastResumeAuto = '';
+  let evalLoaded = false;
+  let evalExpanded = false;
 
   const say = (t, bad) => {
     msg.textContent = t || '';
@@ -968,6 +1192,64 @@ function mountTrain(ctx) {
     }
     resultBox.append(bands);
 
+    if (ds.sourceQuality && ds.sourceQuality.length) {
+      const qDet = el('details', 'fs-sec');
+      const qSum = el('summary', '');
+      const lowCnt = ds.sourceQuality.filter((x) => x.keepRate < 60).length;
+      const failCnt = (ds.f0Failed || []).length;
+      qSum.append(
+        el('span', '', `各素材质检明细（${ds.sourceQuality.length} 首）`),
+        el('span', 'fs-sec-hint',
+          (lowCnt ? `${lowCnt} 首保留率偏低 · ` : '')
+          + (failCnt ? `${failCnt} 片音高分析失败需复查` : '保留率按低到高排列')),
+      );
+      const qBody = el('div', 'fs-sec-body');
+      const qTbl = el('table', 'fs-table');
+      const qHead = el('thead');
+      const qTr = el('tr');
+      for (const h of ['素材', '保留/总片', '保留率', '有效时长', '丢弃明细']) qTr.append(el('th', '', h));
+      qHead.append(qTr);
+      const qTb = el('tbody');
+      const dLabels = ds.dropLabels || {};
+      for (const q of ds.sourceQuality) {
+        const tr = el('tr');
+        const tdName = el('td', 'fs-file', q.source);
+        tdName.title = q.source;
+        const rateTd = el('td', 'fs-num', `${q.keepRate}%`);
+        if (q.keepRate < 60) rateTd.classList.add('fs-qual-low');
+        const why = Object.entries(q.reasons || {})
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => `${dLabels[k] || k}×${v}`)
+          .join('，') || '无';
+        tr.append(
+          tdName,
+          el('td', 'fs-num', `${q.kept}/${q.total}`),
+          rateTd,
+          el('td', 'fs-num', `${q.keptSec}s`),
+          el('td', 'fs-meta', why),
+        );
+        qTb.append(tr);
+      }
+      qTbl.append(qHead, qTb);
+      qBody.append(qTbl);
+
+      if (failCnt) {
+        const fBox = el('div', 'fs-list');
+        fBox.append(el('div', 'fs-warn', `需复查切片（f0_analysis_failed，共 ${failCnt} 片）：`));
+        for (const f of (ds.f0Failed || []).slice(0, 15)) {
+          const row = el('div', 'fs-row');
+          row.append(
+            el('span', 'n', `${f.file} · ${f.source}`),
+            el('span', 'r', `起点 ${f.start}s · 长 ${f.dur}s`),
+          );
+          fBox.append(row);
+        }
+        qBody.append(fBox);
+      }
+      qDet.append(qSum, qBody);
+      resultBox.append(qDet);
+    }
+
     if (ds.preview && ds.preview.length) {
       const pv = el('div', 'fs-list');
       for (const p of ds.preview) {
@@ -984,14 +1266,18 @@ function mountTrain(ctx) {
   let wrows = [];
   let wPresets = [];
   let wRefs = [];
+  let wFootMeta = null;
+
+  const currentBatch = () => Math.max(1, Number((bsSel && bsSel.value) || 4));
 
   const afterShares = () => {
+    const batch = currentBatch();
     const counts = wrows.map(() => 0);
     let total = 0;
     for (let bucket = 0; bucket < 8; bucket++) {
       const n = wrows.reduce((sum, r) => sum + (r.buckets?.[bucket] || 0), 0);
       if (!n) continue;
-      const draws = Math.ceil(n / 4) * 4;
+      const draws = Math.ceil(n / batch) * batch;
       const denominator = wrows.reduce((sum, r) => sum + (r.buckets?.[bucket] || 0) * (wcfg.bands[r.id] ?? 1), 0);
       wrows.forEach((r, i) => { counts[i] += draws * (r.buckets?.[bucket] || 0) * (wcfg.bands[r.id] ?? 1) / denominator; });
       total += draws;
@@ -1000,6 +1286,7 @@ function mountTrain(ctx) {
   };
 
   const paintWeightNumbers = () => {
+    const batch = currentBatch();
     const afters = afterShares();
     wrows.forEach((r, i) => {
       const ref = wRefs[i];
@@ -1010,6 +1297,9 @@ function mountTrain(ctx) {
       ref.share.className = `fs-wshift ${dir}`;
       ref.times.textContent = `${wcfg.bands[r.id] ?? 1}x`;
     });
+    if (wFootMeta) {
+      wFootMeta.textContent = `预览为桶内抽样片数占比（非增强 / batch ${batch}），不是时长占比；以训练采样报告为准，增强副本按原片音域归组`;
+    }
   };
 
   const renderWeights = (cfg, rows) => {
@@ -1099,7 +1389,8 @@ function mountTrain(ctx) {
         /* 错误已显示 */
       }
     });
-    foot.append(saveBtn, el('span', 'fs-meta', '预览为桶内抽样片数占比（非增强 / batch4），不是时长占比；以训练采样报告为准，增强副本按原片音域归组'));
+    wFootMeta = el('span', 'fs-meta', '');
+    foot.append(saveBtn, wFootMeta);
     weightBox.append(foot);
 
     paintWeightNumbers();
@@ -1259,6 +1550,9 @@ function mountTrain(ctx) {
     o.selected = v === 4;
     bsSel.append(o);
   }
+  bsSel.addEventListener('change', () => {
+    if (wrows.length) paintWeightNumbers();
+  });
   const seIn = el('input', 'fs-tin');
   seIn.type = 'number';
   seIn.min = '1';
@@ -1279,11 +1573,24 @@ function mountTrain(ctx) {
     return wrap;
   };
 
+  const resumeLastBtn = el('button', 'fs-btn', '');
+  resumeLastBtn.style.display = 'none';
+  resumeLastBtn.title = '填入上次实验名并勾选「从上次存档继续」（需保持数据集与增强参数完全一致）';
+  let lastResumeInfo = null;
+  resumeLastBtn.addEventListener('click', () => {
+    if (!lastResumeInfo) return;
+    expIn.value = lastResumeInfo.exp;
+    resumeChk.checked = true;
+    tMsg.textContent = `已切换到续训「${lastResumeInfo.exp}」（已有 ${lastResumeInfo.done} 轮，请确认轮次大于 ${lastResumeInfo.done}）`;
+    tMsg.classList.remove('bad');
+  });
+
   tForm.append(
     mkField('实验名', expIn, '从头训练使用新实验名；同名仅允许数据一致的断点续训'),
     mkField('轮次', epIn, '先训练 40～70 轮，使用独立试听选模，增加轮次不保证更好'),
     mkField('批大小', bsSel, '8G 显存用 4，爆显存就降到 2'),
     mkField('每 N 轮存档', seIn, '每 N 轮导出一个小模型到「模型」页'),
+    resumeLastBtn,
   );
   const pruneAfterChk = el('input', 'fs-ck');
   pruneAfterChk.type = 'checkbox';
@@ -1298,25 +1605,50 @@ function mountTrain(ctx) {
   pruneAfterLbl.title = '按下面「每 N 轮留一个」保留，其余删掉。不勾就只是提醒你手动清。';
   const abChk = el('input', 'fs-ck');
   abChk.type = 'checkbox';
-  abChk.checked = false; // 用户要求：不默认勾，想要就自己点
+  abChk.checked = false;
   const abLbl = el('label', 'fs-meta', '训练完生成选模对比');
   abLbl.prepend(abChk);
-  abLbl.title = '用下面独立的低、中、高音干声对比 final 和最后两个中间档，关闭检索';
-  const lowChk = el('input', 'fs-ck');
-  lowChk.type = 'checkbox';
-  lowChk.checked = false; // 用户要求：不默认勾（实测只是有限改善）
-  const lowLbl = el('label', 'fs-meta', '低音增强');
-  lowLbl.prepend(lowChk);
-  lowLbl.title = '有限改善：把每个切片合成 -2/-4 半音的副本一起训练。实测只能缓解、不能根治"低音不像"（模型在低音区本来就没有音色记忆），且 F0/特征提取时间约 ×3';
-  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, lowLbl, el('span', 'fs-grow'), startT, stopT);
+  abLbl.title = '用独立的低、中、高音三段干声对比 final 和最后两个中间档，关闭检索';
+  const evalToggleBtn = el('button', 'fs-btn', '选模素材');
+  evalToggleBtn.title = '展开或收起低、中、高音三段独立干声路径输入框（自动记住上次填写）';
+  chkRow.append(resumeLbl, rebuildLbl, pruneAfterLbl, abLbl, evalToggleBtn, el('span', 'fs-grow'), startT, stopT);
 
-  const evaluationInputs = ['低音', '中音', '高音'].map(band => {
-    const input = el('input', 'fs-tin');
-    input.placeholder = `${band}独立干声路径（未参与训练，含长音，建议10～30秒）`;
-    return input;
+  const evalBands = ['低音', '中音', '高音'];
+  const evaluationInputs = [];
+  const evaluationBox = el('div', 'fs-eval');
+  evaluationBox.style.display = 'none';
+  evaluationBox.append(el('div', 'fs-meta', '选模素材：固定低、中、高音三段独立干声（自动保存，勿使用训练素材或同一首歌的其他片段）。'));
+  const persistEvalPaths = () => {
+    const vals = evaluationInputs.map((inp) => String(inp.value || '').trim().replace(/^["']|["']$/g, ''));
+    evaluationInputs.forEach((inp, idx) => { inp.value = vals[idx]; });
+    void ctx.invoke('saveEvalPaths', [vals]).catch(() => undefined);
+  };
+  for (const band of evalBands) {
+    const row = el('div', 'fs-eval-row');
+    const lbl = el('span', 'fs-meta', band);
+    const input = el('input', 'fs-eval-in');
+    input.placeholder = `${band}独立干声绝对路径（含长音，建议 10～30 秒）`;
+    input.addEventListener('change', persistEvalPaths);
+    row.append(lbl, input);
+    evaluationBox.append(row);
+    evaluationInputs.push(input);
+  }
+
+  const syncEvalVisible = () => {
+    const show = abChk.checked || evalExpanded;
+    evaluationBox.style.display = show ? 'flex' : 'none';
+    evalToggleBtn.classList.toggle('on', show);
+  };
+  abChk.addEventListener('change', syncEvalVisible);
+  evalToggleBtn.addEventListener('click', () => {
+    evalExpanded = !evalExpanded;
+    syncEvalVisible();
+    if (evalExpanded) {
+      const firstEmpty = evaluationInputs.find((i) => !i.value.trim()) || evaluationInputs[0];
+      firstEmpty.focus();
+    }
   });
-  const evaluationBox = el('div', 'fs-list');
-  evaluationBox.append(el('div', 'fs-meta', '选模素材：固定低、中、高音三段独立干声。请确认没有同一首歌的片段进入训练集。'), ...evaluationInputs);
+
   const samplingText = el('div', 'fs-meta');
   const tProg = el('div', 'fs-prog');
   const tFill = el('i');
@@ -1326,7 +1658,6 @@ function mountTrain(ctx) {
   const lossAxis = el('div', 'fs-haxis');
   const tModels = el('div', 'fs-list');
 
-  const tTitle = el('div', 'fs-wtitle', '训练');
   const ckptBar = el('div', 'fs-bar');
   const ckptMeta = el('span', 'fs-meta', '');
   const keepIn = el('input', 'fs-tin');
@@ -1340,7 +1671,7 @@ function mountTrain(ctx) {
   abBtn.title = '用独立低、中、高音干声对比 final 和最后两个中间档，关闭检索';
   ckptBar.append(el('span', 'fs-meta', '中间档：'), ckptMeta, el('span', 'fs-meta', '每'),
     keepIn, el('span', 'fs-meta', '轮留一个'), el('span', 'fs-grow'), abBtn, pruneBtn);
-  trainBox.append(tTitle, tForm, chkRow, evaluationBox, tProg, tMsg, samplingText, losses, lossAxis, tModels, ckptBar);
+  trainBox.append(tForm, chkRow, evaluationBox, tProg, tMsg, samplingText, losses, lossAxis, tModels, ckptBar);
 
   let trainExp = '';
   let trainTimer = null;
@@ -1361,13 +1692,25 @@ function mountTrain(ctx) {
       tMsg.textContent = '先填实验名（或跑一次训练）再生成选模对比';
       return;
     }
+    const paths = evaluationInputs.map((input) => input.value.trim().replace(/^["']|["']$/g, ''));
+    const missingIdx = paths.findIndex((p) => !p);
+    if (missingIdx >= 0) {
+      evalExpanded = true;
+      syncEvalVisible();
+      evaluationInputs[missingIdx].focus();
+      tMsg.textContent = '请先填完低、中、高音三段独立干声路径，再生成选模对比';
+      tMsg.classList.add('bad');
+      return;
+    }
     abBtn.disabled = true;
     abBtn.textContent = '生成中…';
     try {
-      const r = await ctx.invoke('trainAbTest', [{ exp, evaluationPaths: evaluationInputs.map(input => input.value.trim()) }]);
+      const r = await ctx.invoke('trainAbTest', [{ exp, evaluationPaths: paths }]);
       tMsg.textContent = (r && r.text) || `选模对比已生成（${exp}）`;
+      tMsg.classList.remove('bad');
     } catch (e) {
       tMsg.textContent = `选模对比失败：${(e && e.message) || e}`;
+      tMsg.classList.add('bad');
     } finally {
       abBtn.disabled = false;
       abBtn.textContent = '生成选模对比';
@@ -1452,6 +1795,14 @@ function mountTrain(ctx) {
     const log = st.log || { done: 0, losses: [], latest: null, secPerEpoch: null, error: '' };
     const total = st.total || 0;
 
+    if (!evalLoaded && Array.isArray(st.evaluationPaths)) {
+      evalLoaded = true;
+      st.evaluationPaths.forEach((p, idx) => {
+        if (evaluationInputs[idx] && !evaluationInputs[idx].value && p) {
+          evaluationInputs[idx].value = String(p);
+        }
+      });
+    }
     // 分区自动展开：谁在跑就展开谁；都空闲就全收起（用户手动展开的不动）
     const secState = running ? 'train' : (st.datasetBusy ? 'ds' : 'idle');
     if (secState !== lastSecState) {
@@ -1459,10 +1810,14 @@ function mountTrain(ctx) {
       secB.d.open = secState === 'train';
       secA.d.open = secState === 'ds';
     }
-    // 有没训完的记录、当前又没在训练 → 自动勾「从上次存档继续」（每个实验只代勾一次）
-    if (!running && log.done > 0 && st.exp && lastResumeAuto !== st.exp) {
-      resumeChk.checked = true;
-      lastResumeAuto = st.exp;
+    // 取消静默代勾「从上次存档继续」，改为显式快捷按钮，避免新实验误触指纹报错
+    if (!running && log.done > 0 && st.exp) {
+      lastResumeInfo = { exp: st.exp, done: log.done };
+      resumeLastBtn.textContent = `续训 ${st.exp}（${log.done} 轮）`;
+      resumeLastBtn.style.display = '';
+    } else {
+      lastResumeInfo = null;
+      resumeLastBtn.style.display = 'none';
     }
 
     startT.disabled = running || st.datasetBusy;
@@ -1567,6 +1922,17 @@ function mountTrain(ctx) {
       say('先选一个数据集', true);
       return;
     }
+    const evalPaths = evaluationInputs.map((input) => input.value.trim().replace(/^["']|["']$/g, ''));
+    if (abChk.checked) {
+      const missingIdx = evalPaths.findIndex((p) => !p);
+      if (missingIdx >= 0) {
+        evalExpanded = true;
+        syncEvalVisible();
+        evaluationInputs[missingIdx].focus();
+        say('已勾选「训练完生成选模对比」，请先填完低、中、高音三段独立干声路径', true);
+        return;
+      }
+    }
     startT.disabled = true;
     try {
       const r = await call('trainStart', [{
@@ -1578,7 +1944,7 @@ function mountTrain(ctx) {
         rebuild: rebuildChk.checked,
         pruneAfter: pruneAfterChk.checked,
         abTest: abChk.checked,
-        evaluationPaths: evaluationInputs.map(input => input.value.trim()),
+        evaluationPaths: evalPaths,
         augment: lowChk.checked,
         keepEvery: Math.max(1, Number(keepIn.value) || 50),
       }]);
@@ -1682,7 +2048,11 @@ function mountTrain(ctx) {
       say('没勾选任何素材', true);
       return;
     }
-    const params = { sliceMode: modeSel.value };
+    const params = {
+      sliceMode: modeSel.value,
+      separator: sepSel.value,
+      dereverb: derevChk.checked,
+    };
     if (modeSel.value === 'fixed') params.targetLen = Number(lenIn.value) || 3.7;
     const opts = lastDir && appendChk.checked ? { dir: lastDir, append: true } : {};
     startBtn.disabled = true;
@@ -1705,6 +2075,393 @@ function mountTrain(ctx) {
   return {
     dispose() {
       if (timer) clearInterval(timer);
+      if (trainTimer) clearInterval(trainTimer);
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ 试唱 / 点歌 */
+
+function mountSing(ctx) {
+  ensureStyle();
+
+  const root = ctx.root;
+  root.classList.add('fs-wrap');
+
+  const mkField = (label, node) => {
+    const box = el('label', 'fs-field');
+    box.append(el('span', 'fs-flabel', label), node);
+    return box;
+  };
+  const mkSel = (opts, defVal) => {
+    const s = el('select', 'fs-btn');
+    for (const [v, t] of opts) {
+      const o = el('option', '', t);
+      o.value = v;
+      if (String(v) === String(defVal)) o.selected = true;
+      s.append(o);
+    }
+    return s;
+  };
+
+  // ---- 顶栏：搜索 / 指定来源 + 核心操作
+  const bar1 = el('div', 'fs-bar');
+  const songIn = el('input', 'fs-tpath');
+  songIn.placeholder = '输入歌名（搜 B 站）、BV 号（BV1xx...）、B 站链接或本机音频绝对路径';
+  const orderSel = mkSel([['default', 'B 站综合'], ['click', '按播放量'], ['pubdate', '按最新']], 'default');
+  const searchBtn = el('button', 'fs-btn', 'B 站搜歌');
+  const singBtn = el('button', 'fs-btn on', '开始试唱');
+  const stopBtn = el('button', 'fs-btn danger', '停止');
+  const unloadBtn = el('button', 'fs-btn', '释放显存');
+  unloadBtn.title = '立即卸载常驻 GPU 模型归还显存（下次点歌自动拉回）';
+  bar1.append(songIn, orderSel, searchBtn, singBtn, stopBtn, unloadBtn);
+
+  // ---- 调参栏
+  const bar2 = el('div', 'fs-sgrid');
+  const startIn = el('input', 'fs-sin-sm');
+  startIn.type = 'number';
+  startIn.placeholder = '0';
+  const durIn = el('input', 'fs-sin-sm');
+  durIn.type = 'number';
+  durIn.placeholder = '整首';
+  const pitchIn = el('input', 'fs-sin-sm');
+  pitchIn.value = 'auto';
+  pitchIn.title = 'auto 或半音数（如 0、+3、-2）';
+  const idxIn = el('input', 'fs-sin-sm');
+  idxIn.type = 'number';
+  idxIn.step = '0.05';
+  idxIn.min = '0';
+  idxIn.max = '1';
+  const protIn = el('input', 'fs-sin-sm');
+  protIn.type = 'number';
+  protIn.step = '0.02';
+  protIn.min = '0';
+  protIn.max = '0.5';
+  const rmsIn = el('input', 'fs-sin-sm');
+  rmsIn.type = 'number';
+  rmsIn.step = '0.05';
+  rmsIn.min = '0';
+  rmsIn.max = '1';
+
+  const modeSel = mkSel([['full', '带伴奏'], ['vocals', '清唱']], 'full');
+  const sepSel = mkSel([['htdemucs', '快速 htdemucs'], ['roformer', 'UVR5 RoFormer 精唱']], 'htdemucs');
+  const derevSel = mkSel([['off', '关去混响'], ['on', '开去混响']], 'off');
+  const f0Sel = mkSel([['rmvpe', 'rmvpe'], ['fcpe', 'fcpe']], 'rmvpe');
+  const dynSel = mkSel([['off', '统一音色'], ['soft-verse-bright-chorus', '主歌柔/副歌亮']], 'off');
+  const harmSel = mkSel([
+    ['off', '无和声'],
+    ['double', '双轨厚声(副歌)'],
+    ['double+third', '双轨+轻三度'],
+    ['third', '三度和声'],
+    ['third+fifth', '三+五度'],
+  ], 'off');
+  const revSel = mkSel([['off', '关混响'], ['light', '轻度混响']], 'off');
+  const toIn = el('input', 'fs-tin');
+  toIn.value = 'local';
+  toIn.title = 'local / group:群号 / private:QQ号';
+  const refreshChk = el('input', 'fs-ck');
+  refreshChk.type = 'checkbox';
+  const refreshLbl = el('label', 'fs-meta', '忽略缓存');
+  refreshLbl.prepend(refreshChk);
+
+  bar2.append(
+    mkField('起始(秒)', startIn),
+    mkField('时长(秒)', durIn),
+    mkField('移调', pitchIn),
+    mkField('indexRate', idxIn),
+    mkField('protect', protIn),
+    mkField('rmsMix', rmsIn),
+    mkField('模式', modeSel),
+    mkField('分离', sepSel),
+    mkField('去混响', derevSel),
+    mkField('F0', f0Sel),
+    mkField('主副歌', dynSel),
+    mkField('和声', harmSel),
+    mkField('混响', revSel),
+    mkField('投递', toIn),
+    refreshLbl,
+  );
+
+  const prog = el('div', 'fs-prog');
+  const fill = el('i');
+  prog.append(fill);
+  const msg = el('div', 'fs-msg');
+  const statusMeta = el('div', 'fs-meta', '');
+  const hitsBox = el('div', '');
+
+  // ---- 折叠区：歌词时间轴、声学体检 & 局部返工补录
+  const patchSec = el('details', 'fs-sec');
+  const patchSum = el('summary', '');
+  patchSum.append(
+    el('span', '', '歌词时间轴 / 声学体检 & 局部返工补录'),
+    el('span', 'fs-sec-hint', '唱完后可查看体检、按句号/副歌/当前句局部重唱'),
+  );
+  const patchBody = el('div', 'fs-sec-body');
+  const pBar = el('div', 'fs-sgrid');
+  const lyrLoadBtn = el('button', 'fs-btn', '读取歌词与体检');
+  const lyrRefBtn = el('button', 'fs-btn', '重新联网匹配歌词');
+  const pLocSel = mkSel([['lines', '按句号/关键词'], ['chorus', '第 1 段副歌'], ['current', '当前正唱这句']], 'lines');
+  const pLinesIn = el('input', 'fs-sin-sm');
+  pLinesIn.placeholder = '如 7-9';
+  const pKwIn = el('input', 'fs-tin');
+  pKwIn.placeholder = '歌词关键词';
+  const pProtIn = el('input', 'fs-sin-sm');
+  pProtIn.type = 'number';
+  pProtIn.step = '0.02';
+  pProtIn.placeholder = '不变';
+  const pIdxIn = el('input', 'fs-sin-sm');
+  pIdxIn.type = 'number';
+  pIdxIn.step = '0.05';
+  pIdxIn.placeholder = '不变';
+  const pPrevChk = el('input', 'fs-ck');
+  pPrevChk.type = 'checkbox';
+  pPrevChk.checked = true;
+  const pPrevLbl = el('label', 'fs-meta', '仅试听这句');
+  pPrevLbl.prepend(pPrevChk);
+  const pRunBtn = el('button', 'fs-btn on', '局部返工补录');
+  pBar.append(
+    lyrLoadBtn,
+    lyrRefBtn,
+    mkField('定位', pLocSel),
+    mkField('句号', pLinesIn),
+    mkField('关键词', pKwIn),
+    mkField('protect', pProtIn),
+    mkField('indexRate', pIdxIn),
+    pPrevLbl,
+    pRunBtn,
+  );
+  const pMsg = el('div', 'fs-msg');
+  const lyrPre = el('pre', 'fs-pre', '点「读取歌词与体检」查看最近一首歌的时间轴歌词与声学体检明细');
+  patchBody.append(pBar, pMsg, lyrPre);
+  patchSec.append(patchSum, patchBody);
+
+  root.append(bar1, bar2, prog, msg, statusMeta, hitsBox, patchSec);
+
+  let inited = false;
+  let pollTimer = null;
+
+  const say = (t, bad) => {
+    msg.textContent = t || '';
+    msg.classList.toggle('bad', Boolean(bad));
+  };
+
+  const refreshStatus = async () => {
+    try {
+      const st = await ctx.invoke('status', []);
+      if (!inited && st && st.defaults) {
+        inited = true;
+        const d = st.defaults;
+        pitchIn.value = String(d.pitch ?? 'auto');
+        idxIn.value = String(d.indexRate ?? 0.75);
+        protIn.value = String(d.protect ?? 0.33);
+        rmsIn.value = String(d.rmsMixRate ?? 0);
+        modeSel.value = d.mode || 'full';
+        sepSel.value = d.separator || 'htdemucs';
+        derevSel.value = d.dereverb ? 'on' : 'off';
+        f0Sel.value = d.f0Method || 'rmvpe';
+        dynSel.value = d.dynamicStyle || 'off';
+        harmSel.value = d.harmony || 'off';
+        revSel.value = d.reverb || 'off';
+      }
+      const w = st && st.worker;
+      const cur = w && w.current;
+      const pb = st && st.playback;
+      const parts = [];
+      parts.push(`模型：${(st && st.model) || '—'}`);
+      if (w && w.engine) {
+        parts.push(w.engine.ready ? '显存已预热' : '已休眠省显存');
+        if (w.engine.uvrAvailable) parts.push('UVR5可用');
+      } else {
+        parts.push('worker 待启动');
+      }
+      if (cur) {
+        const pct = Math.round((cur.progress || 0) * 100);
+        fill.style.width = `${pct}%`;
+        parts.push(`进度 ${pct}%：${cur.message || ''}`);
+      } else if (!st.busy) {
+        fill.style.width = '0%';
+      }
+      if (pb && pb.playing) {
+        const ltxt = pb.currentLine ? ` · 第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : '';
+        parts.push(`播放中《${pb.title || ''}》${fmtDur(pb.elapsedSec)}/${fmtDur(pb.durationSec)}${ltxt}`);
+      }
+      statusMeta.textContent = parts.join(' · ');
+      singBtn.disabled = Boolean(st && (st.busy || st.training));
+    } catch (e) {
+      statusMeta.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  const runSing = async (songOverride) => {
+    const song = String(songOverride ?? songIn.value ?? '').trim();
+    if (!song) {
+      say('请先输入歌名、BV 号或本机路径', true);
+      return;
+    }
+    if (songOverride) songIn.value = songOverride;
+    const payload = {
+      song,
+      mode: modeSel.value,
+      to: toIn.value.trim() || 'local',
+      order: orderSel.value,
+      separator: sepSel.value,
+      dereverb: derevSel.value === 'on',
+      f0Method: f0Sel.value,
+      dynamicStyle: dynSel.value,
+      harmony: harmSel.value,
+      reverb: revSel.value,
+      refresh: refreshChk.checked,
+    };
+    if (startIn.value !== '') payload.start = Number(startIn.value);
+    if (durIn.value !== '') payload.duration = Number(durIn.value);
+    if (pitchIn.value.trim() !== '') payload.pitch = pitchIn.value.trim();
+    if (idxIn.value !== '') payload.indexRate = Number(idxIn.value);
+    if (protIn.value !== '') payload.protect = Number(protIn.value);
+    if (rmsIn.value !== '') payload.rmsMixRate = Number(rmsIn.value);
+
+    singBtn.disabled = true;
+    say('处理中（分离 / 换声 / 体检 / 混音），请观察下方实时进度…');
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => void refreshStatus(), 1200);
+    try {
+      const r = await ctx.invoke('sing', [payload]);
+      fill.style.width = '100%';
+      say((r && r.text) || '试唱完成');
+      void loadLyrics(false);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    } finally {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      await refreshStatus();
+    }
+  };
+
+  const loadLyrics = async (forceRefresh) => {
+    try {
+      const r = await ctx.invoke('lyrics', [Boolean(forceRefresh)]);
+      lyrPre.textContent = (r && r.body) || (r && r.text) || '暂无歌词记录';
+    } catch (e) {
+      lyrPre.textContent = (e && e.message) || String(e);
+    }
+  };
+
+  searchBtn.addEventListener('click', async () => {
+    const kw = songIn.value.trim();
+    if (!kw) {
+      say('请先输入要搜的歌名或关键词', true);
+      return;
+    }
+    searchBtn.disabled = true;
+    say(`正在 B 站搜索「${kw}」…`);
+    hitsBox.replaceChildren();
+    try {
+      const r = await ctx.invoke('search', [kw, orderSel.value]);
+      const hits = (r && r.hits) || [];
+      if (!hits.length) {
+        say('B 站没搜到候选，换个关键词或直接贴 BV 号', true);
+        return;
+      }
+      say(`搜到 ${hits.length} 条，点「选这条唱」即可拉取试唱`);
+      const tbl = el('table', 'fs-table');
+      const thead = el('thead');
+      const htr = el('tr');
+      for (const h of ['#', '标题', '时长', 'UP 主', '播放', 'BV 号', '操作']) htr.append(el('th', '', h));
+      thead.append(htr);
+      const tbody = el('tbody');
+      hits.forEach((h, i) => {
+        const tr = el('tr');
+        const wan = h.play >= 10000 ? `${(h.play / 10000).toFixed(1)}万` : String(h.play);
+        const tdT = el('td', 'fs-title', h.title);
+        tdT.title = h.title;
+        const tdA = el('td', 'fs-acts');
+        const pick = el('button', 'fs-btn on', '选这条唱');
+        pick.addEventListener('click', () => void runSing(h.bvid));
+        const fillBv = el('button', 'fs-btn', '填 BV');
+        fillBv.addEventListener('click', () => {
+          songIn.value = h.bvid;
+          songIn.focus();
+        });
+        tdA.append(pick, fillBv);
+        tr.append(
+          el('td', 'fs-num', String(i + 1)),
+          tdT,
+          el('td', 'fs-num', fmtDur(h.durationSec)),
+          el('td', 'fs-meta', h.author || ''),
+          el('td', 'fs-num', wan),
+          el('td', 'fs-mname', h.bvid),
+          tdA,
+        );
+        tbody.append(tr);
+      });
+      tbl.append(thead, tbody);
+      hitsBox.append(tbl);
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    } finally {
+      searchBtn.disabled = false;
+    }
+  });
+
+  singBtn.addEventListener('click', () => void runSing());
+  stopBtn.addEventListener('click', async () => {
+    try {
+      const r = await ctx.invoke('stop', []);
+      say((r && r.text) || '已停止');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    }
+    void refreshStatus();
+  });
+  unloadBtn.addEventListener('click', async () => {
+    unloadBtn.disabled = true;
+    try {
+      const r = await ctx.invoke('unload', []);
+      say((r && r.text) || '已释放显存');
+    } catch (e) {
+      say((e && e.message) || String(e), true);
+    } finally {
+      unloadBtn.disabled = false;
+      void refreshStatus();
+    }
+  });
+  songIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') searchBtn.click();
+  });
+
+  lyrLoadBtn.addEventListener('click', () => void loadLyrics(false));
+  lyrRefBtn.addEventListener('click', () => void loadLyrics(true));
+  pRunBtn.addEventListener('click', async () => {
+    const payload = { previewOnly: pPrevChk.checked, to: 'local' };
+    if (pLocSel.value === 'chorus') payload.section = 'chorus';
+    else if (pLocSel.value === 'current') payload.atCurrent = true;
+    else {
+      if (pLinesIn.value.trim()) payload.lines = pLinesIn.value.trim();
+      if (pKwIn.value.trim()) payload.lyric = pKwIn.value.trim();
+    }
+    if (pProtIn.value !== '') payload.protect = Number(pProtIn.value);
+    if (pIdxIn.value !== '') payload.indexRate = Number(pIdxIn.value);
+    pRunBtn.disabled = true;
+    pMsg.classList.remove('bad');
+    pMsg.textContent = '局部返工换声中（仅重跑目标句，约 2~6 秒）…';
+    try {
+      const r = await ctx.invoke('patch', [payload]);
+      pMsg.textContent = (r && r.text) || '返工完成';
+    } catch (e) {
+      pMsg.classList.add('bad');
+      pMsg.textContent = (e && e.message) || String(e);
+    } finally {
+      pRunBtn.disabled = false;
+      void refreshStatus();
+    }
+  });
+
+  void refreshStatus();
+  return {
+    dispose() {
+      if (pollTimer) clearInterval(pollTimer);
     },
   };
 }
@@ -1712,6 +2469,7 @@ function mountTrain(ctx) {
 export default {
   panels: {
     setup: { mount: mountSetup },
+    sing: { mount: mountSing },
     train: { mount: mountTrain },
     models: { mount: mountModels },
     library: { mount },

@@ -34,6 +34,7 @@ from engine import CHUNK_SEC, SingEngine, doctor, log
 PORT = int(os.environ.get("FISHSING_PORT", "9890"))
 TOKEN = os.environ.get("FISHSING_TOKEN", "").strip()
 WORK_ROOT = Path(os.environ.get("FISHSING_WORK", r"D:\AI\cortico-world-fish-sing\data\work"))
+IDLE_UNLOAD_SEC = max(0, int(os.environ.get("FISHSING_IDLE_UNLOAD_SEC", "600") or 0))
 
 ENGINE = SingEngine()
 JOBS: dict = {}
@@ -41,6 +42,7 @@ JOB_ORDER: list = []
 CURRENT = {"id": None, "cancel": None}
 QUEUE: "queue.Queue[tuple]" = queue.Queue()
 LOCK = threading.Lock()
+LAST_ACTIVE = time.time()
 
 
 def now() -> float:
@@ -78,12 +80,14 @@ def update(jid: str, **kw) -> None:
 
 
 def worker_loop() -> None:
+    global LAST_ACTIVE
     while True:
         jid, kind, params = QUEUE.get()
         cancel = threading.Event()
         with LOCK:
             CURRENT["id"] = jid
             CURRENT["cancel"] = cancel
+            LAST_ACTIVE = now()
         update(jid, state="running", message="开始", startedAt=now())
         try:
             result = run_job(jid, kind, params, cancel)
@@ -100,14 +104,35 @@ def worker_loop() -> None:
             with LOCK:
                 CURRENT["id"] = None
                 CURRENT["cancel"] = None
+                LAST_ACTIVE = now()
             QUEUE.task_done()
 
 
+def idle_watchdog() -> None:
+    """后台巡检：空闲超过 IDLE_UNLOAD_SEC 后自动卸载 GPU 模型归还显存。"""
+    while True:
+        time.sleep(30)
+        if IDLE_UNLOAD_SEC <= 0:
+            continue
+        with LOCK:
+            busy = CURRENT["id"] is not None or not QUEUE.empty()
+            idle_for = now() - LAST_ACTIVE
+        if not busy and ENGINE.ready and idle_for >= IDLE_UNLOAD_SEC:
+            mins = max(1, round(IDLE_UNLOAD_SEC / 60))
+            ENGINE.unload(f"空闲超过 {mins} 分钟")
+
+
 def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
-    # 做数据集不需要唱歌模型：白加载会占用 1.5 GB 显存，还会让 demucs 更容易 OOM
-    if kind in ("song", "convert", "ab") and not ENGINE.ready:
-        update(jid, message="加载模型")
-        ENGINE.load()
+    # 做数据集或训练不需要唱歌模型：先释放常驻权重，避免 8G 卡在分离或训练时 OOM
+    if kind in ("train", "dataset") and ENGINE.ready:
+        update(jid, message="释放唱歌模型显存")
+        ENGINE.unload("腾出显存给训练/分离任务")
+    elif kind in ("song", "convert", "ab", "patch") and not ENGINE.ready:
+        # 精唱 RoFormer 分离阶段会在 separate() 里按需腾显存；其他任务先加载模型
+        if not (kind == "song" and bool(params.get("separate", True))
+                and str(params.get("separator", "htdemucs")).lower() in ("roformer", "uvr", "uvr5")):
+            update(jid, message="加载模型")
+            ENGINE.load()
 
     def progress(p: float, m: str) -> None:
         update(jid, progress=round(max(0.0, min(1.0, p)), 3), message=m)
@@ -126,7 +151,44 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             protect=float(params.get("protect", 0.33)),
             # 0 = 音量完全跟随原唱（轻唱不会被唱满）；老版本传 1.0 = 不跟随
             rms_mix_rate=float(params.get("rms_mix_rate", 0.0)),
+            f0_method=str(params.get("f0_method", "rmvpe")),
+            separator=str(params.get("separator", "htdemucs")),
+            dereverb=bool(params.get("dereverb", False)),
+            dynamic_style=str(params.get("dynamic_style", "off")),
+            segments=params.get("segments") or None,
+            snap_cut=params.get("snap_cut") or None,
+            session_dir=Path(params["session_dir"]) if params.get("session_dir") else None,
             harmony=params.get("harmony") or None,
+            reverb=str(params.get("reverb", "off")),
+            polish=bool(params.get("polish", True)),
+            sep_cache=Path(params["sep_cache"]) if params.get("sep_cache") else None,
+            progress=progress,
+            cancel=cancel,
+        )
+
+    if kind == "patch":
+        work = Path(params.get("work") or (WORK_ROOT / jid))
+        return ENGINE.patch(
+            Path(params["vocal_src"]),
+            Path(params["base_conv"]),
+            Path(params["inst"]) if params.get("inst") else None,
+            work,
+            start_sec=float(params["start"]),
+            end_sec=float(params["end"]),
+            snap=bool(params.get("snap", True)),
+            base_pitch=int(params.get("base_pitch", 0)),
+            patch_pitch=None if params.get("pitch") is None else int(params["pitch"]),
+            index_rate=float(params.get("index_rate", 0.75)),
+            protect=float(params.get("protect", 0.33)),
+            rms_mix_rate=float(params.get("rms_mix_rate", 0.0)),
+            f0_method=str(params.get("f0_method", "rmvpe")),
+            model=str(params.get("model") or ""),
+            harmony=params.get("harmony") or None,
+            reverb=str(params.get("reverb", "off")),
+            polish=bool(params.get("polish", True)),
+            mode=str(params.get("mode", "full")),
+            preview_only=bool(params.get("preview_only", False)),
+            session_dir=Path(params["session_dir"]) if params.get("session_dir") else None,
             progress=progress,
             cancel=cancel,
         )
@@ -142,6 +204,7 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             index_rate=float(params.get("index_rate", 0.75)),
             protect=float(params.get("protect", 0.33)),
             rms_mix_rate=float(params.get("rms_mix_rate", 0.0)),
+            f0_method=str(params.get("f0_method", "rmvpe")),
             progress=progress, cancel=cancel,
         )
 
@@ -155,6 +218,7 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             index_rate=float(params.get("index_rate", 0.75)),
             protect=float(params.get("protect", 0.33)),
             rms_mix_rate=float(params.get("rms_mix_rate", 0.0)),
+            f0_method=str(params.get("f0_method", "rmvpe")),
             progress=progress, cancel=cancel,
         )
 
@@ -196,10 +260,13 @@ def status() -> dict:
     with LOCK:
         cur = CURRENT["id"]
         job = JOBS.get(cur) if cur else None
+        idle_sec = 0 if cur else max(0, int(now() - LAST_ACTIVE))
         return {
             "ok": True,
             "engine": ENGINE.info(),
             "queue": QUEUE.qsize(),
+            "idleSec": idle_sec,
+            "idleUnloadSec": IDLE_UNLOAD_SEC,
             "current": {
                 "id": cur,
                 "kind": job["kind"],
@@ -233,6 +300,12 @@ class Handler(BaseHTTPRequestHandler):
         h = self.headers.get("Authorization", "")
         return h.strip() == f"Bearer {TOKEN}"
 
+    def _drain_body(self) -> None:
+        """HTTP/1.1 Keep-Alive 复用连接时，POST 路由必须把请求体读完，避免残留字节污染下一次请求。"""
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 0:
+            self.rfile.read(n)
+
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
@@ -243,12 +316,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"请求体不是合法 JSON：{e}")
 
+    def _current_snapshot(self) -> "dict | None":
+        with LOCK:
+            cur = CURRENT["id"]
+            job = JOBS.get(cur) if cur else None
+            snapshot = dict(job) if job else None
+        if snapshot and job:
+            # 不带 params（里面有权重表之类的东西），但训练要的 exp/epochs 得留下
+            snapshot = {k: v for k, v in snapshot.items() if k != "params"}
+            snapshot["exp"] = str(job.get("params", {}).get("exp", ""))
+            snapshot["epochs"] = int(job.get("params", {}).get("epochs", 0) or 0)
+        return snapshot
+
     # -- 路由 --------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
         try:
             if self.path.startswith("/health"):
                 self._json(200, status())
+                return
+            if self.path.startswith("/current"):
+                if not self._auth_ok():
+                    self._json(401, {"ok": False, "message": "令牌不对"})
+                    return
+                self._json(200, {"ok": True, "job": self._current_snapshot()})
                 return
             if self.path.startswith("/doctor"):
                 self._json(200, doctor())
@@ -272,18 +363,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"ok": False, "message": "令牌不对"})
                 return
             if self.path.startswith("/current"):
+                self._drain_body()
                 # 重启 Coo 后靠它找回「上一个 worker 还在跑的那个任务」。
                 # 没有这个接口，新面板就不知道有个训练在进行，只能去猜日志。
-                with LOCK:
-                    cur = CURRENT["id"]
-                    job = JOBS.get(cur) if cur else None
-                    snapshot = dict(job) if job else None
-                if snapshot:
-                    # 不带 params（里面有权重表之类的东西），但训练要的 exp/epochs 得留下
-                    snapshot = {k: v for k, v in snapshot.items() if k != "params"}
-                    snapshot["exp"] = str(job.get("params", {}).get("exp", ""))
-                    snapshot["epochs"] = int(job.get("params", {}).get("epochs", 0) or 0)
-                self._json(200, {"ok": True, "job": snapshot})
+                self._json(200, {"ok": True, "job": self._current_snapshot()})
                 return
             if self.path.startswith("/scan"):
                 import dataset as ds
@@ -295,6 +378,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "items": ds.scan(paths)})
                 return
             if self.path.startswith("/stop"):
+                self._drain_body()
                 with LOCK:
                     cancel = CURRENT["cancel"]
                 if cancel:
@@ -303,10 +387,24 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._json(200, {"ok": True, "message": "当前没有任务"})
                 return
+            if self.path.startswith("/unload"):
+                self._drain_body()
+                with LOCK:
+                    busy = CURRENT["id"] is not None or not QUEUE.empty()
+                if busy:
+                    self._json(409, {"ok": False, "message": "当前有任务在运行，稍后再释放显存"})
+                    return
+                unloaded = ENGINE.unload("手动释放")
+                self._json(200, {
+                    "ok": True,
+                    "unloaded": unloaded,
+                    "message": "已释放常驻模型显存" if unloaded else "当前本来就没占显存",
+                })
+                return
             if self.path.startswith("/job"):
                 body = self._body()
                 kind = str(body.pop("kind", "song"))
-                if kind not in ("song", "convert", "dataset", "train", "ab"):
+                if kind not in ("song", "convert", "dataset", "train", "ab", "patch"):
                     self._json(400, {"ok": False, "message": f"未知任务类型：{kind}"})
                     return
                 job = new_job(kind, body)
@@ -318,16 +416,24 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global LAST_ACTIVE
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     t = threading.Thread(target=worker_loop, name="fishsing-job", daemon=True)
     t.start()
+    threading.Thread(target=idle_watchdog, name="fishsing-idle", daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    log(f"fish-sing worker 监听 127.0.0.1:{PORT}（工作目录 {WORK_ROOT}）")
+    idle_hint = f"空闲 {IDLE_UNLOAD_SEC // 60} 分钟自动释显存" if IDLE_UNLOAD_SEC > 0 else "不自动释显存"
+    log(f"fish-sing worker 监听 127.0.0.1:{PORT}（工作目录 {WORK_ROOT}，{idle_hint}）")
     # 预热：先把模型读进来，第一个请求就不用等 8 秒。
     # FISHSING_NO_WARMUP=1 可关掉——做准备数据集这类不需要唱歌模型的任务时，
     # 白占 1.5 GB 显存会让 demucs 更容易 OOM。
     if os.environ.get("FISHSING_NO_WARMUP") != "1":
-        threading.Thread(target=lambda: ENGINE.load(), daemon=True).start()
+        def _warmup() -> None:
+            global LAST_ACTIVE
+            ENGINE.load()
+            with LOCK:
+                LAST_ACTIVE = now()
+        threading.Thread(target=_warmup, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

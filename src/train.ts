@@ -160,6 +160,58 @@ export function summarize(m: Manifest): string {
   return parts.join('；');
 }
 
+export interface SourceQualityRow {
+  source: string;
+  total: number;
+  kept: number;
+  dropped: number;
+  keepRate: number;
+  keptSec: number;
+  reasons: Record<string, number>;
+}
+
+/** 按原始素材聚合切片质检明细，并提取 f0_analysis_failed 需复查列表，便于剔除劣质源。 */
+export function sourceQualityReport(m: Manifest): {
+  rows: SourceQualityRow[];
+  f0Failed: Array<{ file: string; source: string; start: number; dur: number }>;
+} {
+  const map = new Map<string, SourceQualityRow>();
+  const f0Failed: Array<{ file: string; source: string; start: number; dur: number }> = [];
+  for (const s of m.slices || []) {
+    const key = String(s.source || `源#${s.sourceIndex}`);
+    let row = map.get(key);
+    if (!row) {
+      row = { source: key, total: 0, kept: 0, dropped: 0, keepRate: 0, keptSec: 0, reasons: {} };
+      map.set(key, row);
+    }
+    row.total += 1;
+    if (s.kept) {
+      row.kept += 1;
+      row.keptSec += Number(s.dur || 0);
+    } else {
+      row.dropped += 1;
+      const r = String(s.drop || 'unknown');
+      row.reasons[r] = (row.reasons[r] || 0) + 1;
+      if (r === 'f0_analysis_failed') {
+        f0Failed.push({
+          file: s.file,
+          source: key,
+          start: Math.round(Number(s.start || 0) * 10) / 10,
+          dur: Math.round(Number(s.dur || 0) * 10) / 10,
+        });
+      }
+    }
+  }
+  const rows = [...map.values()].map((r) => ({
+    ...r,
+    keepRate: r.total ? Math.round((r.kept / r.total) * 1000) / 10 : 0,
+    keptSec: Math.round(r.keptSec * 10) / 10,
+  }));
+  // 保留率低的排在最前面，一眼锁定劣质源
+  rows.sort((a, b) => a.keepRate - b.keepRate || b.dropped - a.dropped);
+  return { rows, f0Failed: f0Failed.slice(0, 50) };
+}
+
 /** 数据集目录命名：按时间戳，和作品库风格一致。 */
 export function datasetDirName(dataDir: string, prefix = 'ds'): string {
   const d = new Date();
@@ -303,8 +355,9 @@ function bandOfSlice(s: SliceRecord, mode: BandMode): BandId | 'unknown' {
   return f0Band(s.f0_median);
 }
 
-/** 按长度桶估计抽样片数占比；非增强、batch4 的预览，实际值见训练采样报告。 */
-export function weightedRows(m: Manifest, cfg: WeightConfig): BandRow[] {
+/** 按长度桶估计抽样片数占比；非增强预览，实际值见训练采样报告。 */
+export function weightedRows(m: Manifest, cfg: WeightConfig, batchSize = 4): BandRow[] {
+  const stepBatch = Math.max(1, Math.round(Number(batchSize) || 4));
   const st = bandStats(m, cfg.mode);
   const buckets = Object.fromEntries(BAND_ORDER.map(id => [id, Array(8).fill(0)])) as Record<BandId, number[]>;
   for (const s of m.slices.filter(s => s.kept)) {
@@ -319,7 +372,7 @@ export function weightedRows(m: Manifest, cfg: WeightConfig): BandRow[] {
     for (let b = 0; b < 8; b++) {
       const n = BAND_ORDER.reduce((v, id) => v + buckets[id][b], 0);
       if (!n) continue;
-      const draws = Math.ceil(n / 4) * 4;
+      const draws = Math.ceil(n / stepBatch) * stepBatch;
       const denom = BAND_ORDER.reduce((v, id) => v + buckets[id][b] * (weighted ? cfg.bands[id] : 1), 0);
       for (const id of BAND_ORDER) counts[id] += draws * buckets[id][b] * (weighted ? cfg.bands[id] : 1) / denom;
       total += draws;
@@ -760,6 +813,10 @@ export interface TrainState {
   exp: string;
   epochs: number;
   startedAt: number;
+  pruneAfter?: boolean;
+  abTest?: boolean;
+  keepEvery?: number;
+  evaluationPaths?: string[];
 }
 
 const TRAIN_STATE = 'train.json';
@@ -775,7 +832,15 @@ export function readTrainState(dataDir: string): TrainState {
   if (!existsSync(f)) return { exp: '', epochs: 0, startedAt: 0 };
   try {
     const j = JSON.parse(readFileSync(f, 'utf8')) as Partial<TrainState>;
-    return { exp: String(j.exp ?? ''), epochs: Number(j.epochs ?? 0), startedAt: Number(j.startedAt ?? 0) };
+    return {
+      exp: String(j.exp ?? ''),
+      epochs: Number(j.epochs ?? 0),
+      startedAt: Number(j.startedAt ?? 0),
+      pruneAfter: j.pruneAfter === true,
+      abTest: j.abTest === true,
+      keepEvery: j.keepEvery === undefined ? undefined : Number(j.keepEvery),
+      evaluationPaths: Array.isArray(j.evaluationPaths) ? j.evaluationPaths.map(String) : undefined,
+    };
   } catch {
     return { exp: '', epochs: 0, startedAt: 0 };
   }
@@ -783,6 +848,28 @@ export function readTrainState(dataDir: string): TrainState {
 
 export function writeTrainState(dataDir: string, st: TrainState): void {
   writeFileSync(join(dataDir, TRAIN_STATE), `${JSON.stringify(st, null, 2)}\n`, 'utf8');
+}
+
+const EVAL_PATHS_FILE = 'evaluation.json';
+
+/** 读取上次保存的选模三段独立干声路径（低/中/高）。 */
+export function readEvaluationPaths(dataDir: string): string[] {
+  const f = join(dataDir, EVAL_PATHS_FILE);
+  if (!existsSync(f)) return ['', '', ''];
+  try {
+    const arr = JSON.parse(readFileSync(f, 'utf8'));
+    if (!Array.isArray(arr)) return ['', '', ''];
+    return [0, 1, 2].map((i) => String(arr[i] ?? '').trim());
+  } catch {
+    return ['', '', ''];
+  }
+}
+
+/** 持久化选模三段独立干声路径，避免每次重训重复粘贴。 */
+export function saveEvaluationPaths(dataDir: string, paths: string[]): string[] {
+  const clean = [0, 1, 2].map((i) => String(paths[i] ?? '').trim());
+  writeFileSync(join(dataDir, EVAL_PATHS_FILE), `${JSON.stringify(clean, null, 2)}\n`, 'utf8');
+  return clean;
 }
 
 /** 训练日志最后一次更新距今多少秒；没有日志返回 null。 */

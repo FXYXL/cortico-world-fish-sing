@@ -8,7 +8,15 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
-import type { WorkerPaths } from './paths.ts';
+import { LEGACY_RVC_ROOTS, type WorkerPaths } from './paths.ts';
+
+export interface ModelRange {
+  p5: number;
+  p25?: number;
+  median: number;
+  p95: number;
+  frames: number;
+}
 
 export interface ModelEntry {
   name: string;
@@ -21,6 +29,8 @@ export interface ModelEntry {
   exp: string;
   /** 这个实验对应的检索索引（相对 rvcRoot），没有就是 null */
   index: string | null;
+  /** 来自 logs/<exp>/range.json 的音域统计（Hz） */
+  range?: ModelRange | null;
   current: boolean;
 }
 
@@ -70,15 +80,42 @@ export function findIndex(paths: WorkerPaths, exp: string): string | null {
   return idx.length ? `logs/${exp}/${idx[0].f}` : null;
 }
 
+/** 读取实验目录里的 range.json（优先自托管 rvcRoot，兼容历史 RVC 目录）。 */
+export function readModelRange(paths: WorkerPaths, exp: string): ModelRange | null {
+  if (!exp) return null;
+  const roots = [paths.rvcRoot, ...LEGACY_RVC_ROOTS.filter((r) => r !== paths.rvcRoot)];
+  for (const root of roots) {
+    const file = join(root, 'logs', exp, 'range.json');
+    if (!existsSync(file)) continue;
+    try {
+      const d = JSON.parse(readFileSync(file, 'utf8')) as Partial<ModelRange>;
+      if (Number(d.p5) > 0 && Number(d.median) > 0 && Number(d.p95) > 0) {
+        return {
+          p5: Math.round(Number(d.p5)),
+          p25: d.p25 ? Math.round(Number(d.p25)) : undefined,
+          median: Math.round(Number(d.median)),
+          p95: Math.round(Number(d.p95)),
+          frames: Number(d.frames ?? 0),
+        };
+      }
+    } catch {
+      /* 损坏文件跳过 */
+    }
+  }
+  return null;
+}
+
 export function listModels(paths: WorkerPaths, currentName: string): ModelEntry[] {
   const dir = join(paths.rvcRoot, 'assets', 'weights');
   if (!existsSync(dir)) return [];
+  const rangeCache = new Map<string, ModelRange | null>();
   return readdirSync(dir)
     .filter((f) => f.toLowerCase().endsWith('.pth'))
     .map((f) => {
       const full = join(dir, f);
       const st = statSync(full);
       const { exp, epoch, step } = parseModelName(f);
+      if (!rangeCache.has(exp)) rangeCache.set(exp, readModelRange(paths, exp));
       return {
         name: f,
         sizeMb: Math.round((st.size / 1048576) * 10) / 10,
@@ -87,6 +124,7 @@ export function listModels(paths: WorkerPaths, currentName: string): ModelEntry[
         step,
         exp,
         index: findIndex(paths, exp),
+        range: rangeCache.get(exp) ?? null,
         current: f === currentName,
       };
     })

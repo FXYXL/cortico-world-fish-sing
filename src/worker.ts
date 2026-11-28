@@ -27,12 +27,26 @@ export interface WorkerOptions {
   workDir: string;
   model: string;
   index: string;
+  /** 空闲自动卸载模型释放显存的秒数；0 = 不自动释放 */
+  idleUnloadSec?: number;
+  /** UVR5 / audio-separator 权重缓存目录 */
+  uvrModelDir?: string;
 }
 
 export interface WorkerHealth {
   ok: boolean;
-  engine?: { ready: boolean; model: string; index: string; samplerate: number; loadMs: number };
+  engine?: {
+    ready: boolean;
+    model: string;
+    index: string;
+    samplerate: number;
+    loadMs: number;
+    uvrAvailable?: boolean;
+    fcpeAvailable?: boolean;
+  };
   queue?: number;
+  idleSec?: number;
+  idleUnloadSec?: number;
   current?: { id: string; message: string; progress: number } | null;
 }
 
@@ -45,8 +59,6 @@ export interface JobState {
   error?: string;
   /** 任务类型（/current 返回，重启后靠它判断是否要重新接管训练） */
   kind?: string;
-  /** 训练任务的实验名（/current 快照里额外带上） */
-  exp?: string;
   /** 训练任务额外带的信息（/current 返回） */
   exp?: string;
   epochs?: number;
@@ -164,6 +176,8 @@ export class WorkerClient {
       FISHSING_SEP_PY: this.opts.separatePython,
       FISHSING_SEP_SCRIPT: this.opts.separateScript,
       FISHSING_WORK: this.opts.workDir,
+      FISHSING_IDLE_UNLOAD_SEC: String(Math.max(0, Math.round(this.opts.idleUnloadSec ?? 600))),
+      ...(this.opts.uvrModelDir ? { FISHSING_UVR_MODEL_DIR: this.opts.uvrModelDir } : {}),
       PYTHONIOENCODING: 'utf-8',
       PYTHONUNBUFFERED: '1',
     };
@@ -241,7 +255,8 @@ export class WorkerClient {
     const ranMs = this.startedAt ? Date.now() - this.startedAt : 0;
     this.crashCount = ranMs >= 5 * 60_000 ? 1 : this.crashCount + 1;
     if (this.crashCount > 5) {
-      this.log.error('worker 连续退出 5 次都没站稳，不再自动拉起（避免无限重启）。修好环境后重启 Coo。');
+      const reportErr = this.log.error ?? this.log.warn;
+      reportErr('worker 连续退出 5 次都没站稳，不再自动拉起（避免无限重启）。修好环境后重启 Coo。');
       return;
     }
     const delay = Math.min(60_000, 5000 * 2 ** (this.crashCount - 1));
@@ -256,7 +271,13 @@ export class WorkerClient {
   /** worker 里正在跑的任务（重启后靠它重新接管训练）。没有返回 null。 */
   async currentJob(): Promise<JobState | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/current`, { signal: AbortSignal.timeout(3000) });
+      const headers: Record<string, string> = {};
+      if (this.opts.token) headers.authorization = `Bearer ${this.opts.token}`;
+      const res = await fetch(`${this.baseUrl}/current`, {
+        headers,
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) return null;
       const b = (await res.json().catch(() => ({}))) as { ok?: boolean; job?: JobState };
       return b.job ?? null;
     } catch {
@@ -324,7 +345,6 @@ export class WorkerClient {
         await new Promise((r) => setTimeout(r, 700));
         continue;
       }
-      badSince = 0;
       if (!job) {
         if (!badSince) badSince = Date.now();
         if (Date.now() - badSince > 30_000) {
@@ -333,6 +353,7 @@ export class WorkerClient {
         await new Promise((r) => setTimeout(r, 700));
         continue;
       }
+      badSince = 0;
 
       const pct = job.progress ?? 0;
       if ((job.message && job.message !== lastMsg) || Math.abs(pct - lastPct) > 1e-6) {
@@ -390,6 +411,26 @@ export class WorkerClient {
       const message = e instanceof Error ? e.message : String(e);
       this.log.warn(`取消请求发不出去（worker 没响应）：${message}`);
       return { ok: false, message: `连不上 worker：${message}` };
+    }
+  }
+
+  /** 手动释放常驻模型显存（有任务在跑时会拒绝）。 */
+  async unload(): Promise<{ ok: boolean; unloaded?: boolean; message: string }> {
+    try {
+      const res = await fetch(`${this.baseUrl}/unload`, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: '{}',
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; unloaded?: boolean; message?: string };
+      return {
+        ok: res.ok && body.ok !== false,
+        unloaded: body.unloaded,
+        message: String(body.message ?? `HTTP ${res.status}`),
+      };
+    } catch (e) {
+      return { ok: false, message: `连不上 worker：${e instanceof Error ? e.message : String(e)}` };
     }
   }
 
