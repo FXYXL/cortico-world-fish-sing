@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "cortico-world-fish-sing",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "describe": {
     "tools": [
       {
@@ -102,6 +102,10 @@
               "type": "boolean",
               "description": "分离后是否额外去混响"
             },
+            "model": {
+              "type": "string",
+              "description": "临时指定本次演唱使用的音色模型（可先调 fish_sing_status 查看全部可用模型）"
+            },
             "dynamicStyle": {
               "type": "string",
               "enum": [
@@ -185,7 +189,8 @@
               ]
             },
             "model": {
-              "type": "string"
+              "type": "string",
+              "description": "临时换另一个音色模型来唱这一句（可先调 fish_sing_status 查看本机全部可用模型）"
             },
             "previewOnly": {
               "type": "boolean"
@@ -293,6 +298,10 @@
       {
         "type": "fishsing.started",
         "description": "异步点歌准备完成并开始播放（含声学体检与歌词时间轴提示）"
+      },
+      {
+        "type": "fishsing.lyric",
+        "description": "唱中提词预告（进副歌前提前预告或按配置间隔推送下一句歌词）"
       },
       {
         "type": "fishsing.ended",

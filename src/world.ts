@@ -75,7 +75,7 @@ import {
 } from './setup.ts';
 import { duration, split, toMp3, type FfmpegDeps } from './audio.ts';
 import { rankHits, searchBili, type SearchOrder } from './bili.ts';
-import { parseTarget, Player, sendRecord } from './deliver.ts';
+import { parseTarget, Player, sendRecord, type LyricCueEvent, type LyricPushConfig } from './deliver.ts';
 import {
   addToLibrary,
   dropFromLibrary,
@@ -486,6 +486,57 @@ export class FishSingWorld implements World {
     return labels.join(' / ');
   }
 
+  private lyricPushConfig(): LyricPushConfig {
+    const p = this.opts.cfg.play;
+    const rawMode = String(p?.lyricPushMode ?? 'smart');
+    const mode: 'off' | 'smart' | 'interval' = rawMode === 'off' ? 'off' : rawMode === 'interval' ? 'interval' : 'smart';
+    return {
+      mode,
+      intervalSec: Math.max(0, Math.min(120, Number(p?.lyricPushIntervalSec ?? 25))),
+      leadSec: Math.max(0, Math.min(10, Number(p?.lyricLeadSec ?? 3))),
+    };
+  }
+
+  private emitLyricCue(cue: LyricCueEvent): void {
+    void this.pushSingEvent('fishsing.lyric', cue.text, {
+      kind: cue.kind,
+      title: cue.title,
+      elapsedSec: cue.elapsedSec,
+      durationSec: cue.durationSec,
+      nextLine: cue.nextLine,
+    });
+  }
+
+  /** 汇总本机可用的音色模型列表（优先展示各实验主模型，供工具按需返回，不占用常驻环境提示词）。 */
+  private formatAvailableModels(): string {
+    const all = listModels(this.routes, this.current.model);
+    if (!all.length) return '无';
+    // 优先展示无 _eXXX 后缀的主模型；如果某实验只有中间档，也保留最新一档
+    const byExp = new Map<string, typeof all>();
+    for (const m of all) {
+      const arr = byExp.get(m.exp) ?? [];
+      arr.push(m);
+      byExp.set(m.exp, arr);
+    }
+    const picked: typeof all = [];
+    for (const arr of byExp.values()) {
+      const finals = arr.filter((x) => x.epoch === null);
+      if (finals.length) picked.push(...finals);
+      else picked.push(arr[0]);
+    }
+    // 当前正在用的模型（即使是中间档）一定要露脸
+    if (!picked.some((x) => x.current)) {
+      const cur = all.find((x) => x.current);
+      if (cur) picked.unshift(cur);
+    }
+    return picked
+      .map((m) => {
+        const rg = m.range ? ` ${m.range.p5}–${m.range.p95}Hz` : '';
+        return `${m.name}${m.current ? '（当前）' : ''}${rg ? `(${rg.trim()})` : ''}`;
+      })
+      .join('、');
+  }
+
   private deps(): SingDeps {
     const cfg = this.opts.cfg;
     return {
@@ -529,6 +580,8 @@ export class FishSingWorld implements World {
         dynamicStyle: cfg.voice?.dynamicStyle === 'soft-verse-bright-chorus' ? 'soft-verse-bright-chorus' : 'off',
         mode: cfg.voice?.mode === 'vocals' ? 'vocals' : 'full',
       },
+      lyricPush: this.lyricPushConfig(),
+      onLyricCue: (cue: LyricCueEvent) => this.emitLyricCue(cue),
       onPlaybackEnd: (ev: PlaybackEndInfo) => {
         if (ev.reason !== 'ended') return;
         const issueHint = ev.report?.issues?.length
@@ -668,6 +721,10 @@ export class FishSingWorld implements World {
             type: 'boolean',
             description: '分离后是否额外去混响（减少原唱混响导致的电音）',
           },
+          model: {
+            type: 'string',
+            description: '临时指定本次演唱使用的音色模型（如 dfy7.pth），唱完自动恢复默认模型；可先调 fish_sing_status 查看本机全部可用音色模型',
+          },
           dynamicStyle: {
             type: 'string',
             enum: ['off', 'soft-verse-bright-chorus'],
@@ -720,6 +777,7 @@ export class FishSingWorld implements World {
           f0Method: args.f0Method === 'fcpe' || args.f0Method === 'rmvpe' ? (args.f0Method as 'rmvpe' | 'fcpe') : undefined,
           separator: args.separator === 'roformer' || args.separator === 'htdemucs' ? (args.separator as 'htdemucs' | 'roformer') : undefined,
           dereverb: typeof args.dereverb === 'boolean' ? args.dereverb : undefined,
+          model: args.model === undefined ? undefined : String(args.model),
           dynamicStyle: args.dynamicStyle === 'soft-verse-bright-chorus' || args.dynamicStyle === 'off'
             ? (args.dynamicStyle as 'off' | 'soft-verse-bright-chorus') : undefined,
           segments: Array.isArray(args.segments) ? (args.segments as SingSegmentSpec[]) : undefined,
@@ -799,7 +857,7 @@ export class FishSingWorld implements World {
           protect: { type: 'number', description: '该句新气声保护 0~0.5' },
           rmsMixRate: { type: 'number', description: '该句新音量跟随 0~1' },
           f0Method: { type: 'string', enum: ['rmvpe', 'fcpe'], description: '该句临时切换 F0 算法' },
-          model: { type: 'string', description: '临时换另一个音色模型来唱这一句（如 dfy2.pth）' },
+          model: { type: 'string', description: '临时换另一个音色模型来唱这一句（如 dfy7.pth），可先调 fish_sing_status 查看本机全部可用音色模型' },
           previewOnly: { type: 'boolean', description: 'true = 只试听返工句（前后带 2 秒上下文），不改整首；false = 贴回整首并重放' },
           to: { type: 'string', description: '投递目标，默认 local' },
         },
@@ -972,7 +1030,10 @@ export class FishSingWorld implements World {
             title: hit.title,
             durationSec: hit.durationSec,
             lyrics: snap?.lyrics as LyricsSheet | undefined,
+            chorusRanges: snap?.report?.chorusRanges,
           },
+          lyricPush: this.lyricPushConfig(),
+          onLyricCue: (cue) => this.emitLyricCue(cue),
           onEnd: (reason, elapsedSec) => {
             if (reason !== 'ended') return;
             void this.pushSingEvent(
@@ -989,12 +1050,13 @@ export class FishSingWorld implements World {
 
     list.push({
       name: 'fish_sing_status',
-      description: '唱歌功能现在能不能用：模型、显存、队列、当前在算什么。用户问「你还能唱歌吗」「刚才那首到哪了」时用。',
+      description: '查看唱歌状态、当前播到第几句，以及本机所有可用的音色模型列表（想换音色重唱或局部返工前先调这个查看有哪些模型）。',
       tags: ['music'],
       parameters: { type: 'object', properties: {}, required: [] },
       handler: async () => {
+        const modelsTxt = this.formatAvailableModels();
         const h = await this.worker.health(2000);
-        if (!h?.engine) return 'worker 没在跑（下次唱歌会自动拉起来）。';
+        if (!h?.engine) return `worker 没在跑（下次唱歌会自动拉起来）。可用音色模型：${modelsTxt}。`;
         const cur = h.current ? `正在：${h.current.message}（${Math.round(h.current.progress * 100)}%）；` : '当前空闲；';
         const gpuState = h.engine.ready ? '已预热在显存' : '已休眠省显存（下次点歌自动加载）';
         const extras: string[] = [];
@@ -1004,7 +1066,7 @@ export class FishSingWorld implements World {
         const playNote = pb.playing
           ? `本机正在放《${pb.title || '歌曲'}》（${fmtTime(pb.elapsedSec)}/${fmtTime(pb.durationSec)}${pb.currentLine ? `，第 ${pb.currentLine.index} 句「${pb.currentLine.text}」` : ''}）。`
           : '';
-        return `模型 ${h.engine.model}${h.engine.index ? ` + 索引 ${h.engine.index}` : '（无索引）'}（${gpuState}），采样率 ${h.engine.samplerate}${extras.length ? `，${extras.join('/')}` : ''}；${cur}队列 ${h.queue ?? 0} 个。${playNote}`;
+        return `模型 ${h.engine.model}${h.engine.index ? ` + 索引 ${h.engine.index}` : '（无索引）'}（${gpuState}），采样率 ${h.engine.samplerate}${extras.length ? `，${extras.join('/')}` : ''}；${cur}队列 ${h.queue ?? 0} 个。可用音色模型：${modelsTxt}。${playNote}`;
       },
     });
 

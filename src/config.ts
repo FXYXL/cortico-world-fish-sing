@@ -64,6 +64,12 @@ export interface FishSingConfigSection {
     defaultTarget: 'local' | 'none';
     /** 异步后台准备并开唱（默认开）：点歌后不阻塞聊天，开唱与唱完自动回调通知她 */
     asyncSing?: boolean;
+    /** 唱中歌词提词推送模式：smart=副歌前提前预告+主歌兜底；interval=按秒定时推；off=关闭 */
+    lyricPushMode?: 'off' | 'smart' | 'interval';
+    /** 唱中提词推送间隔（秒）：interval 模式下固定间隔；smart 模式下为主歌最长安静兜底（0=仅推副歌前预告） */
+    lyricPushIntervalSec?: number;
+    /** 提词提前预告秒数（提前一拍告知下一句与副歌），默认 3 秒 */
+    lyricLeadSec?: number;
   };
   send: {
     /** SnowLuma OneBot HTTP，例如 http://127.0.0.1:3002 */
@@ -148,6 +154,9 @@ export const FISHSING_DEFAULTS: FishSingConfigSection = {
     volume: 1,
     defaultTarget: 'local',
     asyncSing: true,
+    lyricPushMode: 'smart',
+    lyricPushIntervalSec: 25,
+    lyricLeadSec: 3,
   },
   send: {
     httpUrl: '',
@@ -388,6 +397,29 @@ export function fishsingConfigGroups(): ConfigGroup[] {
             type: 'boolean',
             title: '异步后台唱播（推荐）',
             description: '开启后点歌不阻塞聊天：后台准备完自动开唱，并在开唱与自然唱完时回调通知她（支持唱中插话、随时打断和局部返工）。',
+            'x-hot': true,
+          },
+          [at('play.lyricPushMode')]: {
+            type: 'string',
+            title: '唱中提词推送模式',
+            description: 'smart = 仅在每段进副歌前提前预告 + 长主歌偶尔补推（推荐，不刷屏）；interval = 每隔指定秒数定时推下一句；off = 关闭唱中提词。',
+            enum: ['smart', 'interval', 'off'],
+            'x-hot': true,
+          },
+          [at('play.lyricPushIntervalSec')]: {
+            type: 'number',
+            title: '提词推送间隔（秒）',
+            description: 'interval 模式下每隔多少秒推一次（5~120，默认 25）；smart 模式下作为主歌最长安静兜底间隔（填 0 则只推副歌前预告）。',
+            minimum: 0,
+            maximum: 120,
+            'x-hot': true,
+          },
+          [at('play.lyricLeadSec')]: {
+            type: 'number',
+            title: '提词提前预告（秒）',
+            description: '提前几秒预告「下一句要唱什么 / 马上进副歌」（默认 3 秒，提前一拍让她做好情绪准备）。',
+            minimum: 0,
+            maximum: 10,
             'x-hot': true,
           },
           [at('play.volume')]: {

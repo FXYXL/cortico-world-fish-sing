@@ -154,6 +154,7 @@ def run_job(jid: str, kind: str, params: dict, cancel: threading.Event) -> dict:
             f0_method=str(params.get("f0_method", "rmvpe")),
             separator=str(params.get("separator", "htdemucs")),
             dereverb=bool(params.get("dereverb", False)),
+            model=str(params.get("model") or ""),
             dynamic_style=str(params.get("dynamic_style", "off")),
             segments=params.get("segments") or None,
             snap_cut=params.get("snap_cut") or None,

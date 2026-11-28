@@ -10,21 +10,41 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { lineAtTime, type LyricLine, type LyricsSheet } from './lyrics.ts';
+import { fmtTime, lineAtTime, type LyricLine, type LyricsSheet, type TimeSpan } from './lyrics.ts';
 
 export interface PlayMeta {
   id?: string;
   title?: string;
   durationSec?: number;
   lyrics?: LyricsSheet;
+  chorusRanges?: TimeSpan[];
+}
+
+export interface LyricPushConfig {
+  mode: 'off' | 'smart' | 'interval';
+  intervalSec: number;
+  leadSec: number;
+}
+
+export interface LyricCueEvent {
+  kind: 'chorus_ahead' | 'interval';
+  title: string;
+  elapsedSec: number;
+  durationSec: number;
+  text: string;
+  nextLine?: LyricLine;
 }
 
 export interface PlayOptions {
   dir: string;
   playerPath: string;
   volume: number;
-  /** 曲目元信息（用于唱中实时追踪播到第几秒/第几句） */
+  /** 曲目元信息（用于唱中实时追踪播到第几秒/第几句与提词推送） */
   meta?: PlayMeta;
+  /** 唱中歌词提词配置（smart / interval / off） */
+  lyricPush?: LyricPushConfig;
+  /** 唱中提词触发回调 */
+  onLyricCue?: (cue: LyricCueEvent) => void;
   /** 播放结束回调：ended=自然播完，stopped=被主动打断，error=异常退出 */
   onEnd?: (reason: 'ended' | 'stopped' | 'error', elapsedSec: number) => void;
   /** 出问题时用它留痕：ffplay 静默失败最坑，不报就永远查不到 */
@@ -49,6 +69,108 @@ export class Player {
   private meta: PlayMeta = {};
   private stopFlag = false;
   private activeOnEnd: PlayOptions['onEnd'];
+  private lyricTimer: ReturnType<typeof setInterval> | null = null;
+
+  private clearLyricTimer(): void {
+    if (this.lyricTimer) {
+      clearInterval(this.lyricTimer);
+      this.lyricTimer = null;
+    }
+  }
+
+  /** 启动唱中提词调度器：仅在播放中生效，播完/切歌/停止立刻销毁。 */
+  private startLyricPrompter(
+    started: number,
+    meta: PlayMeta,
+    cfg: LyricPushConfig | undefined,
+    onCue: PlayOptions['onLyricCue'],
+  ): void {
+    this.clearLyricTimer();
+    if (!cfg || cfg.mode === 'off' || !onCue) return;
+    const lyrics = meta.lyrics;
+    const chorus = meta.chorusRanges ?? [];
+    if (!lyrics?.lines?.length && !chorus.length) return;
+
+    const title = String(meta.title || '当前歌曲');
+    const durationSec = Number(meta.durationSec || 0);
+    const leadSec = Math.max(0, Math.min(10, Number(cfg.leadSec ?? 3)));
+    const intervalSec = Math.max(0, Math.min(120, Number(cfg.intervalSec ?? 25)));
+    const firedChorus = new Set<number>();
+    let lastPushAt = -999;
+    let lastCueLineIdx = -1;
+
+    this.lyricTimer = setInterval(() => {
+      if (!this.proc) {
+        this.clearLyricTimer();
+        return;
+      }
+      const elapsed = Math.max(0, (Date.now() - started) / 1000);
+      if (durationSec > 6 && elapsed > durationSec - 2.5) return;
+
+      // 1) 副歌提前预告（smart 和 interval 模式都优先触发，每段副歌只推一次）
+      for (let idx = 0; idx < chorus.length; idx += 1) {
+        if (firedChorus.has(idx)) continue;
+        const c = chorus[idx];
+        const remain = c.start - elapsed;
+        if (remain <= leadSec + 0.6 && remain >= -0.8) {
+          firedChorus.add(idx);
+          const chLines = (lyrics?.lines ?? [])
+            .filter((l) => l.start >= c.start - 1.2 && l.start <= c.end)
+            .slice(0, 2);
+          const preview = chLines.length
+            ? `接下来：${chLines.map((l) => `第 ${l.index} 句「${l.text}」`).join(' → ')}`
+            : `副歌区间 ${fmtTime(c.start)}–${fmtTime(c.end)}`;
+          const timing = remain > 0.7 ? `约 ${Math.round(remain)} 秒后` : '马上';
+          lastPushAt = elapsed;
+          if (chLines[0]) lastCueLineIdx = chLines[0].index;
+          onCue({
+            kind: 'chorus_ahead',
+            title,
+            elapsedSec: Math.round(elapsed * 10) / 10,
+            durationSec,
+            nextLine: chLines[0],
+            text: `[提词·即将进副歌] 《${title}》${timing}进副歌（${fmtTime(c.start)}–${fmtTime(c.end)}，该亮起来啦）！${preview}`,
+          });
+          return;
+        }
+      }
+
+      // 2) 按秒定时节拍推送（interval 固定间隔；smart 在 intervalSec > 0 时作为长主歌兜底）
+      const minStep = cfg.mode === 'interval' ? Math.max(5, intervalSec || 25) : (intervalSec > 0 ? Math.max(20, intervalSec) : 0);
+      if (minStep <= 0) return;
+
+      // smart 模式下如果即将进副歌（8 秒内），把机会留给更准的副歌预告，不连续推两次
+      if (cfg.mode === 'smart') {
+        const nearChorus = chorus.some((c, idx) => !firedChorus.has(idx) && c.start - elapsed > 0 && c.start - elapsed <= leadSec + 8);
+        if (nearChorus) return;
+      }
+
+      const firstWait = cfg.mode === 'interval' ? Math.min(minStep, 10) : Math.min(minStep, 18);
+      if (lastPushAt < 0 ? elapsed < firstWait : elapsed - lastPushAt < minStep) return;
+
+      const curPos = lineAtTime(lyrics, elapsed);
+      const aheadPos = lineAtTime(lyrics, elapsed + leadSec);
+      const upcoming = aheadPos.current && aheadPos.current.index !== curPos.current?.index
+        ? aheadPos.current
+        : (curPos.next ?? aheadPos.next ?? aheadPos.current);
+      if (!upcoming || upcoming.index === lastCueLineIdx) return;
+
+      const nextCh = chorus.find((c, idx) => !firedChorus.has(idx) && c.start > elapsed && c.start - elapsed <= 20);
+      const chHint = nextCh ? `（约 ${Math.round(nextCh.start - elapsed)} 秒后进副歌）` : '';
+      const curNote = curPos.current ? `正唱第 ${curPos.current.index} 句「${curPos.current.text}」，` : '';
+      lastPushAt = elapsed;
+      lastCueLineIdx = upcoming.index;
+      onCue({
+        kind: 'interval',
+        title,
+        elapsedSec: Math.round(elapsed * 10) / 10,
+        durationSec,
+        nextLine: upcoming,
+        text: `[提词 ${fmtTime(elapsed)}/${fmtTime(durationSec)}] 《${title}》${curNote}下一句（${fmtTime(upcoming.start)}）：第 ${upcoming.index} 句「${upcoming.text}」${chHint}`,
+      });
+    }, 1000);
+    this.lyricTimer.unref?.();
+  }
 
   get playing(): string {
     return this.current;
@@ -95,6 +217,7 @@ export class Player {
       settled = true;
       const elapsed = Math.max(0, Math.round(((Date.now() - started) / 1000) * 10) / 10);
       if (this.proc === child) {
+        this.clearLyricTimer();
         this.proc = null;
         this.current = '';
         this.startedAt = 0;
@@ -124,9 +247,11 @@ export class Player {
     this.startedAt = started;
     this.meta = opts.meta ?? {};
     this.activeOnEnd = opts.onEnd;
+    this.startLyricPrompter(started, this.meta, opts.lyricPush, opts.onLyricCue);
   }
 
   stop(): void {
+    this.clearLyricTimer();
     if (!this.proc) return;
     const child = this.proc;
     const started = this.startedAt;

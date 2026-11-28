@@ -19,7 +19,14 @@ import { join, basename, extname } from 'node:path';
 
 import { audioUrlOf, download, extractBvid, isBvid, rankHits, searchBili, type SearchHit, type SearchOrder } from './bili.ts';
 import { cut, duration, split, toMp3, type FfmpegDeps } from './audio.ts';
-import { parseTarget, sendRecord, type OneBotOptions, type Player } from './deliver.ts';
+import {
+  parseTarget,
+  sendRecord,
+  type LyricCueEvent,
+  type LyricPushConfig,
+  type OneBotOptions,
+  type Player,
+} from './deliver.ts';
 import {
   addToLibrary,
   cacheGet,
@@ -78,6 +85,10 @@ export interface SingDeps {
   minScore: number;
   excludeWords: string;
   voice: SingParams;
+  /** 唱中歌词提词配置 */
+  lyricPush?: LyricPushConfig;
+  /** 唱中提词触发回调 */
+  onLyricCue?: (cue: LyricCueEvent) => void;
   /** 本机自然播完 / 被打断时的回调（用于 pushEvent 通知桌宠接话） */
   onPlaybackEnd?: (info: PlaybackEndInfo) => void;
 }
@@ -110,6 +121,8 @@ export interface SingRequest {
   separator?: 'htdemucs' | 'roformer';
   /** 分离后额外去混响 */
   dereverb?: boolean;
+  /** 临时指定本次演唱使用的音色模型名（如 dfy7.pth），唱完自动恢复默认模型 */
+  model?: string;
   /** 动态主副歌演绎：off / soft-verse-bright-chorus */
   dynamicStyle?: 'off' | 'soft-verse-bright-chorus';
   /** 显式分段换音色/换参数 */
@@ -344,9 +357,10 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
   const songText = String(req.song || '').trim();
   if (!songText) return { ok: false, message: '没给歌名或文件' };
 
+  const reqModel = req.model ? String(req.model).trim() : '';
   const params: SingParams = {
-    model: deps.voice.model,
-    index: deps.voice.index,
+    model: reqModel || deps.voice.model,
+    index: reqModel && reqModel !== deps.voice.model ? '' : deps.voice.index,
     indexRate: Number(req.indexRate ?? deps.voice.indexRate),
     protect: Number(req.protect ?? deps.voice.protect),
     // 0 = 完全跟随原唱音量；1 = 完全用模型自己的（轻唱被唱满）。越界/NaN 一律退回配置值。
@@ -460,6 +474,7 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
         f0_method: params.f0Method,
         separator: params.separator,
         dereverb: params.dereverb,
+        model: reqModel,
         dynamic_style: params.dynamicStyle ?? 'off',
         segments: Array.isArray(req.segments) && req.segments.length ? req.segments : null,
         reverb: params.reverb,
@@ -575,7 +590,15 @@ export async function singSong(req: SingRequest, deps: SingDeps): Promise<SingRe
           dir: deps.ffmpeg.dir,
           playerPath: deps.playerPath,
           volume: deps.volume,
-          meta: { id, title: src.title, durationSec: totalSec, lyrics },
+          meta: {
+            id,
+            title: src.title,
+            durationSec: totalSec,
+            lyrics,
+            chorusRanges: report?.chorusRanges,
+          },
+          lyricPush: deps.lyricPush,
+          onLyricCue: deps.onLyricCue,
           onEnd: (reason, elapsedSec) => {
             deps.onPlaybackEnd?.({ id, title: src.title, reason, elapsedSec, durationSec: totalSec, report });
           },
@@ -806,7 +829,10 @@ export async function patchSong(req: PatchRequest, deps: SingDeps): Promise<Sing
           title: previewOnly ? `${snap.title}（返工预览）` : snap.title,
           durationSec: sec,
           lyrics: previewOnly ? undefined : (snap.lyrics as LyricsSheet | undefined),
+          chorusRanges: previewOnly ? undefined : snap.report?.chorusRanges,
         },
+        lyricPush: previewOnly ? undefined : deps.lyricPush,
+        onLyricCue: previewOnly ? undefined : deps.onLyricCue,
         onEnd: previewOnly ? undefined : (reason, elapsedSec) => {
           deps.onPlaybackEnd?.({ id: snap.id, title: snap.title, reason, elapsedSec, durationSec: sec, report: snap.report });
         },

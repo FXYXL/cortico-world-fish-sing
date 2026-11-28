@@ -1013,6 +1013,7 @@ class SingEngine:
              f0_method: str = "rmvpe",
              separator: str = "htdemucs",
              dereverb: bool = False,
+             model: str = "",
              dynamic_style: str = "off",
              segments: "list | None" = None,
              snap_cut: "dict | None" = None,
@@ -1024,7 +1025,7 @@ class SingEngine:
              progress: Optional[Callable[[float, str], None]] = None,
              cancel: Optional[threading.Event] = None) -> dict:
         """
-        整首歌：分离 → 换声（支持主歌柔副歌亮/分段换音色 + 可选和声） → 混音 → 声学体检。
+        整首歌：分离 → 换声（支持临时换模型/主歌柔副歌亮/分段换音色 + 可选和声） → 混音 → 声学体检。
         mode: full=带伴奏 / vocals=只要人声（清唱）/ mixed 同 full 但保留中间文件
         pitch: 半音数；'auto' = 分离后按源曲与模型音域自动推荐。
         """
@@ -1035,6 +1036,39 @@ class SingEngine:
         sep_engine = "roformer" if str(separator or "").strip().lower() in ("roformer", "uvr", "uvr5") else "htdemucs"
         f0_m = "fcpe" if str(f0_method or "").strip().lower() == "fcpe" else "rmvpe"
         dyn_style = str(dynamic_style or "off").strip().lower()
+        req_model = str(model or "").strip()
+        original_model = (self.model_path or str(RVC_ROOT / "assets" / "weights" / self.model), self.index)
+        switched_model = False
+
+        try:
+            if req_model:
+                ckpt, idx_p = self._resolve_model_ckpt(req_model)
+                if ckpt and str(ckpt) != original_model[0]:
+                    self.set_model(ckpt, idx_p)
+                    switched_model = True
+
+            return self._song_body(
+                src, work, separate=separate, mode=mode, pitch=pitch,
+                index_rate=index_rate, protect=protect, rms_mix_rate=rms_mix_rate,
+                f0_m=f0_m, sep_engine=sep_engine, dereverb=dereverb, dyn_style=dyn_style,
+                segments=segments, snap_cut=snap_cut, session_dir=session_dir,
+                harmony=harmony, reverb=reverb, polish=polish, sep_cache=sep_cache,
+                report=report, cancel=cancel, t0=t0,
+            )
+        finally:
+            if switched_model:
+                try:
+                    self.set_model(Path(original_model[0]), original_model[1])
+                except Exception as e:  # noqa: BLE001
+                    log(f"唱完恢复原默认模型失败：{e}")
+
+    def _song_body(self, src: Path, work: Path, *, separate: bool, mode: str,
+                   pitch: "int | str", index_rate: float, protect: float,
+                   rms_mix_rate: float, f0_m: str, sep_engine: str, dereverb: bool,
+                   dyn_style: str, segments: "list | None", snap_cut: "dict | None",
+                   session_dir: Optional[Path], harmony: "dict | None", reverb: str,
+                   polish: bool, sep_cache: Optional[Path], report, cancel: threading.Event,
+                   t0: float) -> dict:
 
         auto_pitch = isinstance(pitch, str) and pitch.strip().lower() == "auto"
         suggestion: Optional[dict] = None
